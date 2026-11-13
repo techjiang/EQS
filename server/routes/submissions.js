@@ -1,7 +1,7 @@
 import { get, all, run, now, log } from '../lib/db.js'
 import { readJson, fail, sendJson, clientIp } from '../lib/http.js'
 import { requireUser, requirePerm, currentUser, can } from '../lib/auth.js'
-import { pickForm, validateSubmission, gradeSubmission, computeStats, submissionData, paginate, fieldVisible, passLineOf } from '../lib/forms.js'
+import { pickForm, validateSubmission, gradeSubmission, computeStats, submissionData, paginate, fieldVisible, passLineOf, manualScoresOf, passHintOf } from '../lib/forms.js'
 
 const flatAnswer = v => (Array.isArray(v) ? v.map(String) : v === undefined || v === null || v === '' ? [] : [String(v)])
 const sameSet = (a, b) => a.length === b.length && [...a].sort().every((x, i) => x === [...b].sort()[i])
@@ -68,6 +68,11 @@ export function checkLimit(form, req, extra = {}) {
   return fp
 }
 
+/** 列表/详情统一带上人工分，前端不用再 parse 一次 */
+function withManual(row) {
+  return { ...submissionData(row), manual_scores: manualScoresOf(row) }
+}
+
 export default function register(r) {
   /** 公开：读取表单（不含答案） */
   r.get('/api/public/forms/:id', async (req, res, { params }) => {
@@ -103,6 +108,7 @@ export default function register(r) {
     let score = null
     let passed = null
     if (form.kind === 'exam') {
+      // 交卷那一刻还没有人工分，主观题只算卷面总分，不计入可判分总分
       const g = gradeSubmission(form.schema, data, form.settings)
       score = g.score
       passed = g.passed ? 1 : 0
@@ -120,7 +126,7 @@ export default function register(r) {
     const submission = get('SELECT * FROM submissions WHERE id = ?', id)
 
     const review = form.kind === 'exam' && form.settings?.showResult !== false
-      ? buildReview(form.schema, data, form.settings)
+      ? buildReview(form.schema, data, form.settings, {})
       : null
 
     sendJson(res, 201, {
@@ -148,33 +154,40 @@ export default function register(r) {
   })
 
   /** 交卷后逐题回顾：只返回对错、正确答案与解析，不回传用户原始作答之外的信息 */
-  function buildReview(schema, data, settings = {}) {
+  function buildReview(schema, data, settings = {}, manual = {}) {
     const items = []
     for (const f of schema) {
       if (['divider', 'richtext', 'html', 'image'].includes(f.type)) continue
       if (!fieldVisible(f, data)) continue
       const given = flatAnswer(data[f.id])
       const right = (f.answer || []).map(String)
+      const auto = right.length > 0
+      const correct = auto && sameSet(given, right)
+      const manualGiven = manual?.[f.id]
+      const hasManual = !auto && manualGiven !== undefined && manualGiven !== null && manualGiven !== ''
+      const score = Number(f.score) || 0
       items.push({
         id: f.id,
         label: f.label,
         type: f.type,
         given,
         answer: right,
-        judged: right.length > 0,
-        correct: right.length > 0 && sameSet(given, right),
-        score: Number(f.score) || 0,
-        got: right.length > 0 && sameSet(given, right) ? Number(f.score) || 0 : 0,
+        judged: auto || hasManual,
+        manual: hasManual,
+        correct,
+        score,
+        got: auto ? (correct ? score : 0) : hasManual ? Math.min(score, Math.max(0, Number(manualGiven) || 0)) : 0,
         analysis: f.analysis || ''
       })
     }
-    // 与 gradeSubmission 保持同一口径：只把有标准答案的题计入可判分总分
+    // 与 gradeSubmission 同一口径：自动判分题 + 已人工给分题才算进可判分总分
     const total = items.reduce((a, i) => a + (i.judged ? i.score : 0), 0)
     const paperTotal = items.reduce((a, i) => a + i.score, 0)
     return {
       items, total, paperTotal,
       ungraded: items.filter(i => !i.judged && i.score > 0).length,
       passLine: passLineOf(settings, total),
+      hint: passHintOf(settings, total, paperTotal),
       graded: items.some(i => i.judged)
     }
   }
@@ -194,7 +207,16 @@ export default function register(r) {
     const sameUser = me?.id && row.user_id && Number(row.user_id) === Number(me.id)
     const sameIp = row.ip && row.ip === clientIp(req)
     if (!sameDevice && !sameUser && !sameIp) fail(403, '只能查询本设备提交过的答卷')
-    sendJson(res, 200, { ok: true, data: { id: row.id, data: JSON.parse(row.data), score: row.score, createdAt: row.created_at } })
+    const review = form?.kind === 'exam' && form.settings?.showResult !== false
+      ? buildReview(form.schema, JSON.parse(row.data), form.settings, manualScoresOf(row))
+      : null
+    sendJson(res, 200, {
+      ok: true,
+      data: {
+        id: row.id, data: JSON.parse(row.data), score: row.score,
+        passed: row.passed === 1, reviewed: !!row.reviewed_at, review, createdAt: row.created_at
+      }
+    })
   })
 
   /** 管理端：答卷列表 */
@@ -209,6 +231,8 @@ export default function register(r) {
     const keyword = url.searchParams.get('keyword')
     if (keyword) { where.push('s.data LIKE ?'); args.push(`%${keyword}%`) }
     if (url.searchParams.get('marked') === '1') where.push('s.marked = 1')
+    // 待批阅：考试答卷里还有主观题没给分
+    if (url.searchParams.get('pending') === '1') where.push("(s.reviewed_at IS NULL OR s.reviewed_at = '') AND f.kind = 'exam'")
     if (url.searchParams.get('from')) { where.push('s.created_at >= ?'); args.push(url.searchParams.get('from')) }
     if (url.searchParams.get('to')) { where.push('s.created_at <= ?'); args.push(url.searchParams.get('to') + 'T23:59:59') }
     const base = `FROM submissions s JOIN forms f ON f.id = s.form_id WHERE ${where.join(' AND ')}`
@@ -216,7 +240,7 @@ export default function register(r) {
     const p = paginate(req, total)
     const order = url.searchParams.get('order') === 'asc' ? 'ASC' : 'DESC'
     const rows = all(`SELECT s.*, f.title AS form_title ${base} ORDER BY s.id ${order} LIMIT ? OFFSET ?`, ...args, p.pageSize, p.offset)
-    sendJson(res, 200, { ok: true, data: rows.map(submissionData), total, page: p.page, pageSize: p.pageSize, totalPages: p.totalPages })
+    sendJson(res, 200, { ok: true, data: rows.map(withManual), total, page: p.page, pageSize: p.pageSize, totalPages: p.totalPages })
   })
 
   r.get('/api/submissions/:id', async (req, res, { params }) => {
@@ -225,7 +249,7 @@ export default function register(r) {
     if (!row) fail(404, '答卷不存在')
     const form = pickForm(row.form_id, { withDeleted: true })
     if (!can(user, '*') && form?.created_by !== user.id) fail(403, '无权查看')
-    sendJson(res, 200, { ok: true, data: { ...submissionData(row), form } })
+    sendJson(res, 200, { ok: true, data: { ...withManual(row), form } })
   })
 
   r.post('/api/submissions', async (req, res) => {
@@ -257,13 +281,49 @@ export default function register(r) {
     const data = body.data ?? JSON.parse(row.data)
     const errors = validateSubmission(form.schema, data)
     if (errors.length) fail(422, errors.join('；'))
-    const g = form.kind === 'exam' ? gradeSubmission(form.schema, data, form.settings) : null
+    const manual = manualScoresOf(row)
+    const g = form.kind === 'exam' ? gradeSubmission(form.schema, data, form.settings, manual) : null
     const marked = body.marked === undefined ? row.marked : (body.marked ? 1 : 0)
     run('UPDATE submissions SET data = ?, score = ?, passed = ?, marked = ?, updated_at = ? WHERE id = ?',
       JSON.stringify(data), g?.score ?? row.score, g ? (g.passed ? 1 : 0) : row.passed, marked, now(), row.id)
     log(user, '编辑答卷', `#${row.id}`)
     dispatchWebhooks('update', { formId: form.id, submission: { id: row.id, data } }).catch(() => {})
     sendJson(res, 200, { ok: true })
+  })
+
+  /**
+   * 人工批阅：给主观题打分并重算成绩
+   * body: { scores: { [fieldId]: 0..满分 }, note?: string }
+   */
+  r.put('/api/submissions/:id/review', async (req, res, { params }) => {
+    const user = requirePerm(req, 'data:write')
+    const row = get('SELECT * FROM submissions WHERE id = ? AND deleted_at IS NULL', Number(params.id))
+    if (!row) fail(404, '答卷不存在')
+    const form = pickForm(row.form_id)
+    if (!form) fail(404, '表单不存在')
+    if (form.kind !== 'exam') fail(400, '只有考试答卷需要批阅')
+    if (!can(user, '*') && form.created_by !== user.id) fail(403, '无权批阅')
+    const body = await readJson(req)
+    const data = JSON.parse(row.data)
+    // 只认这份卷子里真有、且确实没有标准答案的题，防止给选择题凭空加分
+    const subjective = new Map(form.schema.filter(f => f.score > 0 && !f.answer?.length && fieldVisible(f, data)).map(f => [f.id, f]))
+    const scores = {}
+    for (const [fid, raw] of Object.entries(body.scores || {})) {
+      const f = subjective.get(fid)
+      if (!f) continue
+      if (raw === null || raw === undefined || raw === '') continue
+      const n = Number(raw)
+      if (!Number.isFinite(n)) fail(400, `「${f.label}」的分数不是数字`)
+      if (n < 0 || n > f.score) fail(400, `「${f.label}」应在 0 - ${f.score} 分之间`)
+      scores[fid] = Math.round(n * 100) / 100
+    }
+    const g = gradeSubmission(form.schema, data, form.settings, scores)
+    run('UPDATE submissions SET manual_scores = ?, score = ?, passed = ?, reviewed_at = ?, reviewed_by = ?, review_note = ?, updated_at = ? WHERE id = ?',
+      JSON.stringify(scores), g.score, g.passed ? 1 : 0, now(), user.id, String(body.note ?? row.review_note ?? '').slice(0, 500), now(), row.id)
+    log(user, '批阅答卷', `#${row.id} → ${g.score}/${g.total}`)
+    const updated = get('SELECT * FROM submissions WHERE id = ?', row.id)
+    dispatchWebhooks('update', { formId: form.id, formTitle: form.title, submission: withManual(updated) }).catch(() => {})
+    sendJson(res, 200, { ok: true, data: { ...withManual(updated), review: buildReview(form.schema, data, form.settings, scores) } })
   })
 
   r.delete('/api/submissions/:id', async (req, res, { params }) => {

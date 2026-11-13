@@ -15,12 +15,14 @@ export default {
     const totalPages = ref(1)
     const keyword = ref('')
     const marked = ref(false)
+    const pending = ref(false)
     const loading = ref(true)
     const detail = ref(null)
     const editing = ref(null)
     const form = ref(null)
     const selected = ref([])
     const importing = ref(false)
+    const review = ref(null)
 
     const loadForms = async () => {
       const r = await api.get('/api/forms?pageSize=200')
@@ -47,6 +49,7 @@ export default {
         if (formId.value) qs.set('formId', formId.value)
         if (keyword.value) qs.set('keyword', keyword.value)
         if (marked.value) qs.set('marked', '1')
+        if (pending.value) qs.set('pending', '1')
         const r = await api.get('/api/submissions?' + qs)
         rows.value = r.data
         total.value = r.total
@@ -163,6 +166,41 @@ export default {
     }
 
     const openDetail = (row) => { detail.value = row }
+
+    /** 打开批阅：拉最新答卷，把主观题与人工分摊成表单 */
+    const openReview = async (row) => {
+      try {
+        const r = await api.get(`/api/submissions/${row.id}`)
+        const sub = r.data
+        const f = sub.form
+        if (!f || f.kind !== 'exam') return err('只有考试答卷需要批阅')
+        const subjective = (f.schema || []).filter(q => q.score > 0 && !(q.answer || []).length)
+        if (!subjective.length) return err('这份卷子没有主观题')
+        review.value = {
+          id: row.id,
+          title: f.title,
+          note: sub.review_note || '',
+          reviewedAt: sub.reviewed_at || '',
+          scores: { ...(sub.manual_scores || {}) },
+          items: subjective.map(q => ({
+            id: q.id, label: q.label, score: Number(q.score) || 0,
+            given: sub.data[q.id], analysis: q.analysis || ''
+          }))
+        }
+      } catch (e) { err(e.message) }
+    }
+
+    const saveReview = async () => {
+      try {
+        const r = await api.put(`/api/submissions/${review.value.id}/review`, {
+          scores: review.value.scores, note: review.value.note
+        })
+        const total = r.data.review ? `${r.data.review.total} 分` : ''
+        ok(`批阅完成${total ? `，重新计算成绩 ${total}` : ''}`)
+        review.value = null
+        load()
+      } catch (e) { err(e.message) }
+    }
     const openEdit = async (row) => {
       // 全部表单视图下，先按行的所属表单加载 schema，编辑弹窗才画得出控件
       if (row.form_id && row.form_id !== formId.value) {
@@ -224,6 +262,10 @@ export default {
           type: 'checkbox', checked: marked.value, style: 'accent-color:var(--brand)',
           onChange: e => { marked.value = e.target.checked; page.value = 1; load() }
         }), '仅看标记']),
+        h('label', { class: 'flex small' }, [h('input', {
+          type: 'checkbox', checked: pending.value, style: 'accent-color:var(--brand)',
+          onChange: e => { pending.value = e.target.checked; page.value = 1; load() }
+        }), '待批阅']),
         h('div', { style: 'flex:1' }),
         h('span', { class: 'small muted' }, `共 ${total.value} 份`),
         h('button', { class: 'btn sm danger', onClick: batchDelete }, '批量删除'),
@@ -240,7 +282,9 @@ export default {
                 h('th', {}, '编号'), h('th', {}, '提交时间'),
                 allMode.value ? h('th', {}, '来源表单') : null,
                 ...cols.value.map(f => h('th', {}, f.label)),
-                h('th', {}, '得分'), h('th', {}, '操作')
+                h('th', { class: 'stick-score' }, '得分'),
+                h('th', { class: 'stick-gap' }),
+                h('th', { class: 'stick-ops' }, '操作')
               ])),
               h('tbody', {}, rows.value.map(r => h('tr', {}, [
                 h('td', {}, h('input', {
@@ -259,9 +303,16 @@ export default {
                 h('td', { class: 'nowrap' }, fmtDate(r.created_at)),
                 allMode.value ? h('td', {}, r.form_title || '-') : null,
                 ...cols.value.map(f => h('td', {}, cell(r, f))),
-                h('td', {}, r.score != null ? h('span', { class: ['tag', r.passed ? 'ok' : 'warn'] }, String(r.score)) : '-'),
-                h('td', { class: 'nowrap' }, h('div', { class: 'flex', style: 'gap:4px' }, [
+                h('td', { class: 'nowrap stick-score' }, r.score != null
+                  ? h('span', {}, [
+                      h('span', { class: ['tag', r.passed ? 'ok' : 'warn'] }, String(r.score)),
+                      r.reviewed_at ? h('span', { class: 'tag', style: 'margin-left:4px' }, '已批阅') : null
+                    ])
+                  : '-'),
+                h('td', { class: 'stick-gap' }),
+                h('td', { class: 'nowrap stick-ops' }, h('div', { class: 'flex', style: 'gap:4px' }, [
                   h('button', { class: 'btn ghost sm', onClick: () => openDetail(r) }, '查看'),
+                  h('button', { class: 'btn ghost sm', onClick: () => openReview(r) }, '批阅'),
                   h('button', { class: 'btn ghost sm', onClick: () => openEdit(r) }, '编辑'),
                   h('button', { class: 'btn ghost sm', onClick: () => toggleMark(r) }, r.marked ? '取消标记' : '标记'),
                   h('button', { class: 'btn ghost sm danger', onClick: () => remove(r) }, '删除')
@@ -283,6 +334,55 @@ export default {
                 ? Object.entries(detail.value.data[f.id]).map(([k, v]) => `${k}：${v}`).join('；')
                 : String(detail.value.data[f.id] || '-'))
         ])))
+      }) : null,
+
+      review.value ? Modal({
+        title: `批阅答卷 #${review.value.id} · ${review.value.title}`, modelValue: true,
+        onClose: () => review.value = null, wide: true,
+        children: h('div', {}, [
+          h('div', { class: 'small muted mb' }, review.value.reviewedAt
+            ? `上次批阅：${fmtDate(review.value.reviewedAt)}，可再次调整`
+            : '主观题没有标准答案，需要人工给分；给完分系统会重算总分与及格判定'),
+          ...review.value.items.map(it => h('div', { class: 'mb', style: 'padding:12px 14px;border:1px solid var(--line);border-radius:10px' }, [
+            h('div', { class: 'flex between', style: 'gap:10px;align-items:flex-start' }, [
+              h('b', { style: 'font-size:14px;line-height:1.5' }, it.label),
+              h('span', { class: 'tag', style: 'white-space:nowrap;flex:none' }, `满分 ${it.score}`)
+            ]),
+            h('div', { class: 'small muted', style: 'margin:8px 0 4px' }, '作答'),
+            h('div', { style: 'white-space:pre-wrap;word-break:break-word;margin-bottom:8px' },
+              it.given == null || it.given === '' ? h('span', { class: 'muted' }, '（未作答）') : String(it.given)),
+            h('div', { class: 'flex', style: 'gap:8px;align-items:center' }, [
+              h('span', { class: 'small muted' }, '给分'),
+              h('input', {
+                class: 'input', type: 'number', min: 0, max: it.score, step: '0.5',
+                style: 'max-width:110px', value: review.value.scores[it.id] ?? '',
+                placeholder: '0',
+                onInput: e => {
+                  const v = e.target.value
+                  if (v === '') delete review.value.scores[it.id]
+                  else review.value.scores[it.id] = Number(v)
+                }
+              }),
+              h('button', {
+                class: 'btn sm', onClick: () => review.value.scores[it.id] = it.score
+              }, '满分'),
+              h('button', {
+                class: 'btn sm', onClick: () => review.value.scores[it.id] = 0
+              }, '0 分')
+            ])
+          ])),
+          h('div', { class: 'field' }, [
+            h('label', {}, '批阅备注（可选）'),
+            h('textarea', {
+              class: 'textarea', style: 'min-height:60px', placeholder: '例如：观点完整，但缺少示例',
+              value: review.value.note, onInput: e => review.value.note = e.target.value
+            })
+          ])
+        ]),
+        footer: [
+          h('button', { class: 'btn', onClick: () => review.value = null }, '取消'),
+          h('button', { class: 'btn primary', onClick: saveReview }, '保存并重算成绩')
+        ]
       }) : null,
 
       editing.value ? Modal({

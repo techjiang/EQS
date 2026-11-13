@@ -130,6 +130,20 @@ table.table{width:100%;border-collapse:collapse;font-size:13.5px}
 .table th{text-align:left;font-weight:600;color:var(--text-2);font-size:12.5px;padding:11px 14px;border-bottom:1px solid var(--line);white-space:nowrap;background:var(--panel-2)}
 .table td{padding:12px 14px;border-bottom:1px solid var(--line-2);vertical-align:middle}
 .table tbody tr:hover{background:var(--panel-2)}
+/* 题目多时列会溢出：宽屏把「得分 / 操作」吸在右边，窄屏不吸，
+   否则两列叠加会在手机上把内容压成一条缝 */
+@media (min-width:900px){
+  /* 得分 / 操作吸在右边，中间留一个空列垫住，
+     被顶掉的半截列不会露出来 */
+  .table .stick-score{position:sticky;right:304px;background:var(--panel);z-index:2;box-shadow:inset 1px 0 0 var(--line)}
+  .table .stick-gap{position:sticky;right:220px;background:var(--panel);z-index:2;
+    width:84px;min-width:84px;padding:0;border:none;box-shadow:none}
+  .table td.stick-gap{border-bottom:1px solid var(--line-2)}
+  .table th.stick-gap{border-bottom:1px solid var(--line)}
+  .table .stick-ops{position:sticky;right:0;background:var(--panel);z-index:2}
+  .table th.stick-score,.table th.stick-gap,.table th.stick-ops{background:var(--panel-2)}
+  .table tbody tr:hover .stick-score,.table tbody tr:hover .stick-gap,.table tbody tr:hover .stick-ops{background:var(--panel-2)}
+}
 .table tbody tr:last-child td{border-bottom:none}
 
 .empty{text-align:center;padding:56px 20px;color:var(--text-3)}

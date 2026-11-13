@@ -10,7 +10,7 @@ export default {
     const showNew = ref(false)
     const creating = ref(false)
     const banks = ref([])
-    const newExam = ref({ title: '', bankId: 0, count: 10, duration: 60, passPercent: 60 })
+    const newExam = ref({ title: '', bankId: 0, bankIds: [], count: 10, duration: 60, passPercent: 60, multi: false })
     const aiPrompt = ref('')
 
     const load = async () => {
@@ -49,6 +49,30 @@ export default {
           settings: { ...(r.data?.settings || {}), passPercent: newExam.value.passPercent, duration: newExam.value.duration }
         })
         ok(`已生成 ${r.count} 题并发布`)
+        showNew.value = false
+        navigate(`/forms/${r.id}/design`)
+      } catch (e) { err(e.message) } finally { creating.value = false }
+    }
+
+    const toggleBank = (id) => {
+      const set = new Set(newExam.value.bankIds)
+      set.has(id) ? set.delete(id) : set.add(id)
+      newExam.value.bankIds = [...set]
+    }
+
+    const createFromBanks = async () => {
+      if (!newExam.value.bankIds.length) return err('请至少勾选一个题库')
+      creating.value = true
+      try {
+        const r = await api.post('/api/banks/paper', {
+          title: newExam.value.title || '智能组卷考试',
+          bankIds: newExam.value.bankIds,
+          count: newExam.value.count,
+          duration: newExam.value.duration,
+          passPercent: newExam.value.passPercent
+        })
+        await api.put(`/api/forms/${r.id}`, { status: 'published' })
+        ok(`已从 ${r.banks?.length || 1} 个题库抽取 ${r.count} 题并发布`)
         showNew.value = false
         navigate(`/forms/${r.id}/design`)
       } catch (e) { err(e.message) } finally { creating.value = false }
@@ -105,9 +129,32 @@ export default {
             class: 'input', value: newExam.value.title, placeholder: '例如：2025 年度安全知识考核',
             onInput: e => newExam.value.title = e.target.value
           })]),
-          h('div', { class: 'field' }, [h('label', {}, '从题库组卷'), h('select', {
-            class: 'select', value: newExam.value.bankId, onChange: e => newExam.value.bankId = Number(e.target.value)
-          }, banks.value.length ? banks.value.map(b => h('option', { value: b.id }, `${b.name}（${b.question_count} 题）`)) : [h('option', { value: 0 }, '暂无题库，请先创建')])]),
+          h('div', { class: 'field' }, [
+            h('label', {}, '组卷方式'),
+            h('div', { class: 'flex', style: 'gap:6px' }, [
+              h('button', {
+                class: ['btn', 'sm', newExam.value.multi ? '' : 'primary'],
+                onClick: () => newExam.value.multi = false
+              }, '单题库抽题'),
+              h('button', {
+                class: ['btn', 'sm', newExam.value.multi ? 'primary' : ''],
+                onClick: () => newExam.value.multi = true
+              }, '多题库混合组卷')
+            ])
+          ]),
+          newExam.value.multi
+            ? h('div', { class: 'field' }, [
+                h('label', {}, `勾选题库（已选 ${newExam.value.bankIds.length} 个，题目按题库轮转均摊）`),
+                banks.value.length
+                  ? h('div', { class: 'flex wrap', style: 'gap:6px;max-height:150px;overflow:auto' }, banks.value.map(b => h('button', {
+                      class: ['btn', 'sm', newExam.value.bankIds.includes(b.id) ? 'primary' : ''],
+                      onClick: () => toggleBank(b.id)
+                    }, `${b.name}（${b.question_count}）`)))
+                  : h('div', { class: 'small muted' }, '暂无题库，请先创建')
+              ])
+            : h('div', { class: 'field' }, [h('label', {}, '从题库组卷'), h('select', {
+                class: 'select', value: newExam.value.bankId, onChange: e => newExam.value.bankId = Number(e.target.value)
+              }, banks.value.length ? banks.value.map(b => h('option', { value: b.id }, `${b.name}（${b.question_count} 题）`)) : [h('option', { value: 0 }, '暂无题库，请先创建')])]),
           h('div', { class: 'row' }, [
             h('div', { class: 'field' }, [h('label', {}, '抽题数量'), h('input', {
               class: 'input', type: 'number', value: newExam.value.count, onInput: e => newExam.value.count = Number(e.target.value)
@@ -129,7 +176,10 @@ export default {
         footer: [
           h('button', { class: 'btn', onClick: () => showNew.value = false }, '取消'),
           h('button', { class: 'btn', onClick: createByAi, disabled: creating.value }, 'AI 生成'),
-          h('button', { class: 'btn primary', onClick: createFromBank, disabled: creating.value }, '题库组卷')
+          h('button', {
+            class: 'btn primary', disabled: creating.value,
+            onClick: () => newExam.value.multi ? createFromBanks() : createFromBank()
+          }, newExam.value.multi ? '混合组卷' : '题库组卷')
         ]
       }) : null
     ])

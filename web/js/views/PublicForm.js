@@ -155,7 +155,9 @@ export default {
                 h('div', { class: 'small muted' }, result.value.graded === false
                   ? '本卷暂无可自动判分的题目，成绩需人工批阅'
                   : `满分 ${result.value.total ?? '-'} 分 · 及格线 ${result.value.passLine ?? '-'} 分 · ${result.value.passed ? '通过' : '未通过'}`),
-                result.value.ungraded ? h('div', { class: 'small muted', style: 'margin-top:2px' }, `另有 ${result.value.ungraded} 道主观题需人工批阅，不计入自动判分`) : null
+                result.value.ungraded ? h('div', {
+                  style: 'margin-top:8px;padding:8px 12px;border-radius:9px;background:rgba(245,158,11,.12);font-size:12.5px;color:var(--warn, #b06b00)'
+                }, `还有 ${result.value.ungraded} 道主观题等待人工批阅，批阅后总分与是否通过会更新，可凭答卷编号回来查询`) : null
               ]) : null,
               result.value?.review?.items?.length ? h('div', { style: 'margin-top:16px;text-align:left' }, [
                 h('div', { class: 'small muted', style: 'margin-bottom:8px' }, '逐题回顾'),
@@ -222,7 +224,11 @@ export default {
                   queryResult.value ? h('div', { style: 'margin-top:12px;font-size:13px' }, [
                     h('div', { class: 'small muted', style: 'margin-bottom:6px' },
                       `答卷 #${queryResult.value.id} · ${fmtDate(queryResult.value.createdAt)}` +
-                      (queryResult.value.score != null ? ` · 得分 ${queryResult.value.score}` : '')),
+                      (queryResult.value.score != null ? ` · 得分 ${queryResult.value.score}` : '') +
+                      (queryResult.value.reviewed ? ' · 已人工批阅' : '')),
+                    queryResult.value.review ? h('div', { class: 'small', style: 'margin-bottom:8px;color:' + (queryResult.value.passed ? 'var(--ok)' : 'var(--danger)') },
+                      `${queryResult.value.passed ? '通过' : '未通过'} · 可判分总分 ${queryResult.value.review.total} 分 · 及格线 ${queryResult.value.review.passLine} 分` +
+                      (queryResult.value.review.ungraded ? ` · 还有 ${queryResult.value.review.ungraded} 题待批阅` : '')) : null,
                     ...form.value.schema
                       .filter(f => queryResult.value.data[f.id] !== undefined && !['divider', 'richtext', 'html', 'image'].includes(f.type))
                       .map(f => {

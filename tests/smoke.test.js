@@ -413,6 +413,98 @@ try {
   assert(bs[2].type === 'email', '邮箱题型识别正确', bs[2].type)
   assert(bs[3].type === 'textarea', '多行题型识别正确', bs[3].type)
 
+
+  console.log('\n[19] 主观题人工批阅')
+  // 建一份「客观题 20 分 + 主观题 20 分」的卷子
+  r = await req('POST', '/api/forms', {
+    title: '批阅测试卷', kind: 'exam',
+    schema: [
+      { id: 'q1', type: 'radio', label: 'HTTP 404 表示？', options: [{ label: '未找到', value: 'A' }, { label: '成功', value: 'B' }], answer: ['A'], score: 20, required: true },
+      { id: 'q2', type: 'textarea', label: '简述事件循环', answer: [], score: 20 },
+      { id: 'q3', type: 'text', label: '附加题', answer: [], score: 0 }
+    ],
+    settings: { passPercent: 60 }
+  })
+  const reviewFormId = r.json.id
+  await req('PUT', `/api/forms/${reviewFormId}`, { status: 'published' })
+
+  r = await req('POST', `/api/public/forms/${reviewFormId}/submit`, { data: { q1: 'A', q2: '宏任务与微任务交替执行' } })
+  const subId = r.json.id
+  assert(r.json.graded === true, '客观题有答案 → 已有可自动判分题目')
+  assert(r.json.score === 20, '自动判分只算客观题：20 分', String(r.json.score))
+  assert(r.json.total === 20, '可判分总分 20（主观题暂不计入）', String(r.json.total))
+  assert(r.json.paperTotal === 40, '卷面总分 40 分单独回传', String(r.json.paperTotal))
+  assert(r.json.ungraded === 1, '待批阅题目数 1', String(r.json.ungraded))
+  assert(r.json.passed === true, '客观题全对即按 20 分口径通过（不再被主观题拖成永久不及格）')
+
+  r = await req('PUT', `/api/submissions/${subId}/review`, { scores: { q2: 15 }, note: '思路正确' })
+  assert(r.status === 200 && r.json.ok, '批阅接口可用', 'status=' + r.status)
+  assert(r.json.data.score === 35, '批阅后重算总分 20 + 15 = 35', String(r.json.data?.score))
+  assert(r.json.data.passed === 1, '批阅后仍通过（35/40 ≥ 60%）', String(r.json.data?.passed))
+  assert(r.json.data.manual_scores?.q2 === 15, '人工分被持久化')
+  assert(!!r.json.data.reviewed_at, '记录批阅时间')
+
+  r = await req('GET', `/api/submissions/${subId}`)
+  assert(r.json.data.score === 35, '详情接口读到重算后的成绩')
+
+  r = await req('PUT', `/api/submissions/${subId}/review`, { scores: { q2: 99 } })
+  assert(r.status === 400, '给分超过题目分值被拒绝', 'status=' + r.status)
+  r = await req('PUT', `/api/submissions/${subId}/review`, { scores: { q1: 20 } })
+  assert(r.status === 200 && r.json.data.score === 20, '客观题不接受人工加分（只认主观题）', String(r.json.data?.score))
+  r = await req('PUT', `/api/submissions/${subId}/review`, { scores: { q2: -5 } })
+  assert(r.status === 400, '负分被拒绝')
+
+  r = await req('PUT', `/api/submissions/${subId}/review`, { scores: { q2: 0 } })
+  assert(r.json.data.score === 20, '主观题给 0 分时总分回落到客观题得分', String(r.json.data?.score))
+  assert(r.json.data.passed === 0, '主观题 0 分 → 20/40 未达 60% 及格线', String(r.json.data?.passed))
+
+  // 全主观题的卷子：交卷时显示待批阅，批阅后才有成绩口径
+  r = await req('POST', '/api/forms', {
+    title: '全主观卷', kind: 'exam',
+    schema: [{ id: 's1', type: 'textarea', label: '谈谈你的理解', answer: [], score: 30 }],
+    settings: { passPercent: 60 }
+  })
+  const essayFormId = r.json.id
+  await req('PUT', `/api/forms/${essayFormId}`, { status: 'published' })
+  r = await req('POST', `/api/public/forms/${essayFormId}/submit`, { data: { s1: '我的理解是……' } })
+  const essaySubId = r.json.id
+  assert(r.json.graded === false, '全主观卷交卷时标记为「待批阅」而非 0 分')
+  r = await req('PUT', `/api/submissions/${essaySubId}/review`, { scores: { s1: 24 } })
+  assert(r.json.data.score === 24 && r.json.data.passed === 1, '全主观卷批阅后按 24/30 判定通过', String(r.json.data?.score))
+
+  // 待批阅筛选
+  r = await req('GET', `/api/submissions?pending=1&pageSize=100`)
+  assert(Array.isArray(r.json.data), '待批阅筛选可查询')
+
+  console.log('\n[20] 多题库混合组卷')
+  r = await req('POST', '/api/banks', { name: '组卷库 A' })
+  const bankA = r.json.id
+  r = await req('POST', '/api/banks', { name: '组卷库 B' })
+  const bankB = r.json.id
+  for (let i = 1; i <= 6; i++) {
+    await req('POST', `/api/banks/${bankA}/questions`, {
+      type: 'radio', label: `A 库题 ${i}`, options: [{ label: '对', value: 'Y' }, { label: '错', value: 'N' }], answer: ['Y'], score: 5
+    })
+  }
+  for (let i = 1; i <= 2; i++) {
+    await req('POST', `/api/banks/${bankB}/questions`, {
+      type: 'text', label: `B 库题 ${i}`, score: 10
+    })
+  }
+  r = await req('POST', '/api/banks/paper', { title: '混合卷', bankIds: [bankA, bankB], count: 4, duration: 30, passPercent: 70 })
+  assert(r.status === 201 && r.json.count === 4, '按数量抽题成功', String(r.json.count))
+  assert(r.json.banks?.length === 2, '两个孩子题库都被抽到（轮转均摊）', JSON.stringify(r.json.banks))
+  const mixedId = r.json.id
+  r = await req('GET', `/api/forms/${mixedId}`)
+  assert(r.json.data.kind === 'exam', '生成的表单是考试类型')
+  assert(r.json.data.schema.length === 4, '卷面题目数与请求一致', String(r.json.data.schema.length))
+  assert(r.json.data.settings.passPercent === 70, '及格线按百分比写入', String(r.json.data.settings?.passPercent))
+
+  r = await req('POST', '/api/banks/paper', { bankIds: [bankA], count: 100 })
+  assert(r.json.count === 6, '抽题数量超过题库容量时取全部', String(r.json.count))
+  r = await req('POST', '/api/banks/paper', { bankIds: [999999], count: 3 })
+  assert(r.status === 400, '非法题库 id 被拒绝', 'status=' + r.status)
+
   console.log('\n[18] 前端静态资源')
   for (const p of ['/', '/js/main.js', '/css/app.css', '/assets/eqs-mark.svg', '/vendor/echarts.min.js']) {
     const res = await fetch(BASE + p)

@@ -74,6 +74,10 @@ CREATE TABLE IF NOT EXISTS submissions (
   wx_nickname TEXT DEFAULT '',
   wx_avatar TEXT DEFAULT '',
   marked INTEGER NOT NULL DEFAULT 0,
+  manual_scores TEXT NOT NULL DEFAULT '{}',
+  reviewed_at TEXT,
+  reviewed_by INTEGER NOT NULL DEFAULT 0,
+  review_note TEXT DEFAULT '',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   deleted_at TEXT
@@ -163,6 +167,21 @@ CREATE INDEX IF NOT EXISTS idx_sub_form ON submissions(form_id, deleted_at);
 CREATE INDEX IF NOT EXISTS idx_q_bank ON questions(bank_id, deleted_at);
 CREATE INDEX IF NOT EXISTS idx_forms_kind ON forms(kind, deleted_at);
 `)
+
+// 老库补列：SQLite 没有 ADD COLUMN IF NOT EXISTS，先查再补
+function ensureColumns(table, columns) {
+  const have = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map(c => c.name))
+  for (const [name, ddl] of Object.entries(columns)) {
+    if (!have.has(name)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${ddl}`)
+  }
+}
+
+ensureColumns('submissions', {
+  manual_scores: "TEXT NOT NULL DEFAULT '{}'",
+  reviewed_at: 'TEXT',
+  reviewed_by: 'INTEGER NOT NULL DEFAULT 0',
+  review_note: "TEXT DEFAULT ''"
+})
 
 export const get = (sql, ...params) => db.prepare(sql).get(...params)
 export const all = (sql, ...params) => db.prepare(sql).all(...params)

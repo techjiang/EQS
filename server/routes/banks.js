@@ -146,6 +146,71 @@ export default function register(r) {
     sendJson(res, 201, { ok: true, id: Number(result.lastInsertRowid), count: schema.length, settings })
   })
 
+  /** 跨题库组卷：多个题库按比例抽题，或全库随机 */
+  r.post('/api/banks/paper', async (req, res) => {
+    const user = requirePerm(req, 'bank:write')
+    const body = await readJson(req)
+    const count = Math.max(1, Math.min(200, Number(body.count) || 10))
+    const visible = can(user, '*')
+      ? all('SELECT * FROM banks WHERE deleted_at IS NULL')
+      : all('SELECT * FROM banks WHERE deleted_at IS NULL AND owner_id = ?', user.id)
+    const byId = new Map(visible.map(b => [b.id, b]))
+    // 指定了题库就只在指定范围内抽，没指定就全库
+    let ids = Array.isArray(body.bankIds) ? body.bankIds.map(Number).filter(id => byId.has(id)) : []
+    // 显式指定了题库却一个都不可用，直接拒绝；不要偷偷退化成「全库抽题」
+    if (Array.isArray(body.bankIds) && body.bankIds.length && !ids.length) fail(400, '所选题库不存在或无权访问')
+    if (!ids.length) ids = visible.map(b => b.id)
+    if (!ids.length) fail(400, '没有可用的题库')
+    const marks = ids.map(() => '?').join(',')
+    const pool = all(`SELECT * FROM questions WHERE deleted_at IS NULL AND bank_id IN (${marks})`, ...ids)
+    if (!pool.length) fail(400, '所选题库中没有题目')
+    let picked = pool
+    if (body.typeFilter) {
+      const tf = pool.filter(q => q.type === body.typeFilter)
+      if (tf.length) picked = tf
+    }
+    // 按比例均衡抽题：先打乱再轮转各题库取，避免题目多的题库把卷子占满
+    picked = picked.sort(() => Math.random() - 0.5)
+    if (picked.length > count) {
+      const buckets = new Map()
+      for (const q of picked) {
+        if (!buckets.has(q.bank_id)) buckets.set(q.bank_id, [])
+        buckets.get(q.bank_id).push(q)
+      }
+      const lists = [...buckets.values()]
+      const out = []
+      while (out.length < count && lists.some(l => l.length)) {
+        for (const l of lists) {
+          if (out.length >= count) break
+          if (l.length) out.push(l.shift())
+        }
+      }
+      picked = out
+    }
+    const schema = picked.map(q => {
+      const p = parseQ(q)
+      return normalizeField({ type: p.type, label: p.title, options: p.options, answer: p.answer, analysis: p.analysis, score: p.score })
+    })
+    const settings = {
+      passPercent: Number(body.passPercent) > 0 ? Math.min(100, Number(body.passPercent)) : 60,
+      duration: Math.max(0, Number(body.duration) || 0)
+    }
+    const ts = now()
+    const usedBanks = [...new Set(picked.map(q => byId.get(q.bank_id)?.name).filter(Boolean))]
+    const result = run('INSERT INTO forms(title, description, kind, schema, settings, status, created_by, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?)',
+      String(body.title || '智能组卷').slice(0, 200),
+      body.description || `从 ${usedBanks.length} 个题库随机抽取生成`,
+      'exam', JSON.stringify(schema), JSON.stringify(settings), 'draft', user.id, ts, ts)
+    sendJson(res, 201, {
+      ok: true,
+      id: Number(result.lastInsertRowid),
+      count: schema.length,
+      banks: usedBanks,
+      total: picked.reduce((a, q) => a + (Number(q.score) || 0), 0),
+      settings
+    })
+  })
+
   /** 刷题：拉取题目（不返回答案） */
   r.get('/api/banks/:id/practice', async (req, res, { params }) => {
     const user = requireUser(req)

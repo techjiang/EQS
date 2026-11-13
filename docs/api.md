@@ -39,7 +39,7 @@
 | --- | --- | --- |
 | GET | `/api/public/forms/:id` | 读取已发布表单（不含答案） |
 | POST | `/api/public/forms/:id/submit` | 提交 `{data, password?, openid?, wxNickname?, wxAvatar?, duration?}` |
-| GET | `/api/public/forms/:id/query?submissionId=` | 按编号查询答卷（需开启 `allowQuery`，且只能查本设备 / 本账号 / 同 IP 提交的答卷） |
+| GET | `/api/public/forms/:id/query?submissionId=` | 按编号查询答卷（需开启 `allowQuery`，且只能查本设备 / 本账号 / 同 IP 提交的答卷），返回含 `score` / `passed` / `reviewed` / `review` |
 
 提交响应：
 
@@ -47,10 +47,69 @@
 { "ok": true, "id": 12, "score": 85, "total": 100, "paperTotal": 100, "ungraded": 0, "graded": true, "passed": true, "message": "提交成功", "redirect": "" }
 ```
 
+分数口径：
+- `total` 只统计**可自动判分**的题目（客观题），主观题没有标准答案，不计入。
+- `paperTotal` 是整卷满分（含主观题），展示用。
+- `ungraded` 是待人工批阅的主观题数量；`graded: false` 表示尚有主观题未批阅，
+  此时前端展示「待批阅」而不是 0 分，避免“全对也不及格”的误判。
+- `passed` 由 `score / total` 与 `settings.passPercent` 比较得出，全部主观题时返回 `null`。
+
 `GET /api/public/forms/:id` 返回的 `settings` 已按白名单裁剪：只含外观与开关
 （`submitText`、`buttonText`、`redirectUrl`、`headerImage`、`bgImage`、`bgColor`、`buttonColor`、
 `allowQuery`、`onlyWechat`、`recordWechat`、`needPassword`、`passPercent`、`showResult`、`duration`），
 访问密码、白名单、通知邮箱等敏感字段不会下发到浏览器。
+
+## 答卷
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/api/submissions?formId=&keyword=&page=&pageSize=&pending=1` | 列表；`pending=1` 只看考试类且未批阅的答卷 |
+| GET | `/api/submissions/:id` | 单份答卷详情（含 `manualScores`、批阅信息） |
+| PUT | `/api/submissions/:id` | 编辑答卷内容（保留已有主观题人工分） |
+| PUT | `/api/submissions/:id/review` | 主观题批阅，见下 |
+| DELETE | `/api/submissions/:id` | 删除 |
+| POST | `/api/submissions/batch-delete` | `{ids}` 批量删除 |
+
+### 主观题人工批阅
+
+```
+PUT /api/submissions/:id/review
+{ "scores": { "q_lesson": 12, "q_plan": 15 }, "note": "思路完整，指标可再具体些" }
+```
+
+`scores` 的键是 schema 中题目的 `key`，值是人工给出的分数。服务端逐项校验：
+只接受主观题（无标准答案且分值 > 0）、值必须是 `[0, 题目分值]` 内的数字，
+给选择题打分、负数、非数字一律 400。
+
+保存后按「客观题自动分 + 主观题人工分」重算总分，写回 `score` 并记录
+`reviewed_at` / `reviewed_by` / `review_note`，同时触发 `update` WebHook。
+未出现在 `scores` 里的主观题保留原有分数，因此可以分批批阅、随时调整。
+
+## 题库与组卷
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/api/banks` | 题库列表 |
+| POST | `/api/banks` | 新建题库 `{name, description?}` |
+| GET | `/api/banks/:id/questions` | 题目列表 |
+| POST | `/api/banks/:id/questions` | 新增题目 |
+| POST | `/api/banks/:id/import` | `{text}` 文本批量导入 |
+| POST | `/api/banks/paper` | 多题库混合组卷，见下 |
+
+### 多题库混合组卷
+
+```
+POST /api/banks/paper
+{ "bankIds": [1, 2, 3], "count": 10, "types": ["single", "essay"],
+  "title": "2025 前端与安全能力考核", "passPercent": 60, "duration": 60 }
+```
+
+- `bankIds` 按当前用户权限过滤，传了但全部无效时返回 `400 所选题库不存在或无权访问`，
+  不会静默退化成「从全部题库抽题」。
+- 抽题时先把候选题全局打乱，再按题库轮转取题（round-robin），
+  避免题量大的题库把卷面刷满，保证混合卷各题库比例均衡。
+- `types` 可限定题型；`passPercent` / `duration` 写入新考试的 settings。
+- 返回新建的考试表单详情，`schema.fields` 即组好的卷面。
 
 ## 附件上传
 

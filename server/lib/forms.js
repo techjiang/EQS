@@ -112,12 +112,15 @@ export function validateSubmission(schema, data) {
   return errors
 }
 
+const isBlank = v => v === undefined || v === null || v === '' || (Array.isArray(v) && v.length === 0)
+
 /**
- * 自动评分（考试）
- * 只把「有标准答案」的题计入卷面总分：简答、论述这类题目前不支持人工批阅，
- * 若算进总分，会出现「全对也永远不及格」的假失败。
+ * 考试评分
+ * 三类题分开算：有标准答案的自动判；没标准答案但有人工给分的按人工分计；
+ * 既没答案也没人批的主观题，只算进卷面总分，不进可判分总分——否则「全对也永远不及格」。
+ * @param manual { [fieldId]: number } 老师给的分
  */
-export function gradeSubmission(schema, data, settings = {}) {
+export function gradeSubmission(schema, data, settings = {}, manual = {}) {
   let total = 0
   let got = 0
   let scored = 0
@@ -126,17 +129,41 @@ export function gradeSubmission(schema, data, settings = {}) {
   for (const f of schema) {
     if (!f.score || !fieldVisible(f, data)) continue
     paperTotal += f.score
-    if (!f.answer?.length) { ungraded++; continue }
+    if (f.answer?.length) {
+      total += f.score
+      scored++
+      const v = data[f.id]
+      const given = (Array.isArray(v) ? v : v === undefined || v === null || v === '' ? [] : [v]).map(String).sort()
+      const right = f.answer.map(String).sort()
+      if (given.length === right.length && given.every((x, i) => x === right[i])) got += f.score
+      continue
+    }
+    const m = manual?.[f.id]
+    if (m === undefined || m === null || m === '') { ungraded++; continue }
+    // 人工分约束在 [0, 该题分值] 之间，防止手抖填出超纲分数
     total += f.score
     scored++
-    const v = data[f.id]
-    const given = (Array.isArray(v) ? v : v === undefined || v === null || v === '' ? [] : [v]).map(String).sort()
-    const right = f.answer.map(String).sort()
-    if (given.length === right.length && given.every((x, i) => x === right[i])) got += f.score
+    got += Math.min(f.score, Math.max(0, Number(m) || 0))
   }
   const score = Math.round(got * 100) / 100
   const passLine = passLineOf(settings, total)
   return { score, total, paperTotal, ungraded, passLine, passed: score >= passLine, graded: scored > 0 }
+}
+
+/** 从答卷记录里取人工批阅分：{ [fieldId]: number } */
+export function manualScoresOf(row) {
+  if (!row?.manual_scores) return {}
+  try {
+    const v = JSON.parse(row.manual_scores)
+    return v && typeof v === 'object' ? v : {}
+  } catch { return {} }
+}
+
+/** 需要在及格线之外单独告知的提示，避免「满分 40 却显示 75」这类口径误会 */
+export function passHintOf(settings = {}, total = 0, paperTotal = 0) {
+  const passLine = passLineOf(settings, total)
+  if (paperTotal > total) return `及格线按可判分题目总分 ${total} 分计算，卷面总分 ${paperTotal} 分，另有主观题待人工批阅`
+  return `满分 ${total} 分 · 及格线 ${passLine} 分`
 }
 
 /** 及格线：优先按总分百分比（passPercent），否则回退到绝对分（passScore），默认 60% */
