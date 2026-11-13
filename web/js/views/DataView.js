@@ -114,16 +114,17 @@ export default {
     }
 
     const remove = async (row) => {
-      if (!await confirmBox(`删除答卷 #${row.id}？可在回收中心恢复的记录不会保留（仅表单可恢复）。`)) return
+      if (!await confirmBox(`删除答卷 #${row.id}？删除后可在「回收中心 · 答卷」里恢复。`)) return
       try { await api.del(`/api/submissions/${row.id}`); ok('已删除'); load() } catch (e) { err(e.message) }
     }
 
     const batchDelete = async () => {
       if (!selected.value.length) return err('请先勾选答卷')
-      if (!await confirmBox(`删除选中的 ${selected.value.length} 份答卷？`)) return
+      if (!await confirmBox(`删除选中的 ${selected.value.length} 份答卷？删除后可在「回收中心 · 答卷」里恢复。`)) return
       try {
-        await api.post('/api/submissions/batch-delete', { ids: selected.value })
-        ok('已删除')
+        const r = await api.post('/api/submissions/batch-delete', { ids: selected.value })
+        // 之前不管删没删掉都报「已删除 N 份」，其中不存在的 id、无权的答卷其实原样躺在库里
+        ok(r.skipped ? `已删除 ${r.count} 份，${r.skipped} 份无权限或已不存在` : `已删除 ${r.count} 份`)
         selected.value = []
         load()
       } catch (e) { err(e.message) }

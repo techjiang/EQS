@@ -26,10 +26,27 @@
 | PUT | `/api/forms/:id` | 更新任意字段 |
 | DELETE | `/api/forms/:id` | 移入回收中心 |
 | POST | `/api/forms/:id/restore` | 恢复 |
-| DELETE | `/api/forms/:id/purge` | 彻底删除 |
+| DELETE | `/api/forms/:id/purge` | 彻底删除（须先移入回收中心，连带清理答卷与附件文件） |
 | POST | `/api/forms/:id/duplicate` | 复制 |
 | POST | `/api/forms/:id/import-text` | `{text}` 文本批量导入题目，返回 `{added, schema}` |
 | GET | `/api/forms/:id/report` | 报表统计数据 |
+
+## 回收中心
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/api/recycle/submissions` | 回收站里的答卷，返回 `{self, byForm}`：自己删掉的 / 所属表单在回收站的 |
+| POST | `/api/submissions/:id/restore` | 恢复一份答卷（所属表单必须已恢复） |
+| POST | `/api/submissions/batch-delete` | 批量删除 `{ids}`，返回 `{count, skipped}` |
+| GET | `/api/banks/recycle` | 回收站里的题库 |
+| POST | `/api/banks/:id/restore` | 恢复题库（题目跟着回来） |
+| DELETE | `/api/banks/:id/purge` | 彻底删除题库（须先移入回收中心，连带删掉题目） |
+| GET | `/api/questions/recycle` | 回收站里单独删掉的题目 |
+| POST | `/api/questions/:id/restore` | 恢复题目 |
+
+删除语义统一为**软删除 + 二次确认**：`DELETE` 只置 `deleted_at`，进回收中心；
+「彻底删除」要求对象已在回收站，并真正删库。表单的彻底删除会一并清理 `files`
+记录与本地磁盘文件，附件地址随即失效。
 
 `kind` 取值：`survey`（问卷）、`exam`（考试）、`form`（通用表单）。
 

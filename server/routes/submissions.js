@@ -297,11 +297,31 @@ export default function register(r) {
     })
   })
 
+  /**
+   * 回收中心·答卷。
+   * 删除答卷的提示语一直写着「可在回收中心恢复」，但回收中心只列表单——
+   * 手滑删掉一份答卷就再也找不回来，只能翻库。
+   * 这里同时给出两类：自己躺进回收站的答卷，以及被删表单底下的答卷。
+   */
+  r.get('/api/recycle/submissions', async (req, res) => {
+    const user = requirePerm(req, 'data:read')
+    const own = can(user, '*') ? '' : ` AND f.created_by = ${user.id}`
+    const self = all(`SELECT s.id, s.form_id, s.created_at, s.deleted_at, f.title AS form_title, f.deleted_at AS form_deleted_at
+      FROM submissions s JOIN forms f ON f.id = s.form_id
+      WHERE s.deleted_at IS NOT NULL AND f.deleted_at IS NULL${own} ORDER BY s.id DESC LIMIT 200`)
+    const byForm = all(`SELECT s.id, s.form_id, s.created_at, NULL AS deleted_at, f.title AS form_title, f.deleted_at AS form_deleted_at
+      FROM submissions s JOIN forms f ON f.id = s.form_id
+      WHERE s.deleted_at IS NULL AND f.deleted_at IS NOT NULL${own} ORDER BY s.id DESC LIMIT 200`)
+    sendJson(res, 200, { ok: true, data: { self, byForm } })
+  })
+
   /** 管理端：答卷列表 */
   r.get('/api/submissions', async (req, res) => {
     const user = requirePerm(req, 'data:read')
     const url = new URL(req.url, 'http://x')
-    const where = ['s.deleted_at IS NULL']
+    // 表单进了回收站，它的答卷就不该还留在「答卷数据」列表里：
+    // 之前只过滤答卷自己的 deleted_at，删掉的问卷底下 6 份答卷照样列出来、还能点开编辑。
+    const where = ['s.deleted_at IS NULL', 'f.deleted_at IS NULL']
     const args = []
     // 有主观题（带分值、无标准答案）的考试表单；这些表单的答卷才需要过阅卷队列
     const pendingFormIds = all(`SELECT id, schema FROM forms WHERE kind = 'exam' AND deleted_at IS NULL`)
@@ -425,6 +445,19 @@ export default function register(r) {
     sendJson(res, 200, { ok: true, data: { ...withManual(updated), review: buildReview(form.schema, data, form.settings, scores) } })
   })
 
+  /** 从回收站恢复一份答卷 */
+  r.post('/api/submissions/:id/restore', async (req, res, { params }) => {
+    const user = requirePerm(req, 'data:write')
+    const row = get('SELECT * FROM submissions WHERE id = ?', Number(params.id))
+    if (!row) fail(404, '答卷不存在')
+    const form = pickForm(row.form_id, { withDeleted: true })
+    if (!can(user, '*') && form?.created_by !== user.id) fail(403, '无权恢复')
+    if (form?.deleted_at) fail(400, '该答卷所属的表单还在回收站里，请先恢复表单')
+    run('UPDATE submissions SET deleted_at = NULL, updated_at = ? WHERE id = ?', now(), row.id)
+    log(user, '恢复答卷', `#${row.id}`)
+    sendJson(res, 200, { ok: true })
+  })
+
   r.delete('/api/submissions/:id', async (req, res, { params }) => {
     const user = requirePerm(req, 'data:write')
     const row = get('SELECT * FROM submissions WHERE id = ?', Number(params.id))
@@ -442,15 +475,21 @@ export default function register(r) {
     const { ids } = await readJson(req)
     if (!Array.isArray(ids) || !ids.length) fail(400, '请选择答卷')
     const ts = now()
+    let count = 0
+    let skipped = 0
     for (const id of ids) {
-      const row = get('SELECT * FROM submissions WHERE id = ?', Number(id))
-      if (!row) continue
+      const row = get('SELECT * FROM submissions WHERE id = ? AND deleted_at IS NULL', Number(id))
+      if (!row) { skipped++; continue }
       const form = pickForm(row.form_id, { withDeleted: true })
-      if (!can(user, '*') && form?.created_by !== user.id) continue
+      if (!can(user, '*') && form?.created_by !== user.id) { skipped++; continue }
       run('UPDATE submissions SET deleted_at = ? WHERE id = ?', ts, row.id)
+      count++
     }
-    sendJson(res, 200, { ok: true, count: ids.length })
+    // 之前一律回报「已删除 N 份」，其中不存在的 id、无权的答卷都没删掉，用户以为清干净了
+    sendJson(res, 200, { ok: true, count, skipped })
   })
+
+
 
   /** 报表统计 */
   r.get('/api/forms/:id/report', async (req, res, { params }) => {

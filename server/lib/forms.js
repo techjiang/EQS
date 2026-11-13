@@ -15,7 +15,10 @@ export function normalizeField(f, i = 0) {
   const out = {
     id: f.id || 'f_' + crypto.randomBytes(5).toString('hex'),
     type,
-    label: String(f.label ?? `题目 ${i + 1}`),
+    // 题库侧的字段叫 title（`POST /api/banks/:id/questions` 的文档也是 title），
+    // 表单侧叫 label。只认 label 的后果是：按文档建题，题干被静默写成「题目 1」，
+    // 库里全是同名题——接口一脸 201，人却以为题干丢了。
+    label: String(f.label ?? f.title ?? `题目 ${i + 1}`),
     // 空字符串要理解成「没填」：否则评分题 / NPS 的默认值 '' 会静默清空 0 分作答
     required: f.required === true || f.required === 'true' || f.required === 1,
     placeholder: f.placeholder || '',

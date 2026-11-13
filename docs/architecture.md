@@ -55,7 +55,14 @@ node:http 服务器 ── 路由表 ── 鉴权中间件 ── 业务模块
 | `settings` | KV 配置（分组 JSON） |
 | `webhooks` / `api_keys` / `logs` / `i18n` | 集成与运维 |
 
-**软删除**：`forms` 与 `submissions` 用 `deleted_at` 标记，回收中心据此展示。
+**软删除**：`forms`、`submissions`、`banks`、`questions` 都用 `deleted_at` 标记，回收中心据此展示并支持恢复。
+
+**两层删除**：`DELETE` 只做软删除（可恢复）；`purge` 才是真删库，且要求对象已在回收站里——
+避免一次误点就让问卷连同答卷消失。表单的 `purge` 会连带清理 `files` 记录与磁盘文件。
+
+**统计口径**：工作台的「表单总数 / 已发布」排除模板（`is_template = 0`）；
+答卷类统计一律 `submissions.deleted_at IS NULL AND forms.deleted_at IS NULL`，
+表单进回收站后它的答卷也不再计入。
 
 **索引**：`(form_id, deleted_at)`、`(bank_id, deleted_at)`、`(kind, deleted_at)`，覆盖主要列表查询。
 

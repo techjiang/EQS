@@ -2,6 +2,8 @@ import { get, all, run, now, db } from '../lib/db.js'
 import { readJson, fail, sendJson } from '../lib/http.js'
 import { requireUser, requirePerm, currentUser, can } from '../lib/auth.js'
 import { normalizeSchema, parseForm, pickForm, paginate, safeJson, judgeOptions } from '../lib/forms.js'
+import { localPath } from '../lib/storage.js'
+import fs from 'node:fs'
 import { log } from '../lib/db.js'
 
 const KINDS = ['survey', 'exam', 'practice', 'form']
@@ -103,10 +105,24 @@ export default function register(r) {
     const user = requirePerm(req, 'form:delete')
     const form = pickForm(params.id, { withDeleted: true })
     if (!form) fail(404, '表单不存在')
+    // 只有已经进了回收站的表单才允许彻底删除：直接对在用表单调 purge 的话，
+    // 一次误点就是「问卷连同全部答卷消失」，而回收中心根本没机会接住它。
+    if (!form.deleted_at) fail(400, '请先把表单移入回收中心，再彻底删除')
+    // 彻底删除要连附件一起清：之前只删了 forms / submissions 两张表，
+    // files 记录和磁盘上的文件全留着——用户以为「删干净了」，磁盘里还在涨。
+    let files = 0
+    for (const f of all(`SELECT * FROM files WHERE form_id = ? OR submission_id IN (SELECT id FROM submissions WHERE form_id = ?)`, form.id, form.id)) {
+      if (f.driver === 'local') {
+        const local = localPath(f.stored)
+        if (local) fs.rmSync(local, { force: true })
+      }
+      run('DELETE FROM files WHERE id = ?', f.id)
+      files++
+    }
     run('DELETE FROM submissions WHERE form_id = ?', form.id)
     run('DELETE FROM forms WHERE id = ?', form.id)
-    log(user, '彻底删除表单', `${form.title} #${form.id}`)
-    sendJson(res, 200, { ok: true })
+    log(user, '彻底删除表单', `${form.title} #${form.id}（含 ${files} 个附件）`)
+    sendJson(res, 200, { ok: true, files })
   })
 
   r.post('/api/forms/:id/duplicate', async (req, res, { params }) => {
@@ -162,13 +178,19 @@ export default function register(r) {
 
   r.get('/api/stats/overview', async (req, res) => {
     const user = requireUser(req)
-    const own = can(user, '*') ? '' : `WHERE created_by = ${user.id}`
-    const forms = get(`SELECT COUNT(*) c FROM forms ${own ? own + ' AND' : 'WHERE'} deleted_at IS NULL`).c
-    const published = get(`SELECT COUNT(*) c FROM forms ${own ? own + ' AND' : 'WHERE'} deleted_at IS NULL AND status = 'published'`).c
-    const submissions = get(`SELECT COUNT(*) c FROM submissions WHERE deleted_at IS NULL`).c
-    const today = get(`SELECT COUNT(*) c FROM submissions WHERE deleted_at IS NULL AND created_at >= ?`, new Date().toISOString().slice(0, 10)).c
-    const trend = all(`SELECT substr(created_at,1,10) AS date, COUNT(*) AS count FROM submissions WHERE deleted_at IS NULL GROUP BY date ORDER BY date DESC LIMIT 14`).reverse()
-    const recent = all(`SELECT s.id, s.form_id, s.created_at, f.title FROM submissions s JOIN forms f ON f.id = s.form_id WHERE s.deleted_at IS NULL ORDER BY s.id DESC LIMIT 8`)
+    // 模板也躺在 forms 表里。之前没排除，工作台一进来就报「表单总数 6 / 已发布 6」，
+    // 而用户其实一张问卷都没建——数字全来自内置模板，第一眼就在骗人。
+    const own = `f.is_template = 0 AND f.deleted_at IS NULL` + (can(user, '*') ? '' : ` AND f.created_by = ${user.id}`)
+    const forms = get(`SELECT COUNT(*) c FROM forms f WHERE ${own}`).c
+    const published = get(`SELECT COUNT(*) c FROM forms f WHERE ${own} AND f.status = 'published'`).c
+    // 答卷要跟着表单一起算：表单进了回收站，它的答卷就不该还在工作台上冒出来。
+    // 之前只过滤 s.deleted_at，删掉的问卷答卷照样躺在趋势图和「最近提交」里。
+    const visible = `s.deleted_at IS NULL AND f.deleted_at IS NULL AND f.is_template = 0` + (can(user, '*') ? '' : ` AND f.created_by = ${user.id}`)
+    const subsFrom = `FROM submissions s JOIN forms f ON f.id = s.form_id WHERE ${visible}`
+    const submissions = get(`SELECT COUNT(*) c ${subsFrom}`).c
+    const today = get(`SELECT COUNT(*) c ${subsFrom} AND s.created_at >= ?`, new Date().toISOString().slice(0, 10)).c
+    const trend = all(`SELECT substr(s.created_at,1,10) AS date, COUNT(*) AS count ${subsFrom} GROUP BY date ORDER BY date DESC LIMIT 14`).reverse()
+    const recent = all(`SELECT s.id, s.form_id, s.created_at, f.title ${subsFrom} ORDER BY s.id DESC LIMIT 8`)
     const users = get('SELECT COUNT(*) c FROM users').c
     sendJson(res, 200, { ok: true, data: { forms, published, submissions, today, users, trend, recent } })
   })

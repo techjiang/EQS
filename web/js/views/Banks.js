@@ -49,7 +49,7 @@ export default {
     }
 
     const delBank = async (b) => {
-      if (!await confirmBox(`删除题库「${b.name}」？`)) return
+      if (!await confirmBox(`删除题库「${b.name}」？可在「回收中心 · 题库」里恢复。`)) return
       try { await api.del(`/api/banks/${b.id}`); ok('已删除'); active.value = null; questions.value = []; load() } catch (e) { err(e.message) }
     }
 
@@ -68,7 +68,7 @@ export default {
     }
 
     const delQuestion = async (q) => {
-      if (!await confirmBox('删除这道题？')) return
+      if (!await confirmBox('删除这道题？可在「回收中心 · 题目」里恢复。')) return
       try { await api.del(`/api/questions/${q.id}`); select(active.value); load() } catch (e) { err(e.message) }
     }
 

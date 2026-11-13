@@ -898,7 +898,116 @@ try {
     assert(four[2]?.required === true && four[2]?.type === 'text', '「!」标记落成必填，感叹号不留在题干里', JSON.stringify(four[2]))
   }
 
-  console.log('\n[30] 前端静态资源')
+  console.log('\n[30] 删除与回收：彻底删除要连附件、统计口径跟着表单')
+  {
+    // 造一张带附件的问卷，公开提交一份（附件先上传后交卷）
+    r = await req('POST', '/api/forms', { title: '回收链路探针', schema: [{ type: 'text', label: '名字' }, { type: 'upload', label: '附件' }] })
+    const fId = r.json.id
+    await req('PUT', `/api/forms/${fId}`, { status: 'published' })
+    const fd = new FormData()
+    fd.append('formId', String(fId))
+    fd.append('file', new Blob([Buffer.from('hello')], { type: 'text/plain' }), 'a.txt')
+    const upRes = await fetch(BASE + '/api/upload', { method: 'POST', body: fd })
+    const up = await upRes.json()
+    assert(upRes.status === 201 && !!up.url, '匿名可向已发布表单上传附件', JSON.stringify(up))
+    r = await req('POST', `/api/public/forms/${fId}/submit`, { data: {} })
+    const subId = r.json.id
+    assert(!!subId, '提交答卷成功')
+
+    // 未进回收站的表单不允许直接彻底删除
+    r = await req('DELETE', `/api/forms/${fId}/purge`)
+    assert(r.status === 400, '在用的表单不能直接彻底删除，必须先入回收站', String(r.status))
+
+    // 答卷删除后可恢复
+    r = await req('DELETE', `/api/submissions/${subId}`)
+    assert(r.status === 200, '答卷可删除')
+    r = await req('GET', '/api/recycle/submissions')
+    assert(r.json.data.self.some(x => x.id === subId), '删除的答卷出现在回收中心')
+    r = await req('POST', `/api/submissions/${subId}/restore`)
+    assert(r.status === 200, '答卷可从回收中心恢复')
+    r = await req('GET', '/api/recycle/submissions')
+    assert(!r.json.data.self.some(x => x.id === subId), '恢复后不再停留在回收中心')
+
+    // 批量删除要报真实删除数，而不是「勾了几个就是几个」
+    r = await req('POST', '/api/submissions/batch-delete', { ids: [99999999] })
+    assert(r.json.count === 0 && r.json.skipped === 1, '批量删除回报真实条数，不存在的 id 计入跳过', JSON.stringify(r.json))
+
+    // 表单进回收站后，它的答卷不该继续出现在答卷列表与工作台统计里
+    await req('DELETE', `/api/forms/${fId}`)
+    r = await req('GET', '/api/submissions?pageSize=200')
+    assert(!r.json.data.some(x => x.form_id === fId), '表单进回收站后，其答卷不再出现在答卷列表')
+    r = await req('GET', '/api/recycle/submissions')
+    assert(r.json.data.byForm.some(x => x.id === subId), '表单在回收站时，其答卷归在「待恢复表单」下')
+
+    // 彻底删除：附件记录与磁盘文件一起清掉
+    r = await req('DELETE', `/api/forms/${fId}/purge`)
+    assert(r.status === 200 && r.json.files === 1, '彻底删除表单时连带清理附件', JSON.stringify(r.json))
+    r = await req('GET', `/api/files?formId=${fId}`)
+    assert(r.json.data.length === 0, '彻底删除后 files 表不留残记录')
+    const raw = await fetch(BASE + up.url)
+    assert(raw.status === 404, '彻底删除后附件地址立刻失效（文件真的从磁盘上没了）')
+  }
+
+  console.log('\n[31] 工作台统计不把模板和被删表单算进去')
+  {
+    r = await req('GET', '/api/stats/overview')
+    const d = r.json.data
+    r = await req('GET', '/api/forms?pageSize=200')
+    const mine = r.json.data.filter(f => !f.is_template)
+    assert(d.forms === mine.length, '表单总数不包含内置模板', `${d.forms} vs ${mine.length}`)
+    assert(d.submissions === d.trend.reduce((a, b) => a + b.count, 0), '总答卷数与趋势图口径一致', `${d.submissions} vs ${d.trend.reduce((a, b) => a + b.count, 0)}`)
+    const visibleIds = new Set(mine.map(f => f.id))
+    assert(d.recent.every(x => visibleIds.has(x.form_id)), '「最近提交」不出现已删表单的答卷', JSON.stringify(d.recent.map(x => x.form_id)))
+  }
+
+  console.log('\n[32] 题库接口按文档用 title 建题，题干不会被写成「题目 1」')
+  {
+    r = await req('POST', '/api/banks', { name: '题干口径探针' })
+    const bId = r.json.id
+    r = await req('POST', `/api/banks/${bId}/questions`, { type: 'radio', title: 'HTTP 404 表示什么？', options: ['A', 'B'], answer: ['A'], score: 5 })
+    r = await req('GET', `/api/banks/${bId}/questions`)
+    assert(r.json.data[0]?.title === 'HTTP 404 表示什么？', '按文档传 title，题干原样落库', JSON.stringify(r.json.data[0]?.title))
+    const qid = r.json.data[0].id
+    await req('PUT', `/api/questions/${qid}`, { title: 'HTTP 404 的语义是？' })
+    r = await req('GET', `/api/banks/${bId}/questions`)
+    assert(r.json.data[0]?.title === 'HTTP 404 的语义是？', '用 title 更新题干也生效', JSON.stringify(r.json.data[0]?.title))
+    await req('DELETE', `/api/banks/${bId}`)
+    await req('DELETE', `/api/banks/${bId}/purge`)
+  }
+
+  console.log('\n[33] 题库与题目的删除同样可回收')
+  {
+    r = await req('POST', '/api/banks', { name: '回收探针题库' })
+    const bId = r.json.id
+    r = await req('POST', `/api/banks/${bId}/questions`, { type: 'radio', title: '探针题一', options: ['A', 'B'], answer: ['A'], score: 5 })
+    const qId = r.json.ids[0]
+
+    await req('DELETE', `/api/banks/${bId}`)
+    r = await req('GET', '/api/banks/recycle')
+    assert(r.json.data.some(x => x.id === bId), '删除的题库出现在回收中心')
+    r = await req('POST', `/api/banks/${bId}/restore`)
+    assert(r.status === 200, '题库可恢复')
+    r = await req('GET', `/api/banks/${bId}/questions`)
+    assert(r.json.data.some(q => q.id === qId), '恢复题库后题目跟着回来')
+
+    // 单题删除 → 回收中心可见 → 可恢复
+    await req('DELETE', `/api/questions/${qId}`)
+    r = await req('GET', '/api/questions/recycle')
+    assert(r.json.data.some(q => q.id === qId), '删除的题目出现在回收中心')
+    r = await req('POST', `/api/questions/${qId}/restore`)
+    assert(r.status === 200, '题目可恢复')
+
+    // 题库没进回收站时不允许直接彻底删除
+    r = await req('DELETE', `/api/banks/${bId}/purge`)
+    assert(r.status === 400, '在用题库不能直接彻底删除', String(r.status))
+    await req('DELETE', `/api/banks/${bId}`)
+    r = await req('DELETE', `/api/banks/${bId}/purge`)
+    assert(r.status === 200 && r.json.questions === 1, '彻底删除题库连带删掉题目', JSON.stringify(r.json))
+    r = await req('GET', '/api/banks/recycle')
+    assert(!r.json.data.some(x => x.id === bId), '彻底删除后回收中心不再有它')
+  }
+
+  console.log('\n[34] 前端静态资源')
   for (const p of ['/', '/js/main.js', '/css/app.css', '/assets/eqs-mark.svg', '/vendor/echarts.min.js']) {
     const res = await fetch(BASE + p)
     assert(res.ok, `静态资源可访问：${p}`)

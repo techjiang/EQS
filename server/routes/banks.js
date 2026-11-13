@@ -48,6 +48,65 @@ export default function register(r) {
     sendJson(res, 200, { ok: true })
   })
 
+  /** 回收中心：题库列表（含被删题库下的题目数） */
+  r.get('/api/banks/recycle', async (req, res) => {
+    const user = requireUser(req)
+    const where = ['b.deleted_at IS NOT NULL']
+    const args = []
+    if (!can(user, '*')) { where.push('b.owner_id = ?'); args.push(user.id) }
+    const rows = all(`SELECT b.*, (SELECT COUNT(*) FROM questions q WHERE q.bank_id = b.id AND q.deleted_at IS NULL) AS question_count
+      FROM banks b WHERE ${where.join(' AND ')} ORDER BY b.id DESC`, ...args)
+    sendJson(res, 200, { ok: true, data: rows })
+  })
+
+  /** 从回收站恢复题库（题目跟着回来，它们是软删除，一直都在） */
+  r.post('/api/banks/:id/restore', async (req, res, { params }) => {
+    const user = requirePerm(req, 'bank:write')
+    const bank = get('SELECT * FROM banks WHERE id = ?', Number(params.id))
+    if (!bank) fail(404, '题库不存在')
+    if (!can(user, '*') && bank.owner_id !== user.id) fail(403, '无权恢复')
+    run('UPDATE banks SET deleted_at = NULL WHERE id = ?', bank.id)
+    log(user, '恢复题库', `${bank.name} #${bank.id}`)
+    sendJson(res, 200, { ok: true })
+  })
+
+  /** 回收中心：单独被删掉的题目 */
+  r.get('/api/questions/recycle', async (req, res) => {
+    const user = requireUser(req)
+    const where = ['q.deleted_at IS NOT NULL', 'b.deleted_at IS NULL']
+    const args = []
+    if (!can(user, '*')) { where.push('b.owner_id = ?'); args.push(user.id) }
+    const rows = all(`SELECT q.id, q.title, q.type, q.score, q.deleted_at, b.name AS bank_name
+      FROM questions q JOIN banks b ON b.id = q.bank_id WHERE ${where.join(' AND ')} ORDER BY q.id DESC LIMIT 200`, ...args)
+    sendJson(res, 200, { ok: true, data: rows })
+  })
+
+  r.post('/api/questions/:id/restore', async (req, res, { params }) => {
+    const user = requirePerm(req, 'bank:write')
+    const q = get('SELECT * FROM questions WHERE id = ?', Number(params.id))
+    if (!q) fail(404, '题目不存在')
+    const bank = get('SELECT * FROM banks WHERE id = ?', q.bank_id)
+    if (!can(user, '*') && bank?.owner_id !== user.id) fail(403, '无权恢复')
+    if (bank?.deleted_at) fail(400, '题目所属题库还在回收站里，请先恢复题库')
+    run('UPDATE questions SET deleted_at = NULL WHERE id = ?', q.id)
+    log(user, '恢复题目', `#${q.id} ${q.title}`)
+    sendJson(res, 200, { ok: true })
+  })
+
+  /** 彻底删除题库：连题目一起，删掉就是删掉 */
+  r.delete('/api/banks/:id/purge', async (req, res, { params }) => {
+    const user = requirePerm(req, 'bank:write')
+    const bank = get('SELECT * FROM banks WHERE id = ?', Number(params.id))
+    if (!bank) fail(404, '题库不存在')
+    if (!can(user, '*') && bank.owner_id !== user.id) fail(403, '无权删除')
+    if (!bank.deleted_at) fail(400, '请先把题库移入回收中心，再彻底删除')
+    const count = get('SELECT COUNT(*) c FROM questions WHERE bank_id = ?', bank.id).c
+    run('DELETE FROM questions WHERE bank_id = ?', bank.id)
+    run('DELETE FROM banks WHERE id = ?', bank.id)
+    log(user, '彻底删除题库', `${bank.name} #${bank.id}（含 ${count} 道题）`)
+    sendJson(res, 200, { ok: true, questions: count })
+  })
+
   r.get('/api/banks/:id/questions', async (req, res, { params }) => {
     const user = requireUser(req)
     const bank = get('SELECT * FROM banks WHERE id = ? AND deleted_at IS NULL', Number(params.id))
