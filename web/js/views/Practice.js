@@ -22,7 +22,8 @@ export default {
       try {
         const r = await api.get(`/api/banks/${bankId}/practice?mode=${mode.value}`)
         data.value = r.data
-        idx.value = Math.min(r.data.progress || 0, Math.max(0, r.data.questions.length - 1))
+        // 用服务端给的 resumeAt：顺序模式接着上次练，错题/收藏模式从第一题开始（进度可能已越过它们的长度）
+        idx.value = Math.min(r.data.resumeAt ?? 0, Math.max(0, r.data.questions.length - 1))
         feedback.value = null
         model.value = {}
       } catch (e) { err(e.message) } finally { loading.value = false }
@@ -86,7 +87,11 @@ export default {
 
     return () => {
       if (loading.value) return h('div', { style: 'padding:60px' }, '加载中…')
-      if (!q.value) return h('div', { class: 'card' }, h(Empty, { text: '该模式下暂时没有题目' }))
+      if (!q.value) return h('div', { class: 'card' }, h(Empty, {
+        text: mode.value === 'wrong' ? '错题集是空的：连续答对后题目会自动移出，或你还没答错过'
+          : mode.value === 'favorite' ? '还没有收藏的题目，答题时点「☆ 收藏」即可加入'
+            : '该模式下暂时没有题目'
+      }))
 
       const totalCount = data.value.questions.length
       return h('div', {}, [

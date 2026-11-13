@@ -31,6 +31,28 @@ export function fieldVisible(field, data) {
   })
 }
 
+/**
+ * 输入控件的值绑定。
+ * textarea 的 value 是内容而不是 attribute：在 h() 里写 value 只会写进 attribute，
+ * 用户敲字后 Vue 重渲染，内容会被属性里的旧值顶掉——看起来像「输入框吞字」「已填内容变回空白」。
+ * 表单填写区一律走这里：值是属性，内容靠 DOM property 同步，再加上 onInput 写回 model。
+ */
+function modelValue(props) {
+  return {
+    value: props.value,
+    onVnodeMounted: (vnode) => {
+      const el = vnode.el
+      if (el && el.tagName === 'TEXTAREA' && el.value !== String(props.value ?? '')) el.value = props.value ?? ''
+    },
+    onVnodeUpdated: (vnode) => {
+      const el = vnode.el
+      if (!el || el.tagName !== 'TEXTAREA') return
+      // 只在内容真的不一致时写，避免打断光标位置
+      if (el.value !== String(props.value ?? '')) el.value = props.value ?? ''
+    }
+  }
+}
+
 /** 渲染单个组件的作答控件 */
 export function renderControl(field, model, opts = {}) {
   const { readonly = false, onChange, onUpload } = opts
@@ -51,8 +73,8 @@ export function renderControl(field, model, opts = {}) {
       return h('textarea', {
         class: 'textarea', disabled: dis,
         placeholder: field.placeholder || '请输入内容',
-        value: val ?? '',
-        onInput: e => set(e.target.value)
+        onInput: e => set(e.target.value),
+        ...modelValue({ value: val ?? '' })
       })
     case 'date': case 'datetime': case 'time': {
       const type = field.type === 'datetime' ? 'datetime-local' : field.type
@@ -273,6 +295,8 @@ export function renderControl(field, model, opts = {}) {
             h('label', {}, sf.label),
             h('input', {
               class: 'input', value: row[sf.id] ?? '', disabled: dis,
+              type: sf.type === 'number' ? 'number' : sf.type === 'date' ? 'date' : sf.type === 'email' ? 'email' : 'text',
+              placeholder: sf.type === 'phone' ? '手机号' : '',
               onInput: e => {
                 const next = rows.map((r, j) => j === ri ? { ...r, [sf.id]: e.target.value } : r)
                 set(next)
@@ -281,7 +305,8 @@ export function renderControl(field, model, opts = {}) {
           ]))
         ])),
         !dis ? h('button', {
-          class: 'btn sm', onClick: () => set([...rows, {}])
+          // 新行要带上字段的空值：只塞 {} 会让「填了又删空」和「从没填过」看起来一样
+          class: 'btn sm', onClick: () => set([...rows, Object.fromEntries(fields.map(sf => [sf.id, '']))])
         }, '+ 添加一项') : null
       ])
     }
@@ -310,17 +335,78 @@ export function renderControl(field, model, opts = {}) {
     case 'richtext':
       return h('div', { style: 'font-size:13.5px;color:var(--text-2);line-height:1.8', innerHTML: sanitize(field.props?.html || '') })
     case 'qrcode':
-      return h('div', { class: 'flex' }, [
-        h('input', { class: 'input', placeholder: '扫码或手动输入', value: val ?? '', onInput: e => set(e.target.value) }),
-        h('button', { class: 'btn', type: 'button', onClick: () => toastOnce() }, '扫码')
+      return h('div', {}, [
+        h('div', { class: 'flex' }, [
+          h('input', {
+            class: 'input', placeholder: '扫码或手动输入', value: val ?? '', disabled: dis,
+            onInput: e => set(e.target.value)
+          }),
+          h('button', {
+            class: 'btn', type: 'button', disabled: dis,
+            onClick: () => scanCode(set)
+          }, '扫码')
+        ])
       ])
     default:
       return h('input', { class: 'input', value: val ?? '', onInput: e => set(e.target.value) })
   }
 }
 
-function toastOnce() {
-  import('./ui.js').then(m => m.toast('当前为预览模式，扫码需在浏览器中授权摄像头'))
+/**
+ * 扫码：浏览器支持 BarcodeDetector 且拿得到摄像头就真扫，否则老实说清楚。
+ * 以前这个按钮固定弹「预览模式」，正式填写页点它也是同一句话——等于没做这个组件。
+ */
+async function scanCode(set) {
+  const { toast } = await import('./ui.js')
+  const Detector = globalThis.BarcodeDetector
+  if (!Detector) {
+    toast('当前浏览器不支持摄像头扫码，请手动输入或换用 Chrome / Edge / 安卓浏览器')
+    return
+  }
+  if (!navigator.mediaDevices?.getUserMedia) {
+    toast('当前环境不支持摄像头（需要 HTTPS 或 localhost）')
+    return
+  }
+  let stream
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } })
+  } catch {
+    toast('没有拿到摄像头权限，请允许后重试，或手动输入')
+    return
+  }
+  const wrap = document.createElement('div')
+  wrap.style.cssText = 'position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,.82);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px'
+  const video = document.createElement('video')
+  video.setAttribute('playsinline', 'true')
+  video.style.cssText = 'width:min(86vw,460px);border-radius:16px;background:#000'
+  video.srcObject = stream
+  const tip = document.createElement('div')
+  tip.textContent = '把二维码放进画面里'
+  tip.style.cssText = 'color:#fff;font-size:13px;opacity:.85'
+  const cancel = document.createElement('button')
+  cancel.textContent = '取消'
+  cancel.className = 'btn'
+  const stop = () => {
+    stream.getTracks().forEach(t => t.stop())
+    wrap.remove()
+    clearInterval(timer)
+  }
+  cancel.onclick = stop
+  wrap.append(video, tip, cancel)
+  document.body.appendChild(wrap)
+  await video.play().catch(() => {})
+  const detector = new Detector({ formats: ['qr_code', 'code_128', 'ean_13'] })
+  const timer = setInterval(async () => {
+    if (video.readyState < 2) return
+    try {
+      const codes = await detector.detect(video)
+      if (codes?.length) {
+        set(codes[0].rawValue)
+        stop()
+        toast('已识别：' + codes[0].rawValue.slice(0, 40))
+      }
+    } catch {}
+  }, 350)
 }
 
 /** 与服务端 lib/forms.js 中 captchaChallenge 完全一致的算式，答案由服务端校验 */

@@ -226,6 +226,22 @@ export default function register(r) {
     })
   })
 
+
+/** 题库里还能用的、刷题时真正会被抽到的题目 id（题目被删后，记录里的脏 id 会让「错题 N」虚高） */
+function practicePool(bankId) {
+  return new Set(all('SELECT id FROM questions WHERE bank_id = ? AND deleted_at IS NULL', bankId).map(r => Number(r.id)))
+}
+
+/** 记录里只留当前题库真实存在的题目，顺便去重去脏 */
+function cleanIds(raw, pool) {
+  const set = new Set()
+  for (const v of Array.isArray(raw) ? raw : []) {
+    const n = Number(v)
+    if (Number.isFinite(n) && pool.has(n)) set.add(n)
+  }
+  return set
+}
+
   /** 刷题：拉取题目（不返回答案） */
   r.get('/api/banks/:id/practice', async (req, res, { params }) => {
     const user = requireUser(req)
@@ -236,20 +252,30 @@ export default function register(r) {
     const rows = all('SELECT * FROM questions WHERE bank_id = ? AND deleted_at IS NULL ORDER BY id ASC', bank.id).map(parseQ)
     if (!rows.length) fail(400, '题库暂无题目')
     const record = get('SELECT * FROM practice_records WHERE bank_id = ? AND user_id = ?', bank.id, user.id)
-    const wrongIds = record ? safeJson(record.wrong_ids, []) : []
-    const favoriteIds = record ? safeJson(record.favorite_ids, []) : []
+    const pool = practicePool(bank.id)
+    const wrongIds = cleanIds(record ? safeJson(record.wrong_ids, []) : [], pool)
+    const favoriteIds = cleanIds(record ? safeJson(record.favorite_ids, []) : [], pool)
     const notes = record ? safeJson(record.notes, {}) : {}
     let list = rows
     if (mode === 'random') list = [...rows].sort(() => Math.random() - 0.5)
-    if (mode === 'wrong') list = rows.filter(q => wrongIds.includes(q.id))
-    if (mode === 'favorite') list = rows.filter(q => favoriteIds.includes(q.id))
+    if (mode === 'wrong') list = rows.filter(q => wrongIds.has(Number(q.id)))
+    if (mode === 'favorite') list = rows.filter(q => favoriteIds.has(Number(q.id)))
+    // 进度停在题库末尾时，错题/收藏模式不能直接给出空列表，否则「错题 1」点进去一片空白
+    const rawProgress = Number(record?.progress) || 0
+    const resumeAt = rawProgress < list.length ? rawProgress : 0
     const safeList = list.map(q => ({
       id: q.id, type: q.type, title: q.title, options: q.options, analysis: '',
-      score: q.score, favorite: favoriteIds.includes(q.id), note: notes[q.id] || ''
+      score: q.score, favorite: favoriteIds.has(Number(q.id)), note: notes[q.id] || ''
     }))
     sendJson(res, 200, {
       ok: true,
-      data: { bank: { id: bank.id, name: bank.name }, mode, questions: safeList, progress: record?.progress || 0, wrongCount: wrongIds.length, favoriteCount: favoriteIds.length }
+      data: {
+        bank: { id: bank.id, name: bank.name }, mode, questions: safeList,
+        resumeAt,
+        progress: record?.progress || 0,
+        wrongCount: wrongIds.size,
+        favoriteCount: favoriteIds.size
+      }
     })
   })
 
@@ -282,8 +308,9 @@ export default function register(r) {
         bank.id, user.id, 'sequence', 0, '[]', '[]', '[]', '{}', now())
       record = get('SELECT * FROM practice_records WHERE bank_id = ? AND user_id = ?', bank.id, user.id)
     }
-    const rightIds = new Set(safeJson(record.right_ids, []))
-    const wrongIds = new Set(safeJson(record.wrong_ids, []))
+    const pool = practicePool(bank.id)
+    const rightIds = cleanIds(safeJson(record.right_ids, []), pool)
+    const wrongIds = cleanIds(safeJson(record.wrong_ids, []), pool)
     const streak = safeJson(record.notes, {}).__streak || {}
     const req2 = Number(body.streakToClear) || 0
     if (!judging) {
@@ -328,8 +355,8 @@ export default function register(r) {
       data: {
         progress: record.progress,
         right: safeJson(record.right_ids, []).length,
-        wrong: safeJson(record.wrong_ids, []).length,
-        favorite: safeJson(record.favorite_ids, []).length,
+        wrong: cleanIds(safeJson(record.wrong_ids, []), practicePool(Number(params.id))).size,
+        favorite: cleanIds(safeJson(record.favorite_ids, []), practicePool(Number(params.id))).size,
         notes: Object.fromEntries(Object.entries(notes).filter(([k]) => k !== '__streak'))
       }
     })

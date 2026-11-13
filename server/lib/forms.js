@@ -40,6 +40,16 @@ export function normalizeField(f, i = 0) {
     // 0 是合法下限，不能用 || 兜底
     out.props.min = out.props.min === undefined || out.props.min === null || out.props.min === '' ? 0 : Number(out.props.min)
   }
+  if (type === 'subform') {
+    // 子表单没有结构就是一段填不进去的空数组：默认给一个字段，前端也据此渲染
+    const fs = Array.isArray(out.props.fields) ? out.props.fields : []
+    out.props.fields = (fs.length ? fs : [{ id: 'sf_' + crypto.randomBytes(4).toString('hex'), type: 'text', label: '子项' }])
+      .map((sf, i) => ({
+        id: sf?.id || 'sf_' + crypto.randomBytes(4).toString('hex'),
+        type: FIELD_TYPES.includes(sf?.type) ? sf.type : 'text',
+        label: String(sf?.label ?? `子项 ${i + 1}`)
+      }))
+  }
   if (type === 'rate') out.props.max = Number(out.props.max) || 5
   if (type === 'slider') { out.props.min ??= 0; out.props.max ??= 100; out.props.step ??= 1 }
   return out
@@ -146,13 +156,26 @@ export function validateSubmission(schema, data) {
     if (['divider', 'richtext', 'image', 'html'].includes(f.type)) continue
     const v = data[f.id]
     // 排序题的空数组要真正算「没作答」：它一旦被默认填满，必填就成了摆设
-    const empty = v === undefined || v === null || v === '' || (Array.isArray(v) && v.length === 0)
+    // 数组：空数组是没作答；子表单还要看「每行都空」；排序/多选这类值数组本身有元素就算作答
+    const empty = v === undefined || v === null || v === '' || (Array.isArray(v) && (v.length === 0 ||
+      (f.type === 'subform' && v.every(row => !row || typeof row !== 'object' || Object.values(row).every(x => x === undefined || x === null || String(x).trim() === '')))))
     if (f.required && empty) { errors.push(`${f.label} 为必填项`); continue }
     if (empty) continue
     if (f.type === 'phone' && !/^1[3-9]\d{9}$/.test(String(v))) errors.push(`${f.label} 手机号格式不正确`)
     if (f.type === 'email' && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(v))) errors.push(`${f.label} 邮箱格式不正确`)
     if (f.type === 'idcard' && !/^\d{17}[\dXx]$/.test(String(v))) errors.push(`${f.label} 身份证号格式不正确`)
     if (f.type === 'number' && Number.isNaN(Number(v))) errors.push(`${f.label} 必须是数字`)
+    if (f.type === 'subform') {
+      // 子字段同样要按自己的规则校验，否则「必填手机号」的子项可以随便填
+      const rows = Array.isArray(v) ? v : []
+      rows.forEach((rf, ri) => {
+        for (const sf of (f.props?.fields || [])) {
+          const sv = rf?.[sf.id]
+          if (sv === undefined || sv === null || String(sv).trim() === '') continue
+          if (/手机|phone|mobile/i.test(sf.label) && !/^1[3-9]\d{9}$/.test(String(sv))) errors.push(`${f.label} 第 ${ri + 1} 项 ${sf.label} 格式不正确`)
+        }
+      })
+    }
     if (f.type === 'captcha') {
       const { a, b } = captchaChallenge(f.id)
       if (String(v).trim() !== String(a + b)) errors.push(`${f.label} 校验不通过，请重新计算`)
@@ -232,7 +255,8 @@ export function computeStats(form, submissions) {
   const schema = form.schema
   const list = []
   for (const f of schema) {
-    if (['divider', 'richtext', 'html', 'image'].includes(f.type)) continue
+    // 验证码只是防刷手段，统计它等于把「3+4」的答案摊在报表上；分割线/富文本/图片本来就没有作答
+    if (['divider', 'richtext', 'html', 'image', 'captcha'].includes(f.type)) continue
     const values = submissions.map(s => s.data[f.id]).filter(v => v !== undefined && v !== null && v !== '')
     const item = { id: f.id, label: f.label, type: f.type, count: values.length }
     if (['radio', 'select', 'checkbox', 'sort', 'carousel', 'rate', 'nps', 'switch'].includes(f.type)) {
@@ -261,6 +285,16 @@ export function computeStats(form, submissions) {
       item.max = nums.length ? Math.max(...nums) : 0
       item.min = nums.length ? Math.min(...nums) : 0
       item.count = nums.length
+    } else if (f.type === 'subform') {
+      // 子表单是对象数组，String(v) 出来一律是 [object Object]；拼成「事项：季度复盘 / 负责人：张三」才有意义
+      const labels = Object.fromEntries((f.props?.fields || []).map(sf => [sf.id, sf.label]))
+      // 一份答卷里有多行时压成一行展示，报表只关心「他填了什么」
+      item.samples = values.slice(0, 20).map(v => (Array.isArray(v) ? v : [])
+        .map(row => Object.entries(row || {}).filter(([, x]) => x !== undefined && x !== null && String(x).trim() !== '')
+          .map(([k, x]) => `${labels[k] || '字段'}：${x}`).join(' / '))
+        .filter(Boolean).join('；')
+      ).filter(Boolean).map(s => s.slice(0, 120))
+      item.rows = values.reduce((n, v) => n + (Array.isArray(v) ? v.filter(row => row && Object.values(row).some(x => String(x ?? '').trim() !== '')).length : 0), 0)
     } else {
       item.samples = values.slice(0, 20).map(v => String(flat(v)).slice(0, 60))
     }

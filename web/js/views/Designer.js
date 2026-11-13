@@ -7,6 +7,15 @@ import { FIELD_GROUPS, blankField, fieldMeta, hasOptions, defaultData, uid } fro
 import { renderControl, FormRenderer, fieldVisible } from '../renderer.js'
 import { state } from '../store.js'
 
+
+/** textarea 的值同步：属性里的 value 不等于内容，直接在 h() 里传 value 会被 DOM 忽略 */
+function bindTextarea(value) {
+  const sync = (vnode) => {
+    const el = vnode.el
+    if (el && el.tagName === 'TEXTAREA' && el.value !== String(value ?? '')) el.value = value ?? ''
+  }
+  return { value, onVnodeMounted: sync, onVnodeUpdated: sync }
+}
 export default {
   setup() {
     const id = Number(route.value.path.split('/')[2])
@@ -124,14 +133,14 @@ export default {
 
     const doAi = async () => {
       if (!aiPrompt.value.trim()) return err('请先描述你想要的表单')
+      // 生成会整体替换现有题目。已经画了半天的表单被一句提示词清空，是不可撤销的操作
+      // 先问再进 busy：否则确认框这段时间按钮已经写着「生成中…」
+      if (form.value.schema?.length) {
+        const yes = await confirmBox(`AI 生成会替换当前 ${form.value.schema.length} 道题，确定继续？`)
+        if (!yes) return
+      }
       aiBusy.value = true
       try {
-        // 生成会整体替换现有题目。已经画了半天的表单被一句提示词清空，是不可撤销的操作
-        if (form.value.schema?.length) {
-          const yes = await confirmBox(`AI 生成会替换当前 ${form.value.schema.length} 道题，确定继续？`)
-          // 必须把 busy 放掉：提前 return 会让按钮永远停在「生成中…」
-          if (!yes) { aiBusy.value = false; return }
-        }
         const r = await api.post('/api/ai/generate', { prompt: aiPrompt.value, kind: form.value.kind })
         form.value.schema = r.data.schema
         if (!form.value.description) form.value.description = r.data.description
@@ -220,6 +229,31 @@ export default {
             onInput: e => f.props.maxSize = Number(e.target.value)
           }))
         ]) : null,
+        f.type === 'subform' ? h('div', { class: 'field' }, [
+          h('label', { class: 'flex between' }, [
+            h('span', {}, '子表单字段'),
+            h('button', {
+              class: 'btn ghost sm', onClick: () => {
+                f.props = f.props || {}
+                f.props.fields = f.props.fields || []
+                f.props.fields.push({ id: uid(), type: 'text', label: '子项 ' + (f.props.fields.length + 1) })
+              }
+            }, '+ 添加')
+          ]),
+          (f.props?.fields || []).map((sf, i) => h('div', { class: 'opt-row' }, [
+            h('input', {
+              class: 'input', value: sf.label,
+              onInput: e => { f.props.fields[i] = { ...sf, label: e.target.value } }
+            }),
+            h('button', {
+              onClick: () => {
+                if (f.props.fields.length <= 1) return err('子表单至少要保留一个字段')
+                f.props.fields.splice(i, 1)
+              }
+            }, '×')
+          ])),
+          h('div', { class: 'hint' }, '每行数据按这些字段填写，可随时增删；数据以数组形式保存')
+        ]) : null,
         ['richtext', 'html'].includes(f.type) ? row('内容（支持 HTML）', h('textarea', {
           class: 'textarea mono', style: 'min-height:90px', value: f.props?.html || '',
           onInput: e => f.props.html = e.target.value
@@ -228,11 +262,11 @@ export default {
           class: 'input', value: f.props?.src || '', placeholder: 'https://…',
           onInput: e => f.props.src = e.target.value
         })) : null,
-        ['radio', 'checkbox', 'select', 'rate', 'nps', 'text', 'textarea', 'number', 'date'].includes(f.type) ? h('div', {}, [
-          h('div', { class: 'field' }, [h('label', {}, '默认值'), h('input', {
+        ['radio', 'checkbox', 'select', 'rate', 'nps', 'text', 'textarea', 'number', 'date', 'subform'].includes(f.type) ? h('div', {}, [
+          f.type !== 'subform' ? h('div', { class: 'field' }, [h('label', {}, '默认值'), h('input', {
             class: 'input', value: f.defaultValue,
             onInput: e => f.defaultValue = e.target.value
-          })]),
+          })]) : null,
           h('div', { class: 'row' }, [
             row('分值（考试用）', h('input', {
               class: 'input', type: 'number', value: f.score || 0,
@@ -445,9 +479,11 @@ export default {
                 onInput: e => form.value.title = e.target.value
               }),
               h('textarea', {
-                class: 'textarea', style: 'border:none;min-height:40px;padding:6px 0 0;background:transparent;font-size:13px',
-                value: form.value.description, placeholder: '添加一段描述（可选）',
-                onInput: e => form.value.description = e.target.value
+                class: 'textarea', style: 'border-radius:0;border:none;border-bottom:1px dashed var(--line);min-height:40px;padding:6px 0 0;background:transparent;font-size:13px',
+                placeholder: '添加一段描述（可选）',
+                onInput: e => form.value.description = e.target.value,
+                // textarea 的 value 只是属性，内容得单独同步，否则输入会被旧属性顶掉
+                ...bindTextarea(form.value.description)
               })
             ]),
             h('div', {

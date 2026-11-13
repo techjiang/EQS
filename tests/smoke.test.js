@@ -757,7 +757,77 @@ try {
     assert(r.status === 201, '真的排了序就能提交', JSON.stringify(r.json))
   }
 
-  console.log('\n[26] 前端静态资源')
+  console.log('\n[26] 子表单：结构、必填与子字段校验')
+  {
+    r = await req('POST', '/api/forms', {
+      title: '子表单探针', status: 'published',
+      schema: [{ type: 'subform', label: '家庭成员', required: true, props: { fields: [{ label: '姓名' }, { label: '手机号' }] } }]
+    })
+    const sfField = r.json.data.schema[0]
+    assert(Array.isArray(sfField.props.fields) && sfField.props.fields.length === 2, '子表单字段结构被保住', JSON.stringify(sfField.props))
+    assert(sfField.props.fields.every(x => x.id), '子字段自动补齐 id', JSON.stringify(sfField.props.fields))
+
+    const sfForm = r.json.id
+    r = await req('POST', `/api/public/forms/${sfForm}/submit`, { data: { [sfField.id]: [] } })
+    assert(r.status === 422, '子表单为空时必填拦下', JSON.stringify(r.json))
+    r = await req('POST', `/api/public/forms/${sfForm}/submit`, { data: { [sfField.id]: [{ [sfField.props.fields[0].id]: '' }] } })
+    assert(r.status === 422, '子表单只加了一行空记录也算没填', JSON.stringify(r.json))
+    r = await req('POST', `/api/public/forms/${sfForm}/submit`, {
+      data: { [sfField.id]: [{ [sfField.props.fields[0].id]: '张三', [sfField.props.fields[1].id]: '13800138000' }] }
+    })
+    assert(r.status === 201, '子表单填对了就能提交', JSON.stringify(r.json))
+    r = await req('POST', `/api/public/forms/${sfForm}/submit`, {
+      data: { [sfField.id]: [{ [sfField.props.fields[0].id]: '张三', [sfField.props.fields[1].id]: '123' }] }
+    })
+    assert(r.status === 422 && /手机号/.test(r.json.message || ''), '子字段手机号也会校验', JSON.stringify(r.json))
+  }
+
+  console.log('\n[27] 刷题记录不虚高、错题模式不空转')
+  {
+    r = await req('POST', '/api/banks', { name: '刷题记录探针' })
+    const bid3 = r.json.id
+    r = await req('POST', `/api/banks/${bid3}/import-text`, { text: '1. 1+1=? [单选]\nA. 1\nB. 2\n答案：B' })
+    r = await req('GET', `/api/banks/${bid3}/practice?mode=sequence`)
+    const one = r.json.data.questions[0]
+    await req('POST', `/api/banks/${bid3}/practice/answer`, { questionId: one.id, value: 'A' })
+    r = await req('GET', `/api/banks/${bid3}/practice?mode=wrong`)
+    assert(r.json.data.questions.length === 1, '答错后进错题集', JSON.stringify(r.json.data.questions))
+    // 把进度推到题库末尾：错题模式不能因此给出空列表
+    await req('POST', `/api/banks/${bid3}/practice/answer`, { questionId: one.id, value: 'B', progress: 1, judge: true, streakToClear: 1 })
+    r = await req('GET', `/api/banks/${bid3}/practice?mode=wrong`)
+    assert(r.json.data.questions.length === 0, '答对后按阈值移出错题集')
+    await req('POST', `/api/banks/${bid3}/practice/answer`, { questionId: one.id, value: 'A', progress: 1, judge: true })
+    r = await req('GET', `/api/banks/${bid3}/practice?mode=wrong`)
+    assert(r.json.data.questions.length === 1 && r.json.data.resumeAt === 0, '进度到末尾后错题模式仍从第一题开始', JSON.stringify({ n: r.json.data.questions.length, at: r.json.data.resumeAt }))
+    // 删掉题目后，错题数不能还挂着那个已消失的 id
+    r = await req('DELETE', `/api/questions/${one.id}`)
+    r = await req('GET', `/api/banks/${bid3}/progress`)
+    assert(r.json.data === null || r.json.data.wrong === 0, '题目删除后错题数同步归零', JSON.stringify(r.json.data))
+  }
+
+  console.log('\n[28] 统计口径：子表单可读、验证码不进报表')
+  {
+    r = await req('POST', '/api/forms', { title: '报表口径探针', status: 'published', schema: [
+      { type: 'subform', label: '重点事项', props: { fields: [{ label: '事项' }, { label: '负责人' }] } },
+      { type: 'captcha', label: '人机校验' }
+    ] })
+    const repForm = r.json.data.schema
+    const sfRep = repForm[0]
+    const capId = repForm[1].id
+    const sumRep = String(capId).split('').reduce((a, c) => a + c.charCodeAt(0), 0) || 1
+    const capAns = String((sumRep % 7) + 2 + (sumRep % 5) + 2)
+    const subRep = await req('POST', `/api/public/forms/${r.json.id}/submit`, {
+      data: { [sfRep.id]: [{ [sfRep.props.fields[0].id]: '季度复盘', [sfRep.props.fields[1].id]: '张三' }], [repForm[1].id]: capAns }
+    })
+    assert(subRep.status === 201, '子表单 + 验证码的答卷提交成功', JSON.stringify(subRep.json))
+    r = await req('GET', `/api/forms/${r.json.id}/report`)
+    const sfStat = r.json.data.questions.find(q => q.id === sfRep.id)
+    assert(sfStat && !JSON.stringify(sfStat.samples || []).includes('object Object'), '子表单在报表里给出可读文本', JSON.stringify(sfStat?.samples))
+    assert((sfStat?.samples || []).some(x => x.includes('季度复盘') && x.includes('张三')), '子表单样本带上字段名', JSON.stringify(sfStat?.samples))
+    assert(!r.json.data.questions.some(q => q.type === 'captcha'), '验证码不进统计报表', JSON.stringify(r.json.data.questions.map(q => q.type)))
+  }
+
+  console.log('\n[29] 前端静态资源')
   for (const p of ['/', '/js/main.js', '/css/app.css', '/assets/eqs-mark.svg', '/vendor/echarts.min.js']) {
     const res = await fetch(BASE + p)
     assert(res.ok, `静态资源可访问：${p}`)

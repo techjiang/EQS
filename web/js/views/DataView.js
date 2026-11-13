@@ -91,10 +91,24 @@ export default {
       return f?.label || id
     }
 
+    /** 子表单一行数据 → 「事项：季度复盘 / 负责人：张三」；对象 key 是随机字段 id，直接摆出来没人看得懂 */
+    const subRowText = (row, f) => {
+      const labels = Object.fromEntries((f.props?.fields || []).map(sf => [sf.id, sf.label]))
+      return Object.entries(row || {})
+        .filter(([, x]) => x !== undefined && x !== null && String(x).trim() !== '')
+        .map(([k, x]) => `${labels[k] || '字段'}：${x}`).join(' / ')
+    }
+
     const cell = (row, f) => {
       const v = row.data[f.id]
       if (v == null || v === '') return '-'
-      if (Array.isArray(v)) return v.map(x => (typeof x === 'object' ? (x.name || x.url || JSON.stringify(x)) : x)).join(', ')
+      if (Array.isArray(v)) {
+        if (v.some(x => x && typeof x === 'object')) {
+          const lines = v.map(x => subRowText(x, f)).filter(Boolean)
+          return lines.length ? lines.slice(0, 3).join('；') + (lines.length > 3 ? ` 等 ${lines.length} 条` : '') : '-'
+        }
+        return v.join(', ')
+      }
       if (typeof v === 'object') return Object.entries(v).map(([k, x]) => `${k}：${typeof x === 'object' ? JSON.stringify(x) : x}`).join(' / ')
       return String(v).slice(0, 40)
     }
@@ -326,11 +340,10 @@ export default {
                   type: 'checkbox', style: 'accent-color:var(--brand)',
                   onChange: e => selected.value = e.target.checked ? rows.value.map(r => r.id) : []
                 })),
-                h('th', {}, '编号'), h('th', {}, '提交时间'),
+                h('th', { class: 'stick-id' }, '编号'), h('th', { class: 'stick-time' }, '提交时间'),
                 allMode.value ? h('th', {}, '来源表单') : null,
                 ...cols.value.map(f => h('th', {}, f.label)),
                 h('th', { class: 'stick-score' }, '得分'),
-                h('th', { class: 'stick-gap' }),
                 h('th', { class: 'stick-ops' }, '操作')
               ])),
               h('tbody', {}, rows.value.map(r => h('tr', {}, [
@@ -343,7 +356,7 @@ export default {
                     selected.value = [...s]
                   }
                 })),
-                h('td', {}, [
+                h('td', { class: 'stick-id' }, [
                   // 编号是给人抄的，折成两行既难读又把整张表撑高
                   h('div', { style: 'white-space:nowrap;line-height:1.35' }, [
                     h('span', { class: 'mono' }, '#' + r.id),
@@ -351,7 +364,7 @@ export default {
                   ]),
                   r.marked ? h('span', { class: 'tag warn', style: 'margin-left:6px' }, '标记') : null
                 ]),
-                h('td', { class: 'nowrap' }, fmtDate(r.created_at)),
+                h('td', { class: 'nowrap stick-time' }, fmtDate(r.created_at)),
                 allMode.value ? h('td', {}, r.form_title || '-') : null,
                 ...cols.value.map(f => h('td', {}, cell(r, f))),
                 h('td', { class: 'nowrap stick-score' }, r.score != null
@@ -360,7 +373,6 @@ export default {
                       r.reviewed_at ? h('span', { class: 'tag', style: 'margin-left:4px' }, '已批阅') : null
                     ])
                   : '-'),
-                h('td', { class: 'stick-gap' }),
                 h('td', { class: 'nowrap stick-ops' }, h('div', { class: 'flex', style: 'gap:4px' }, [
                   h('button', { class: 'btn ghost sm', onClick: () => openDetail(r) }, '查看'),
                   h('button', { class: 'btn ghost sm', onClick: () => openReview(r) }, '批阅'),
@@ -379,8 +391,16 @@ export default {
         onClose: () => detail.value = null, wide: true,
         children: h('div', {}, (form.value?.schema || []).filter(f => detail.value.data[f.id] !== undefined).map(f => h('div', { class: 'mb' }, [
           h('div', { class: 'small muted' }, f.label),
-          h('div', { style: 'font-weight:520;word-break:break-word' },
-            Array.isArray(detail.value.data[f.id]) ? detail.value.data[f.id].join('、')
+          h('div', { style: 'font-weight:520;word-break:break-word;white-space:pre-wrap' },
+            // 子表单是对象数组，join 出来是一串 [object Object]，得逐行拼出来
+            Array.isArray(detail.value.data[f.id]) && detail.value.data[f.id].some(x => x && typeof x === 'object')
+              ? detail.value.data[f.id].map((row, i) => {
+                  const labels = Object.fromEntries((f.props?.fields || []).map(sf => [sf.id, sf.label]))
+                  const text = Object.entries(row || {}).filter(([, v]) => v !== undefined && v !== null && String(v).trim() !== '')
+                    .map(([k, v]) => `${labels[k] || k}：${v}`).join(' / ')
+                  return text ? `${i + 1}. ${text}` : ''
+                }).filter(Boolean).join('\n')
+              : Array.isArray(detail.value.data[f.id]) ? detail.value.data[f.id].join('、')
               : typeof detail.value.data[f.id] === 'object'
                 ? Object.entries(detail.value.data[f.id]).map(([k, v]) => `${k}：${v}`).join('；')
                 : String(detail.value.data[f.id] || '-'))

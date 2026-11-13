@@ -52,17 +52,23 @@ export default {
           xAxis: { type: 'category', data: data.value.trend.map(t => t.date.slice(5)), axisLine: { lineStyle: { color: '#1d3a5f' } }, axisLabel: { color: '#7fa6d0' } },
           yAxis: { type: 'value', minInterval: 1, splitLine: { lineStyle: { color: '#12304d' } }, axisLabel: { color: '#7fa6d0' } },
           series: [{
-            type: 'line', smooth: true, symbolSize: 8,
-            data: data.value.trend.map(t => t.count),
-            lineStyle: { width: 3, color: '#38e0ff' },
-            itemStyle: { color: '#38e0ff' },
-            areaStyle: { color: new window.echarts.graphic.LinearGradient(0, 0, 0, 1, [{ offset: 0, color: 'rgba(56,224,255,.45)' }, { offset: 1, color: 'rgba(56,224,255,0)' }]) }
+            // 只有一天数据时折线只剩一个孤立点，投屏看着像没加载出来；单点改画柱状
+            ...(data.value.trend.length > 1
+              ? { type: 'line', smooth: true, symbolSize: 8, lineStyle: { width: 3, color: '#38e0ff' }, itemStyle: { color: '#38e0ff' },
+                  areaStyle: { color: new window.echarts.graphic.LinearGradient(0, 0, 0, 1, [{ offset: 0, color: 'rgba(56,224,255,.45)' }, { offset: 1, color: 'rgba(56,224,255,0)' }]) } }
+              : { type: 'bar', barMaxWidth: 36, itemStyle: { borderRadius: [6, 6, 0, 0], color: '#38e0ff' } }),
+            data: data.value.trend.map(t => t.count)
           }]
         })
       }
       // 只画真的有数据的题；全零的题画出来是空心圈，不如让位给其他题
+      // 按作答人数排序：前 3 张牌要放信息量最大的题，不能只按表单顺序取前三道
       const hasData = q => (q.series || []).some(s2 => Number(s2.value) > 0)
-      const chartable = data.value.questions.filter(q => (q.series || []).length && hasData(q)).slice(0, 3)
+      const chartable = data.value.questions
+        .filter(q => (q.series || []).length && hasData(q))
+        .slice()
+        .sort((a, b) => (b.count || 0) - (a.count || 0))
+        .slice(0, 3)
       chartable.forEach((q, i) => {
         const el = document.getElementById('sc-q' + i)
         if (!el) return
@@ -133,8 +139,11 @@ export default {
       ]
     }
 
+    // 与 render() 同口径：作答人数最多的前三题，保证「第 i 张卡片」和「第 i 张图」是同一道题
     const chartQuestions = () => (data.value?.questions || [])
       .filter(q => (q.series || []).length && (q.series || []).some(s2 => Number(s2.value) > 0))
+      .slice()
+      .sort((a, b) => (b.count || 0) - (a.count || 0))
       .slice(0, 3)
 
     const switchForm = async (e) => {
