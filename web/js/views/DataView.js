@@ -25,21 +25,26 @@ export default {
     const loadForms = async () => {
       const r = await api.get('/api/forms?pageSize=200')
       forms.value = r.data
-      if (!formId.value && forms.value.length) formId.value = forms.value[0].id
+      if (!formId.value && forms.value.length) {
+        // 优先落到真的有答卷的表单，避免一进来就是空表
+        const withData = forms.value.find(f => (f.submission_count || 0) > 0)
+        formId.value = (withData || forms.value[0]).id
+      }
       if (formId.value) await loadForm()
     }
+    const allMode = computed(() => !formId.value)
 
     const loadForm = async () => {
-      if (!formId.value) return
+      if (!formId.value) { form.value = null; return }
       const r = await api.get(`/api/forms/${formId.value}`)
       form.value = r.data
     }
 
     const load = async () => {
-      if (!formId.value) { loading.value = false; return }
       loading.value = true
       try {
-        const qs = new URLSearchParams({ formId: formId.value, page: page.value, pageSize: 20 })
+        const qs = new URLSearchParams({ page: page.value, pageSize: 20 })
+        if (formId.value) qs.set('formId', formId.value)
         if (keyword.value) qs.set('keyword', keyword.value)
         if (marked.value) qs.set('marked', '1')
         const r = await api.get('/api/submissions?' + qs)
@@ -58,7 +63,7 @@ export default {
     }
 
     const labelOf = (id) => {
-      const f = form.value?.schema.find(x => x.id === id)
+      const f = form.value?.schema?.find(x => x.id === id)
       return f?.label || id
     }
 
@@ -93,8 +98,14 @@ export default {
       } catch (e) { err(e.message) }
     }
 
+    const needForm = () => {
+      if (form.value) return true
+      err('请先在左上角选择一个具体表单')
+      return false
+    }
+
     const exportCsv = () => {
-      if (!form.value) return
+      if (!needForm()) return
       const schema = form.value.schema.filter(f => !['divider', 'richtext', 'html', 'image'].includes(f.type))
       const head = ['编号', '提交时间', ...schema.map(f => f.label), '得分', 'IP']
       const lines = [head.map(csvCell).join(',')]
@@ -112,6 +123,7 @@ export default {
     const csvCell = (v) => `"${String(v ?? '').replace(/"/g, '""').replace(/\n/g, ' ')}"`
 
     const exportJson = () => {
+      if (!needForm()) return
       const blob = new Blob([JSON.stringify(rows.value.map(r => ({ id: r.id, createdAt: r.created_at, score: r.score, data: r.data })), null, 2)], { type: 'application/json' })
       const a = document.createElement('a')
       a.href = URL.createObjectURL(blob)
@@ -121,7 +133,7 @@ export default {
     }
 
     const importFile = async (file) => {
-      if (!file) return
+      if (!file || !needForm()) return
       try {
         const text = await file.text()
         const items = JSON.parse(text)
@@ -132,6 +144,7 @@ export default {
     }
 
     const printRows = () => {
+      if (!needForm()) return
       const w = window.open('', '_blank')
       const schema = form.value.schema.filter(f => !['divider', 'richtext', 'html', 'image'].includes(f.type))
       w.document.write(`<html><head><title>${form.value.title}</title><style>
@@ -150,7 +163,17 @@ export default {
     }
 
     const openDetail = (row) => { detail.value = row }
-    const openEdit = (row) => { editing.value = { id: row.id, data: JSON.parse(JSON.stringify(row.data || {})), marked: row.marked } }
+    const openEdit = async (row) => {
+      // 全部表单视图下，先按行的所属表单加载 schema，编辑弹窗才画得出控件
+      if (row.form_id && row.form_id !== formId.value) {
+        try {
+          const r = await api.get(`/api/forms/${row.form_id}`)
+          form.value = r.data
+        } catch (e) { return err(e.message) }
+      }
+      if (!form.value) return err('该表单已不存在')
+      editing.value = { id: row.id || 0, data: JSON.parse(JSON.stringify(row.data || {})), marked: row.marked || 0, formId: row.form_id || formId.value }
+    }
 
     const saveEdit = async () => {
       try {
@@ -176,7 +199,10 @@ export default {
           })]),
           h('button', {
             class: 'btn sm',
-            onClick: () => api.download(`/api/forms/${formId.value}/attachments.zip`, `${form.value?.title || 'form'}-附件.zip`).catch(e => err(e.message))
+            onClick: () => {
+              if (!needForm()) return
+              api.download(`/api/forms/${formId.value}/attachments.zip`, `${form.value?.title || 'form'}-附件.zip`).catch(e => err(e.message))
+            }
           }, '打包附件')
         ])
       ]),
@@ -184,7 +210,10 @@ export default {
         h('select', {
           class: 'select', style: 'max-width:280px', value: formId.value,
           onChange: e => { formId.value = Number(e.target.value); switchForm() }
-        }, forms.value.map(f => h('option', { value: f.id }, f.title))),
+        }, [
+          h('option', { value: 0 }, '全部表单'),
+          ...forms.value.map(f => h('option', { value: f.id }, `${f.title}（${f.submission_count || 0}）`))
+        ]),
         h('input', {
           class: 'input', style: 'max-width:200px', placeholder: '搜索答卷内容…', value: keyword.value,
           onInput: e => keyword.value = e.target.value,
@@ -209,6 +238,7 @@ export default {
                   onChange: e => selected.value = e.target.checked ? rows.value.map(r => r.id) : []
                 })),
                 h('th', {}, '编号'), h('th', {}, '提交时间'),
+                allMode.value ? h('th', {}, '来源表单') : null,
                 ...cols.value.map(f => h('th', {}, f.label)),
                 h('th', {}, '得分'), h('th', {}, '操作')
               ])),
@@ -227,6 +257,7 @@ export default {
                   r.marked ? h('span', { class: 'tag warn', style: 'margin-left:6px' }, '标记') : null
                 ]),
                 h('td', { class: 'nowrap' }, fmtDate(r.created_at)),
+                allMode.value ? h('td', {}, r.form_title || '-') : null,
                 ...cols.value.map(f => h('td', {}, cell(r, f))),
                 h('td', {}, r.score != null ? h('span', { class: ['tag', r.passed ? 'ok' : 'warn'] }, String(r.score)) : '-'),
                 h('td', { class: 'nowrap' }, h('div', { class: 'flex', style: 'gap:4px' }, [
@@ -237,14 +268,14 @@ export default {
                 ]))
               ])))
             ]))
-          : h(Empty, { text: '该表单还没有答卷' })
+          : h(Empty, { text: allMode.value ? '还没有任何答卷' : '该表单还没有答卷' })
       ]),
       h(Pagination, { page: page.value, totalPages: totalPages.value, onChange: p => { page.value = p; load() } }),
 
       detail.value ? Modal({
         title: `答卷 #${detail.value.id}`, modelValue: true,
         onClose: () => detail.value = null, wide: true,
-        children: h('div', {}, form.value.schema.filter(f => detail.value.data[f.id] !== undefined).map(f => h('div', { class: 'mb' }, [
+        children: h('div', {}, (form.value?.schema || []).filter(f => detail.value.data[f.id] !== undefined).map(f => h('div', { class: 'mb' }, [
           h('div', { class: 'small muted' }, f.label),
           h('div', { style: 'font-weight:520;word-break:break-word' },
             Array.isArray(detail.value.data[f.id]) ? detail.value.data[f.id].join('、')
@@ -257,7 +288,7 @@ export default {
       editing.value ? Modal({
         title: editing.value.id ? `编辑答卷 #${editing.value.id}` : '新增答卷',
         modelValue: true, onClose: () => editing.value = null, wide: true,
-        children: h('div', {}, form.value.schema
+        children: h('div', {}, (form.value?.schema || [])
           .filter(f => !['divider', 'richtext', 'html', 'image'].includes(f.type))
           .map(f => h('div', { class: 'field' }, [
             h('label', {}, f.label),
@@ -268,8 +299,8 @@ export default {
           h('button', {
             class: 'btn primary', onClick: async () => {
               try {
-                if (editing.value.id) await api.put(`/api/submissions/${editing.value.id}`, { data: editing.value.data })
-                else await api.post('/api/submissions', { formId: formId.value, data: editing.value.data })
+                if (editing.value.id) await api.put(`/api/submissions/${editing.value.id}`, { data: editing.value.data, marked: editing.value.marked })
+                else await api.post('/api/submissions', { formId: editing.value.formId || formId.value, data: editing.value.data })
                 ok('已保存')
                 editing.value = null
                 load()

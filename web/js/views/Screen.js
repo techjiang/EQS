@@ -60,7 +60,9 @@ export default {
           }]
         })
       }
-      const chartable = data.value.questions.filter(q => q.series?.length).slice(0, 3)
+      // 只画真的有数据的题；全零的题画出来是空心圈，不如让位给其他题
+      const hasData = q => (q.series || []).some(s2 => Number(s2.value) > 0)
+      const chartable = data.value.questions.filter(q => (q.series || []).length && hasData(q)).slice(0, 3)
       chartable.forEach((q, i) => {
         const el = document.getElementById('sc-q' + i)
         if (!el) return
@@ -112,11 +114,13 @@ export default {
       const today = trend.length ? trend[trend.length - 1].count : 0
       const answered = (d.questions || []).reduce((a, q) => a + (q.count || 0), 0)
       if (d.form?.kind === 'exam') {
+        const pass = d.passRate ?? 0
+        const rate = d.total ? Math.round(pass / d.total * 100) : 0
         return [
           ['总答卷', d.total ?? 0],
-          ['题目数', d.questions?.length ?? 0],
           ['平均分', d.avgScore ?? '—'],
-          ['通过人数', d.passRate ?? 0]
+          ['通过人数', pass],
+          ['通过率', rate + '%']
         ]
       }
       const peak = trend.reduce((a, t) => Math.max(a, t.count), 0)
@@ -128,6 +132,10 @@ export default {
         ['累计作答', answered]
       ]
     }
+
+    const chartQuestions = () => (data.value?.questions || [])
+      .filter(q => (q.series || []).length && (q.series || []).some(s2 => Number(s2.value) > 0))
+      .slice(0, 3)
 
     const switchForm = async (e) => {
       formId.value = Number(e.target.value)
@@ -187,12 +195,16 @@ export default {
         ])
       ]),
       h('div', { style: 'display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px' },
-        (data.value?.questions || []).filter(q => q.series?.length).slice(0, 3).map((q, i) => h('div', {
-          style: 'background:rgba(8,24,42,.62);border:1px solid #17405f;border-radius:14px;padding:14px'
-        }, [
-          h('div', { style: 'font-size:13px;color:#8fb4d8;margin-bottom:6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap' }, q.label),
-          h('div', { id: 'sc-q' + i, style: 'height:240px' })
-        ])))
+        chartQuestions().length
+          ? chartQuestions().map((q, i) => h('div', {
+              style: 'background:rgba(8,24,42,.62);border:1px solid #17405f;border-radius:14px;padding:14px'
+            }, [
+              h('div', { style: 'font-size:13px;color:#8fb4d8;margin-bottom:6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap' }, q.label),
+              h('div', { id: 'sc-q' + i, style: 'height:240px' })
+            ]))
+          : h('div', {
+              style: 'grid-column:1/-1;background:rgba(8,24,42,.62);border:1px solid #17405f;border-radius:14px;padding:28px;text-align:center;color:#7fa6d0;font-size:13px'
+            }, '还没有可统计的作答数据，收到答卷后这里会自动出图'))
     ])
   }
 }

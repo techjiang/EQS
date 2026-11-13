@@ -149,7 +149,7 @@ export function renderControl(field, model, opts = {}) {
         ])
       ])
     }
-    case 'upload': {
+    case 'file': case 'upload': {
       const files = Array.isArray(val) ? val : (val ? [val] : [])
       return h('div', {}, [
         h('div', { class: 'flex wrap' }, files.map((f, i) => h('div', {
@@ -279,9 +279,12 @@ export function renderControl(field, model, opts = {}) {
       ])
     }
     case 'image':
+      if (!field.props?.src) return h('div', { class: 'hint' }, '未设置图片地址')
       return h('div', { style: 'border-radius:12px;overflow:hidden' }, h('img', {
-        src: field.props?.src || '/assets/eqs-logo.png', style: 'width:100%;max-height:240px;object-fit:cover'
+        src: field.props.src, style: 'width:100%;max-height:240px;object-fit:cover'
       }))
+    case 'html':
+      return h('div', { style: 'font-size:13.5px;color:var(--text-2);line-height:1.8', innerHTML: sanitize(field.props?.html || '') })
     case 'divider':
       return h('hr', { style: 'border:none;border-top:1px solid var(--line);margin:6px 0' })
     case 'richtext':

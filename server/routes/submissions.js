@@ -110,6 +110,9 @@ export default function register(r) {
       score,
       total: form.kind === 'exam' ? review?.total ?? 0 : null,
       passLine: form.kind === 'exam' ? review?.passLine ?? 0 : null,
+      paperTotal: form.kind === 'exam' ? review?.paperTotal ?? 0 : null,
+      ungraded: form.kind === 'exam' ? review?.ungraded ?? 0 : 0,
+      graded: form.kind === 'exam' ? !!review?.graded : false,
       passed: passed === 1,
       review,
       message: form.settings?.submitText || '提交成功，感谢您的参与！',
@@ -146,8 +149,15 @@ export default function register(r) {
         analysis: f.analysis || ''
       })
     }
-    const total = schema.reduce((a, f) => a + (Number(f.score) || 0), 0)
-    return { items, total, passLine: passLineOf(settings, total), graded: items.some(i => i.judged) }
+    // 与 gradeSubmission 保持同一口径：只把有标准答案的题计入可判分总分
+    const total = items.reduce((a, i) => a + (i.judged ? i.score : 0), 0)
+    const paperTotal = items.reduce((a, i) => a + i.score, 0)
+    return {
+      items, total, paperTotal,
+      ungraded: items.filter(i => !i.judged && i.score > 0).length,
+      passLine: passLineOf(settings, total),
+      graded: items.some(i => i.judged)
+    }
   }
 
   /** 公开：按编号查询自己的答卷 */

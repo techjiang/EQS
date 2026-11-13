@@ -112,15 +112,22 @@ export function validateSubmission(schema, data) {
   return errors
 }
 
-/** 自动评分（考试） */
+/**
+ * 自动评分（考试）
+ * 只把「有标准答案」的题计入卷面总分：简答、论述这类题目前不支持人工批阅，
+ * 若算进总分，会出现「全对也永远不及格」的假失败。
+ */
 export function gradeSubmission(schema, data, settings = {}) {
   let total = 0
   let got = 0
   let scored = 0
+  let ungraded = 0
+  let paperTotal = 0
   for (const f of schema) {
     if (!f.score || !fieldVisible(f, data)) continue
+    paperTotal += f.score
+    if (!f.answer?.length) { ungraded++; continue }
     total += f.score
-    if (!f.answer?.length) continue
     scored++
     const v = data[f.id]
     const given = (Array.isArray(v) ? v : v === undefined || v === null || v === '' ? [] : [v]).map(String).sort()
@@ -129,7 +136,7 @@ export function gradeSubmission(schema, data, settings = {}) {
   }
   const score = Math.round(got * 100) / 100
   const passLine = passLineOf(settings, total)
-  return { score, total, passLine, passed: score >= passLine, graded: scored > 0 }
+  return { score, total, paperTotal, ungraded, passLine, passed: score >= passLine, graded: scored > 0 }
 }
 
 /** 及格线：优先按总分百分比（passPercent），否则回退到绝对分（passScore），默认 60% */

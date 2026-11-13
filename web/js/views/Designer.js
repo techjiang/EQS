@@ -204,7 +204,7 @@ export default {
             onInput: e => { f.props = { ...f.props, min: Number(e.target.value) } }
           })) : null
         ]) : null,
-        ['upload'].includes(f.type) ? h('div', {}, [
+        ['upload', 'file'].includes(f.type) ? h('div', {}, [
           h('div', { class: 'field' }, h('label', { class: 'flex between' }, [
             h('span', {}, '允许多选'),
             h('div', { class: ['switch', f.props?.multiple ? 'on' : ''], onClick: () => f.props.multiple = !f.props.multiple })
@@ -214,8 +214,8 @@ export default {
             onInput: e => f.props.maxSize = Number(e.target.value)
           }))
         ]) : null,
-        f.type === 'richtext' ? row('内容', h('textarea', {
-          class: 'textarea', value: f.props?.html || '',
+        ['richtext', 'html'].includes(f.type) ? row('内容（支持 HTML）', h('textarea', {
+          class: 'textarea mono', style: 'min-height:90px', value: f.props?.html || '',
           onInput: e => f.props.html = e.target.value
         })) : null,
         f.type === 'image' ? row('图片地址', h('input', {

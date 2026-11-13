@@ -50,7 +50,9 @@ export default {
         const names = q.series.map(s => s.name)
         const values = q.series.map(s => s.value)
         const isPie = ['radio', 'select', 'carousel', 'checkbox'].includes(q.type) && q.series.length <= 8
-        const type = chartType.value === 'pie' && isPie ? 'pie' : chartType.value === 'line' ? 'line' : 'bar'
+        const hasData = q.series.some(s2 => Number(s2.value) > 0)
+        // 全零时饼图画出来是空白，退回柱状图让人看出「这一题还没人选」
+        const type = chartType.value === 'pie' && isPie && hasData ? 'pie' : chartType.value === 'line' ? 'line' : 'bar'
         const opt = type === 'pie'
           ? {
               color: PALETTE,

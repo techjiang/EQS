@@ -107,11 +107,19 @@ export default function register(r) {
     const { text } = await readJson(req)
     const fields = parseTextToFields(String(text || ''))
     if (!fields.length) fail(400, '未识别到题目')
+    const dropped = []
     for (const f of fields) {
+      // 选择题的答案必须是已有选项，否则会变成永远答不对的题
+      if (f.answer.length && f.options.length) {
+        const values = new Set(f.options.map(o => String(o.value)))
+        const kept = f.answer.filter(a => values.has(String(a)))
+        if (kept.length !== f.answer.length) dropped.push(f.label)
+        f.answer = kept
+      }
       run('INSERT INTO questions(bank_id, type, title, options, answer, analysis, score, created_at) VALUES(?,?,?,?,?,?,?,?)',
         bank.id, f.type, f.label, JSON.stringify(f.options), JSON.stringify(f.answer), f.analysis, f.score || 5, now())
     }
-    sendJson(res, 200, { ok: true, imported: fields.length })
+    sendJson(res, 200, { ok: true, imported: fields.length, droppedAnswers: dropped })
   })
 
   /** 组卷：按题库随机抽题生成考试 */
@@ -174,7 +182,9 @@ export default function register(r) {
     const q = get('SELECT * FROM questions WHERE id = ? AND bank_id = ? AND deleted_at IS NULL', Number(body.questionId), bank.id)
     if (!q) fail(404, '题目不存在')
     const parsed = parseQ(q)
-    const raw = (Array.isArray(body.value) ? body.value : [body.value]).filter(v => v !== undefined && v !== null && v !== '')
+    // 只有真的提交了答案才判题；收藏 / 写笔记不应把题目算成答错
+    const judging = body.judge === true || Array.isArray(body.value) || (typeof body.value === 'string' && body.value.trim() !== '')
+    const raw = judging ? (Array.isArray(body.value) ? body.value : [body.value]).filter(v => v !== undefined && v !== null && v !== '') : []
     // 允许前端直接传选项字母（A/B/…），统一归一化为选项值
     const given = raw.map(v => {
       const tok = String(v).trim()
@@ -185,7 +195,7 @@ export default function register(r) {
       return tok
     }).sort()
     const right = parsed.answer.map(String).sort()
-    const correct = given.length === right.length && given.every((x, i) => x === right[i])
+    const correct = judging && given.length === right.length && given.every((x, i) => x === right[i])
     let record = get('SELECT * FROM practice_records WHERE bank_id = ? AND user_id = ?', bank.id, user.id)
     if (!record) {
       run('INSERT INTO practice_records(bank_id, user_id, mode, progress, right_ids, wrong_ids, favorite_ids, notes, updated_at) VALUES(?,?,?,?,?,?,?,?,?)',
@@ -196,7 +206,9 @@ export default function register(r) {
     const wrongIds = new Set(safeJson(record.wrong_ids, []))
     const streak = safeJson(record.notes, {}).__streak || {}
     const req2 = Number(body.streakToClear) || 0
-    if (correct) {
+    if (!judging) {
+      // 仅收藏 / 笔记：不动对错记录
+    } else if (correct) {
       rightIds.add(q.id)
       const s = (streak[q.id] || 0) + 1
       streak[q.id] = s
@@ -217,7 +229,8 @@ export default function register(r) {
       JSON.stringify([...rightIds]), JSON.stringify([...wrongIds]), JSON.stringify([...favoriteIds]), JSON.stringify(notes), progress, body.mode || record.mode, now(), record.id)
     sendJson(res, 200, {
       ok: true,
-      correct,
+      correct: judging ? correct : null,
+      judged: judging,
       answer: parsed.answer,
       analysis: parsed.analysis,
       wrongCount: wrongIds.size,

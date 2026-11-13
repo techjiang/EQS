@@ -41,14 +41,14 @@ export default {
         const r = await api.post(`/api/banks/${bankId}/practice/answer`, {
           questionId: cur.id,
           value: model.value[cur.id],
+          judge: true,
           progress: idx.value + 1,
           mode: mode.value,
           streakToClear: streakToClear.value
         })
         feedback.value = r
         answered.value = { ...answered.value, [cur.id]: true }
-        correctMap.value = { ...correctMap.value, [cur.id]: r.correct }
-        if (noteText.value) await api.post(`/api/banks/${bankId}/practice/answer`, { questionId: cur.id, value: model.value[cur.id], note: noteText.value })
+        correctMap.value = { ...correctMap.value, [cur.id]: r.correct === true }
       } catch (e) { err(e.message) }
     }
 
@@ -67,7 +67,7 @@ export default {
       if (!cur) return
       try {
         const r = await api.post(`/api/banks/${bankId}/practice/answer`, {
-          questionId: cur.id, value: model.value[cur.id], favorite: !cur.favorite
+          questionId: cur.id, value: '', judge: false, favorite: !cur.favorite
         })
         cur.favorite = r.favorite
         ok(r.favorite ? '已收藏' : '已取消收藏')
@@ -77,7 +77,7 @@ export default {
     const saveNote = async () => {
       const cur = q.value
       try {
-        await api.post(`/api/banks/${bankId}/practice/answer`, { questionId: cur.id, value: model.value[cur.id], note: noteText.value })
+        await api.post(`/api/banks/${bankId}/practice/answer`, { questionId: cur.id, value: '', judge: false, note: noteText.value })
         cur.note = noteText.value
         noteOpen.value = false
         ok('笔记已保存')

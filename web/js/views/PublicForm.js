@@ -1,7 +1,7 @@
 import { h, ref, onMounted, onBeforeUnmount, computed } from '/vendor/vue.esm.js'
 import { api } from '../api.js'
 import { route } from '../router.js'
-import { ok, err } from '../ui.js'
+import { ok, err, fmtDate } from '../ui.js'
 import { FormRenderer } from '../renderer.js'
 import { defaultData } from '../fields.js'
 
@@ -105,6 +105,21 @@ export default {
       } catch (e) { err(e.message); return null }
     }
 
+    /* ---------- 答卷编号查询 ---------- */
+    const queryOpen = ref(false)
+    const queryId = ref('')
+    const querying = ref(false)
+    const queryResult = ref(null)
+
+    const lookup = async () => {
+      if (!queryId.value.trim()) return err('请输入答卷编号')
+      querying.value = true
+      try {
+        const r = await api.get(`/api/public/forms/${id}/query?submissionId=${encodeURIComponent(queryId.value.trim())}`)
+        queryResult.value = r.data
+      } catch (e) { queryResult.value = null; err(e.message) } finally { querying.value = false }
+    }
+
     const wechatLogin = async () => {
       try {
         const r = await api.get(`/api/wechat/oauth/url?redirect=${encodeURIComponent('/f/' + id)}`)
@@ -136,8 +151,11 @@ export default {
               h('div', { style: 'font-size:52px' }, '🎉'),
               h('h2', { style: 'margin:12px 0 6px' }, result.value?.message || '提交成功'),
               form.value.kind === 'exam' && result.value?.score != null ? h('div', { class: 'center', style: 'margin:10px 0 4px' }, [
-                h('div', { style: 'font-size:34px;font-weight:700;color:' + (result.value.passed ? 'var(--ok)' : 'var(--danger)') }, `${result.value.score}`),
-                h('div', { class: 'small muted' }, `满分 ${result.value.total ?? '-'} 分 · 及格线 ${result.value.passLine ?? '-'} 分 · ${result.value.passed ? '通过' : '未通过'}`)
+                h('div', { style: 'font-size:34px;font-weight:700;color:' + (result.value.passed ? 'var(--ok)' : 'var(--danger)') }, result.value.graded === false ? '待批阅' : `${result.value.score}`),
+                h('div', { class: 'small muted' }, result.value.graded === false
+                  ? '本卷暂无可自动判分的题目，成绩需人工批阅'
+                  : `满分 ${result.value.total ?? '-'} 分 · 及格线 ${result.value.passLine ?? '-'} 分 · ${result.value.passed ? '通过' : '未通过'}`),
+                result.value.ungraded ? h('div', { class: 'small muted', style: 'margin-top:2px' }, `另有 ${result.value.ungraded} 道主观题需人工批阅，不计入自动判分`) : null
               ]) : null,
               result.value?.review?.items?.length ? h('div', { style: 'margin-top:16px;text-align:left' }, [
                 h('div', { class: 'small muted', style: 'margin-bottom:8px' }, '逐题回顾'),
@@ -187,6 +205,39 @@ export default {
                 class: 'btn primary', style: `width:100%;margin-top:20px;height:44px;font-size:15px;${s.buttonColor ? `background:${s.buttonColor}` : ''}`,
                 disabled: submitting.value, onClick: submit
               }, submitting.value ? '提交中…' : (s.buttonText || '提交')),
+              s.allowQuery ? h('div', { style: 'margin-top:16px' }, [
+                h('button', {
+                  class: 'btn ghost sm', style: 'width:100%',
+                  onClick: () => { queryOpen.value = !queryOpen.value; queryResult.value = null }
+                }, queryOpen.value ? '收起查询' : '查询我之前提交的答卷'),
+                queryOpen.value ? h('div', { style: 'margin-top:10px;padding:14px;border:1px solid var(--line);border-radius:12px' }, [
+                  h('div', { class: 'flex', style: 'gap:8px' }, [
+                    h('input', {
+                      class: 'input', placeholder: '答卷编号，例如 12', value: queryId.value,
+                      onInput: e => queryId.value = e.target.value,
+                      onKeydown: e => { if (e.key === 'Enter') lookup() }
+                    }),
+                    h('button', { class: 'btn', disabled: querying.value, onClick: lookup }, querying.value ? '查询中…' : '查询')
+                  ]),
+                  queryResult.value ? h('div', { style: 'margin-top:12px;font-size:13px' }, [
+                    h('div', { class: 'small muted', style: 'margin-bottom:6px' },
+                      `答卷 #${queryResult.value.id} · ${fmtDate(queryResult.value.createdAt)}` +
+                      (queryResult.value.score != null ? ` · 得分 ${queryResult.value.score}` : '')),
+                    ...form.value.schema
+                      .filter(f => queryResult.value.data[f.id] !== undefined && !['divider', 'richtext', 'html', 'image'].includes(f.type))
+                      .map(f => {
+                        const v = queryResult.value.data[f.id]
+                        const text = Array.isArray(v) ? v.join('、')
+                          : typeof v === 'object' && v ? Object.values(v).join('、')
+                          : String(v == null || v === '' ? '-' : v)
+                        return h('div', { style: 'padding:7px 0;border-bottom:1px dashed var(--line)' }, [
+                          h('span', { class: 'small muted' }, f.label + '：'),
+                          h('span', { style: 'margin-left:4px' }, text)
+                        ])
+                      })
+                  ]) : null
+                ]) : null
+              ]) : null,
               h('div', { class: 'fill-foot' }, [
                 h('div', {}, '由 '),
                 h('a', { href: '/', style: 'color:var(--text-3)' }, 'EQS · 开源问卷平台')

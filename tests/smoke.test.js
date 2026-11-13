@@ -320,7 +320,56 @@ try {
   r = await req('POST', `/api/public/forms/${capId}/submit`, { data: { [capField.id]: String(expect) } })
   assert(r.status === 201, '验证码正确可通过（服务端真实校验）', JSON.stringify(r.json))
 
-  console.log('\n[13] 前端静态资源')
+  console.log('\n[13] 刷题：收藏与笔记不应判错')
+  r = await req('GET', `/api/banks/${bankId}/practice?mode=sequence`)
+  const practiceQ = r.json.data.questions[0]
+  const wrongBefore = r.json.data.wrongCount
+  r = await req('POST', `/api/banks/${bankId}/practice/answer`, { questionId: practiceQ.id, value: '', judge: false, favorite: true })
+  assert(r.json.judged === false && r.json.correct === null, '收藏不算一次作答', JSON.stringify(r.json))
+  r = await req('GET', `/api/banks/${bankId}/practice?mode=sequence`)
+  assert(r.json.data.wrongCount === wrongBefore, '收藏后错题数不变', `${wrongBefore} → ${r.json.data.wrongCount}`)
+  assert(r.json.data.questions.find(q => q.id === practiceQ.id).favorite === true, '收藏状态已保存')
+  r = await req('POST', `/api/banks/${bankId}/practice/answer`, { questionId: practiceQ.id, value: '', judge: false, note: '记一笔' })
+  r = await req('GET', `/api/banks/${bankId}/practice?mode=sequence`)
+  assert(r.json.data.wrongCount === wrongBefore, '写笔记后错题数不变')
+  // 真作答仍能正常判题
+  const correctAnswer = (await req('GET', `/api/banks/${bankId}/questions`)).json.data.find(q => q.id === practiceQ.id).answer
+  r = await req('POST', `/api/banks/${bankId}/practice/answer`, { questionId: practiceQ.id, value: correctAnswer, judge: true })
+  assert(r.json.judged === true && r.json.correct === true, '显式作答仍正确判题', JSON.stringify(r.json))
+
+  console.log('\n[14] 主观题不计入自动判分')
+  r = await req('POST', '/api/forms', {
+    title: '主观题口径', kind: 'exam',
+    schema: [
+      { type: 'radio', label: '客观题', options: ['对', '错'], answer: ['对'], score: 50 },
+      { type: 'textarea', label: '主观题', score: 50 }
+    ]
+  })
+  const mixId = r.json.id
+  const mixSchema = r.json.data.schema
+  await req('PUT', `/api/forms/${mixId}`, { status: 'published', settings: { passPercent: 60 } })
+  r = await req('POST', `/api/public/forms/${mixId}/submit`, { data: { [mixSchema[0].id]: '对', [mixSchema[1].id]: '写了很多' } })
+  assert(r.json.total === 50, '可判分总分只算客观题', String(r.json.total))
+  assert(r.json.paperTotal === 100, '卷面总分仍为 100', String(r.json.paperTotal))
+  assert(r.json.passed === true, '客观题全对即通过（不再被主观题拖成永远不及格）', JSON.stringify({ score: r.json.score, passLine: r.json.passLine }))
+  assert(r.json.ungraded === 1, '返回待人工批阅题数')
+
+  console.log('\n[15] 导入答案越界保护与答卷查询')
+  r = await req('POST', `/api/banks/${bankId}/import-text`, {
+    text: ['[单选] 只有两个选项的题', 'A. 甲', 'B. 乙', '答案：D', '分值：5'].join('\n')
+  })
+  assert(r.json.droppedAnswers?.length === 1, '越界答案被标记', JSON.stringify(r.json))
+  const badQ = (await req('GET', `/api/banks/${bankId}/questions`)).json.data.find(q => q.title.includes('两个选项'))
+  assert(badQ && badQ.answer.length === 0, '越界答案被剔除，题目不会永远答错')
+
+  await req('PUT', `/api/forms/${formId}`, { settings: { allowQuery: true } })
+  r = await req('GET', `/api/public/forms/${formId}/query?submissionId=${sub1}`)
+  assert(r.status === 200 && r.json.data.id === sub1, '开放查询后可按编号取回答卷', JSON.stringify(r.json))
+  await req('PUT', `/api/forms/${formId}`, { settings: { allowQuery: false } })
+  r = await req('GET', `/api/public/forms/${formId}/query?submissionId=${sub1}`)
+  assert(r.status === 403, '未开放查询时拒绝访问')
+
+  console.log('\n[16] 前端静态资源')
   for (const p of ['/', '/js/main.js', '/css/app.css', '/assets/eqs-mark.svg', '/vendor/echarts.min.js']) {
     const res = await fetch(BASE + p)
     assert(res.ok, `静态资源可访问：${p}`)
