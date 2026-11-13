@@ -108,7 +108,9 @@ export function defaultData(schema) {
   for (const f of schema) {
     // 表单里写「默认值」是一个输入框，多选/排序写的是「A,B」，不拆开就是一个不存在的选项
     const multi = String(f.defaultValue ?? '').split(/[,，]/).map(s => s.trim()).filter(Boolean)
-    if (f.type === 'checkbox' || f.type === 'sort') data[f.id] = multi
+    // 排序题不预置值：它不是「选好的答案」，预置等于白送一道必填题
+    if (f.type === 'checkbox') data[f.id] = multi
+    else if (f.type === 'sort') data[f.id] = []
     else if (f.type === 'matrix') data[f.id] = {}
     else if (f.type === 'switch') data[f.id] = f.defaultValue === true || f.defaultValue === 'true' || f.defaultValue === 1
     else if (f.type === 'subform') data[f.id] = []

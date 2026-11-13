@@ -125,7 +125,9 @@ try {
   console.log('\n[4] 公开填写与校验')
   r = await req('GET', `/api/public/forms/${formId}`)
   assert(r.json.data.title === '冒烟测试问卷', '公开读取表单成功')
-  assert(r.json.data.schema.every(f => f.answer.length === 0), '公开接口不泄露正确答案')
+  // 公开接口按白名单下发字段，answer 干脆不存在——不是「返回了空数组」
+  assert(r.json.data.schema.every(f => f.answer === undefined), '公开接口不下发正确答案字段')
+  assert(r.json.data.schema.every(f => Object.keys(f).every(k => !/answer|analysis/i.test(k))), '公开接口不下发任何含 answer 的键')
 
   r = await req('POST', `/api/public/forms/${formId}/submit`, { data: { [genderId]: '男' } })
   assert(r.status === 422, '缺少必填项被拒绝', r.json?.message)
@@ -133,6 +135,8 @@ try {
   r = await req('POST', `/api/public/forms/${formId}/submit`, { data: { [genderId]: '男', [nameId]: '张三' } })
   assert(r.status === 201, '合法答卷提交成功', r.json?.message)
   const sub1 = r.json.id
+  const sub1Code = r.json.publicId
+  assert(/^[0-9a-z]{5}-[0-9a-z]{5}$/.test(String(sub1Code)), '提交后返回不可猜的答卷编号', String(sub1Code))
   assert(typeof r.json.message === 'string' && r.json.message.length > 0, '返回提交后自定义文案')
 
   r = await req('GET', '/api/submissions?formId=' + formId)
@@ -363,10 +367,15 @@ try {
   assert(badQ && badQ.answer.length === 0, '越界答案被剔除，题目不会永远答错')
 
   await req('PUT', `/api/forms/${formId}`, { settings: { allowQuery: true } })
-  r = await req('GET', `/api/public/forms/${formId}/query?submissionId=${sub1}`)
+  r = await req('GET', `/api/public/forms/${formId}/query?submissionId=${sub1Code}`)
   assert(r.status === 200 && r.json.data.id === sub1, '开放查询后可按编号取回答卷', JSON.stringify(r.json))
+  // 自增 id 不再能当编号用：编号一旦可猜，NAT 后面的陌生访客就能把全站答卷翻一遍
+  r = await req('GET', `/api/public/forms/${formId}/query?submissionId=${sub1}`, undefined, { 'User-Agent': 'someone-else-browser' })
+  assert(r.status === 404, '自增 id 不能再当代替编号查别人的答卷', JSON.stringify(r.json))
+  r = await req('GET', `/api/public/forms/${formId}/query?submissionId=00000-00000`, undefined, { 'User-Agent': 'stranger-device', 'X-Forwarded-For': '203.0.113.9' })
+  assert(r.status === 404, '随便编号查不到任何东西')
   await req('PUT', `/api/forms/${formId}`, { settings: { allowQuery: false } })
-  r = await req('GET', `/api/public/forms/${formId}/query?submissionId=${sub1}`)
+  r = await req('GET', `/api/public/forms/${formId}/query?submissionId=${sub1Code}`)
   assert(r.status === 403, '未开放查询时拒绝访问')
 
   console.log('\n[16] API Key 鉴权与公开页信息边界')
@@ -619,7 +628,136 @@ try {
     assert(!(r.json.data || []).some(x => x.id === partId), '全部批完后移出待批阅队列')
   }
 
-  console.log('\n[23] 前端静态资源')
+  console.log('\n[23] 公开页不夹带答案、备份可往返、附件可打包')
+  {
+    // 标准答案能藏进任意自定义属性：只删顶层 answer 是不够的
+    r = await req('POST', '/api/forms', {
+      title: '答案走私探针', kind: 'exam', status: 'published',
+      schema: [
+        { id: 'q1', type: 'radio', label: '地球是圆的', options: ['对', '错'], answer: ['对'], score: 5,
+          props: { answers: ['对'], tip: '答案是「对」', min: 1 } }
+      ]
+    })
+    const secretForm = r.json.id
+    r = await req('GET', `/api/public/forms/${secretForm}`)
+    const probe = r.json.data.schema[0]
+    assert(!JSON.stringify(probe).includes('答案'), '公开页不下发藏在 props 里的答案', JSON.stringify(probe))
+    assert(probe.props?.answers === undefined, '未登记的自定义属性一律不下发')
+    assert(probe.props?.min === 1, '作答需要的 props 仍然下发')
+
+    // 匿名提交必须拿到不可猜编号；换 UA 猜自增 id 猜不到东西
+    r = await req('POST', `/api/public/forms/${secretForm}/submit`, { data: { q1: '对' } })
+    const ownId = r.json.id
+    const ownCode = r.json.publicId
+    assert(r.status === 201 && !!ownCode, '匿名提交返回答卷编号', JSON.stringify(r.json))
+    await req('PUT', `/api/forms/${secretForm}`, { settings: { allowQuery: true } })
+    r = await req('GET', `/api/public/forms/${secretForm}/query?submissionId=${ownCode}`, undefined, { 'User-Agent': 'someone-else' })
+    assert(r.status === 200 && r.json.data.id === ownId, '本人凭编号可查回自己的答卷', JSON.stringify(r.json))
+    r = await req('GET', `/api/public/forms/${secretForm}/query?submissionId=${ownId}`, undefined, { 'User-Agent': 'someone-else' })
+    assert(r.status === 404, '换设备猜自增 id 查不到答卷', JSON.stringify(r.json))
+
+    // 备份 → 导入：附件要合并进来，而不是被无视或者反向覆盖
+    const fAz = new FormData()
+    fAz.append('file', new Blob([Buffer.from('备份前的附件')], { type: 'text/plain' }), 'a.txt')
+    fAz.append('formId', String(secretForm))
+    let up2 = await fetch(BASE + '/api/upload', { method: 'POST', body: fAz, headers: { Cookie: adminCookie } })
+    const upAz = await up2.json()
+    assert(up2.ok, '登录用户上传附件成功', JSON.stringify(upAz))
+
+    const bak = await fetch(BASE + '/api/backup/export', { headers: { Cookie: adminCookie } })
+    const bakBuf = Buffer.from(await bak.arrayBuffer())
+    assert(bakBuf.slice(0, 2).toString() === 'PK', '备份包可导出')
+    const before = await req('GET', '/api/files')
+    const beforeNames = (before.json.data || []).map(x => x.name)
+    assert(beforeNames.includes('a.txt'), '附件已入库', JSON.stringify(beforeNames))
+
+    const imp = new FormData()
+    imp.append('file', new Blob([bakBuf], { type: 'application/zip' }), 'backup.zip')
+    const impRes = await fetch(BASE + '/api/backup/import', { method: 'POST', body: imp, headers: { Cookie: adminCookie } })
+    const impJson = await impRes.json()
+    assert(impJson.ok, '备份可导入', JSON.stringify(impJson))
+    const after = await req('GET', '/api/files')
+    assert((after.json.data || []).some(x => x.name === 'a.txt'), '导入后附件仍在（不会被反向清空）')
+    assert(typeof impJson.note === 'string' && impJson.note.includes('合并'), '导入结果说明附件的处理方式')
+
+    // multipart 解析：字段顺序不固定 + 首段前面没有 CRLF
+    const form3 = new FormData()
+    form3.append('formId', String(secretForm))
+    form3.append('file', new Blob([Buffer.from('顺序测试')], { type: 'text/plain' }), 'b.txt')
+    const up3 = await fetch(BASE + '/api/upload', { method: 'POST', body: form3, headers: { Cookie: adminCookie } })
+    const up3Json = await up3.json()
+    assert(up3.ok && up3Json.size === Buffer.from('顺序测试').length, '文件大小准确（首段不被吞掉）', JSON.stringify(up3Json))
+    const raw3 = await fetch(BASE + up3Json.url)
+    assert((await raw3.text()) === '顺序测试', '上传内容逐字节一致')
+
+    // 打包附件：给一份答卷认领两个同名文件，不能互相覆盖
+    const formZ = await req('POST', '/api/forms', { title: '附件打包探针', status: 'published',
+      schema: [{ id: 'fz', type: 'upload', label: '截图' }] })
+    const zid = formZ.json.id
+    const uploadOnes = async (txt, name) => {
+      const fd2 = new FormData()
+      fd2.append('file', new Blob([Buffer.from(txt)], { type: 'text/plain' }), name)
+      fd2.append('formId', String(zid))
+      const res = await fetch(BASE + '/api/upload', { method: 'POST', body: fd2, headers: { Cookie: adminCookie } })
+      return res.json()
+    }
+    const f1 = await uploadOnes('第一张', '截图.png')
+    const f2 = await uploadOnes('第二张', '截图.png')
+    const subZ = await req('POST', `/api/public/forms/${zid}/submit`, { data: { fz: [f1, f2] } })
+    assert(subZ.status === 201, '带附件的答卷提交成功', JSON.stringify(subZ.json))
+    const zipRes = await fetch(BASE + `/api/forms/${zid}/attachments.zip`, { headers: { Cookie: adminCookie } })
+    const zipData = Buffer.from(await zipRes.arrayBuffer())
+    assert(zipRes.ok && zipData.slice(0, 2).toString() === 'PK', '附件打包成功')
+    assert(Number(zipRes.headers.get('x-eqs-files')) === 2, '同名附件不互相覆盖', zipRes.headers.get('x-eqs-files'))
+    // ZIP 里的文件名带 UTF-8 标志位，直接按 UTF-8 搜同名副本
+    assert(zipData.includes(Buffer.from('截图(1).png', 'utf8')), '同名附件被重命名保留')
+  }
+
+  console.log('\n[24] 题库与卷面的答案口径一致')
+  {
+    r = await req('POST', '/api/banks', { name: '口径探针题库' })
+    const bid2 = r.json.id
+    r = await req('POST', `/api/banks/${bid2}/import-text`, {
+      text: ['[多选] 哪些是水果？', 'A. 苹果', 'B. 白菜', '答案：A', '分值：5',
+        '', '[判断] 地球是圆的。', '答案：A', '分值：5'].join('\n')
+    })
+    assert(r.json.imported === 2, '题库导入多选与判断', JSON.stringify(r.json))
+    r = await req('POST', `/api/banks/${bid2}/paper`, { title: '口径探针试卷', count: 10 })
+    const pid = r.json.id
+    const paper = await req('GET', `/api/forms/${pid}`)
+    const paperSchema = paper.json.data.schema
+    const judge = paperSchema.find(f => f.label.includes('地球'))
+    const multi = paperSchema.find(f => f.label.includes('水果'))
+    assert(judge && JSON.stringify(judge.answer) === JSON.stringify(['正确']), '判断题答案落到卷面是「正确」', JSON.stringify(judge?.answer))
+    assert(multi && JSON.stringify(multi.answer) === JSON.stringify(['苹果']), '多选题答案落到卷面是选项值', JSON.stringify(multi?.answer))
+
+    // 真正答对，必须判满分：以前答案对不上选项值，全对也是 0 分
+    await req('PUT', `/api/forms/${pid}`, { status: 'published' })
+    r = await req('POST', `/api/public/forms/${pid}/submit`, {
+      data: { [judge.id]: '正确', [multi.id]: ['苹果'] }
+    })
+    assert(r.json.score === 10 && r.json.passed === true, '从题库组的卷子答对就是满分', JSON.stringify({ score: r.json.score, total: r.json.total }))
+    r = await req('POST', `/api/public/forms/${pid}/submit`, {
+      data: { [judge.id]: '错误', [multi.id]: ['苹果'] }
+    })
+    assert(r.json.score === 5, '答错一题扣掉对应分', String(r.json.score))
+  }
+
+  console.log('\n[25] 排序题的「没动过」要算没作答')
+  {
+    r = await req('POST', '/api/forms', {
+      title: '排序必填探针', status: 'published',
+      schema: [{ id: 's1', type: 'sort', label: '请按重要性排序', required: true,
+        options: [{ label: '快', value: '快' }, { label: '稳', value: '稳' }] }]
+    })
+    const sidX = r.json.id
+    r = await req('POST', `/api/public/forms/${sidX}/submit`, { data: { s1: [] } })
+    assert(r.status === 422, '排序题没动过就提交被拦下', JSON.stringify(r.json))
+    r = await req('POST', `/api/public/forms/${sidX}/submit`, { data: { s1: ['稳', '快'] } })
+    assert(r.status === 201, '真的排了序就能提交', JSON.stringify(r.json))
+  }
+
+  console.log('\n[26] 前端静态资源')
   for (const p of ['/', '/js/main.js', '/css/app.css', '/assets/eqs-mark.svg', '/vendor/echarts.min.js']) {
     const res = await fetch(BASE + p)
     assert(res.ok, `静态资源可访问：${p}`)

@@ -126,6 +126,12 @@ export default {
       if (!aiPrompt.value.trim()) return err('请先描述你想要的表单')
       aiBusy.value = true
       try {
+        // 生成会整体替换现有题目。已经画了半天的表单被一句提示词清空，是不可撤销的操作
+        if (form.value.schema?.length) {
+          const yes = await confirmBox(`AI 生成会替换当前 ${form.value.schema.length} 道题，确定继续？`)
+          // 必须把 busy 放掉：提前 return 会让按钮永远停在「生成中…」
+          if (!yes) { aiBusy.value = false; return }
+        }
         const r = await api.post('/api/ai/generate', { prompt: aiPrompt.value, kind: form.value.kind })
         form.value.schema = r.data.schema
         if (!form.value.description) form.value.description = r.data.description
@@ -141,7 +147,7 @@ export default {
         form.value.schema = r.schema
         importOpen.value = false
         importText.value = ''
-        ok(`已导入 ${r.added} 道题`)
+        ok(`已导入 ${r.added} 道题` + (r.droppedAnswers?.length ? `；${r.droppedAnswers.length} 道题的答案不在选项里，已清空待修正` : ''))
       } catch (e) { err(e.message) }
     }
 

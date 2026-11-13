@@ -32,6 +32,9 @@ export const api = {
     a.download = filename
     a.click()
     setTimeout(() => URL.revokeObjectURL(a.href), 3000)
+    // 打包附件时可能有文件已经从磁盘上丢了，服务端会跳过后照常出包；
+    // 静默吞掉会让人以为「附件就这么多」，所以把跳过的数量带回给调用方
+    return { missing: Number(res.headers.get('x-eqs-missing') || 0), files: Number(res.headers.get('x-eqs-files') || 0) }
   },
   stream: async (url, body, onDelta) => {
     const res = await fetch(url, { method: 'POST', headers: jsonHeaders, credentials: 'same-origin', body: JSON.stringify(body) })

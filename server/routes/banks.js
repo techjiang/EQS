@@ -1,7 +1,7 @@
 import { get, all, run, now, log } from '../lib/db.js'
 import { readJson, fail, sendJson } from '../lib/http.js'
 import { requireUser, requirePerm, can } from '../lib/auth.js'
-import { normalizeField, paginate, safeJson, gradeSubmission } from '../lib/forms.js'
+import { normalizeField, paginate, safeJson, gradeSubmission, coerceAnswerToField } from '../lib/forms.js'
 import { parseTextToFields } from './forms.js'
 
 const parseQ = q => ({ ...q, options: safeJson(q.options, []), answer: safeJson(q.answer, []) })
@@ -73,6 +73,7 @@ export default function register(r) {
     for (const item of items) {
       const f = normalizeField(item)
       if (!f.label) continue
+      coerceAnswerToField(f)
       const result = run('INSERT INTO questions(bank_id, type, title, options, answer, analysis, score, tags, created_at) VALUES(?,?,?,?,?,?,?,?,?)',
         bank.id, f.type, f.label, JSON.stringify(f.options), JSON.stringify(f.answer), f.analysis, f.score || 5, body.tags || '', now())
       ids.push(Number(result.lastInsertRowid))
@@ -86,6 +87,7 @@ export default function register(r) {
     if (!q) fail(404, '题目不存在')
     const body = await readJson(req)
     const f = normalizeField({ ...parseQ(q), ...body })
+    coerceAnswerToField(f)
     run('UPDATE questions SET type = ?, title = ?, options = ?, answer = ?, analysis = ?, score = ?, tags = ? WHERE id = ?',
       f.type, f.label, JSON.stringify(f.options), JSON.stringify(f.answer), f.analysis, f.score, body.tags ?? q.tags, q.id)
     sendJson(res, 200, { ok: true })
@@ -105,7 +107,9 @@ export default function register(r) {
     const bank = get('SELECT * FROM banks WHERE id = ? AND deleted_at IS NULL', Number(params.id))
     if (!bank) fail(404, '题库不存在')
     const { text } = await readJson(req)
-    const fields = parseTextToFields(String(text || ''))
+    // 题库导入的默认分值不能是 0：recalculate 里 `f.score || 5` 会把 0 变成 5，
+    // 而「分值：0」是用户明说的「这题不计分」，不是没填
+    const fields = parseTextToFields(String(text || ''), { defaultScore: 5 })
     if (!fields.length) fail(400, '未识别到题目')
     const dropped = []
     for (const f of fields) {
@@ -116,8 +120,9 @@ export default function register(r) {
         if (kept.length !== f.answer.length) dropped.push(f.label)
         f.answer = kept
       }
+      coerceAnswerToField(f)
       run('INSERT INTO questions(bank_id, type, title, options, answer, analysis, score, created_at) VALUES(?,?,?,?,?,?,?,?)',
-        bank.id, f.type, f.label, JSON.stringify(f.options), JSON.stringify(f.answer), f.analysis, f.score || 5, now())
+        bank.id, f.type, f.label, JSON.stringify(f.options), JSON.stringify(f.answer), f.analysis, f.score ?? 5, now())
     }
     sendJson(res, 200, { ok: true, imported: fields.length, droppedAnswers: dropped })
   })
@@ -131,10 +136,17 @@ export default function register(r) {
     const count = Math.max(1, Number(body.count) || 10)
     const rows = all('SELECT * FROM questions WHERE bank_id = ? AND deleted_at IS NULL ORDER BY RANDOM() LIMIT ?', bank.id, count).map(parseQ)
     if (!rows.length) fail(400, '题库中没有题目')
-    const schema = rows.map(q => normalizeField({
-      type: q.type, label: q.title, options: q.options, answer: q.answer,
-      analysis: q.analysis, score: q.score
-    }))
+    const schema = rows.map(q => {
+      // 题库认「正确答案：A」「正确」，卷面上的多选认 ['选项值']、判断认「正确/错误」。
+      // 直接把题库里的答案搬进卷面，会出现「卷面显示作答 A 却判 0 分」——所以入库前统一口径。
+      const f = normalizeField({
+        type: q.type, label: q.title, options: q.options, answer: q.answer,
+        analysis: q.analysis, score: q.score
+      })
+      if (!f.answer.length && q.answer?.length) f.answer = q.answer
+      coerceAnswerToField(f)
+      return f
+    })
     const ts = now()
     const settings = {
       passPercent: Number(body.passPercent) > 0 ? Number(body.passPercent) : 60,
@@ -189,7 +201,10 @@ export default function register(r) {
     }
     const schema = picked.map(q => {
       const p = parseQ(q)
-      return normalizeField({ type: p.type, label: p.title, options: p.options, answer: p.answer, analysis: p.analysis, score: p.score })
+      const f = normalizeField({ type: p.type, label: p.title, options: p.options, answer: p.answer, analysis: p.analysis, score: p.score })
+      if (!f.answer.length && p.answer?.length) f.answer = p.answer
+      coerceAnswerToField(f)
+      return f
     })
     const settings = {
       passPercent: Number(body.passPercent) > 0 ? Math.min(100, Number(body.passPercent)) : 60,

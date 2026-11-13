@@ -180,8 +180,12 @@ ensureColumns('submissions', {
   manual_scores: "TEXT NOT NULL DEFAULT '{}'",
   reviewed_at: 'TEXT',
   reviewed_by: 'INTEGER NOT NULL DEFAULT 0',
-  review_note: "TEXT DEFAULT ''"
+  review_note: "TEXT DEFAULT ''",
+  // 对外可见的答卷编号。自增 id 是连续可猜的，而「凭编号查询」天然是匿名入口：
+  // 编号只对提交者本人有意义，所以对外一律用这个不可猜的码，内部 id 只在后台用。
+  public_id: 'TEXT'
 })
+db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_sub_public ON submissions(public_id)`)
 
 /**
  * 换库：checkpoint → 关闭 → 用新文件顶替 → 重新打开。

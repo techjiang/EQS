@@ -1,7 +1,29 @@
+import crypto from 'node:crypto'
 import { get, all, run, now, log } from '../lib/db.js'
 import { readJson, fail, sendJson, clientIp } from '../lib/http.js'
 import { requireUser, requirePerm, currentUser, can } from '../lib/auth.js'
 import { pickForm, validateSubmission, gradeSubmission, computeStats, submissionData, paginate, fieldVisible, passLineOf, manualScoresOf, passHintOf, captchaChallenge, safeJson } from '../lib/forms.js'
+
+/** 对外答卷编号：不可猜、无业务含义，只给提交者本人用 */
+export function newPublicId() {
+  const alphabet = '23456789abcdefghjkmnpqrstuvwxyz'
+  const bytes = crypto.randomBytes(10)
+  let out = ''
+  for (const b of bytes) out += alphabet[b % alphabet.length]
+  return out.slice(0, 5) + '-' + out.slice(5, 10)
+}
+
+/** 编号查询：只认不可猜的 public_id；老数据没有 public_id 时才回退到自增 id */
+function findSubmission(formId, raw) {
+  const key = String(raw || '').trim()
+  if (!key) return null
+  const byPublic = get('SELECT * FROM submissions WHERE public_id = ? AND form_id = ? AND deleted_at IS NULL', key, Number(formId))
+  if (byPublic) return byPublic
+  if (/^\d+$/.test(key)) {
+    return get('SELECT * FROM submissions WHERE id = ? AND form_id = ? AND deleted_at IS NULL AND public_id IS NULL', Number(key), Number(formId))
+  }
+  return null
+}
 
 const flatAnswer = v => (Array.isArray(v) ? v.map(String) : v === undefined || v === null || v === '' ? [] : [String(v)])
 const sameSet = (a, b) => a.length === b.length && [...a].sort().every((x, i) => x === [...b].sort()[i])
@@ -120,7 +142,13 @@ export default function register(r) {
     // 验证码的题面（a + b）必须在这里下发：之前只清空 answer，前端算不出题面，
     // 唯一能对照的答案又被清空了，只能去后台表单详情里翻——验证码整体不可用
     const schema = form.schema.map(f => {
-      const out = { ...f, answer: [], analysis: '' }
+      // 白名单而不是「删掉 answer」：标准答案能藏在任何自定义属性里，
+      // 例如 props.answers，删掉顶层 answer 之后它照样下发到浏览器。
+      const out = {
+        id: f.id, type: f.type, label: f.label, required: f.required,
+        placeholder: f.placeholder, description: f.description, options: f.options,
+        defaultValue: f.defaultValue, logic: f.logic, props: publicFieldProps(f)
+      }
       if (f.type === 'captcha') out.challenge = captchaChallenge(f.id)
       return out
     })
@@ -157,10 +185,11 @@ export default function register(r) {
       score = g.score
       passed = g.passed ? 1 : 0
     }
-    const result = run(`INSERT INTO submissions(form_id, data, score, passed, duration, user_id, ip, device, openid, wx_nickname, wx_avatar, created_at, updated_at)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    const publicId = newPublicId()
+    const result = run(`INSERT INTO submissions(form_id, data, score, passed, duration, user_id, ip, device, openid, wx_nickname, wx_avatar, public_id, created_at, updated_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       form.id, JSON.stringify(data), score, passed, Number(body.duration) || 0, user?.id || 0,
-      fp.ip, fp.device, body.openid || '', body.wxNickname || '', body.wxAvatar || '', ts, ts)
+      fp.ip, fp.device, body.openid || '', body.wxNickname || '', body.wxAvatar || '', publicId, ts, ts)
     const id = Number(result.lastInsertRowid)
     // 附件是先上传后交卷的，交卷时把本次作答里引用到的文件认领到这份答卷上，
     // 否则「打包下载附件」会把它们漏掉。
@@ -176,6 +205,7 @@ export default function register(r) {
     sendJson(res, 201, {
       ok: true,
       id,
+      publicId,
       score,
       total: form.kind === 'exam' ? review?.total ?? 0 : null,
       passLine: form.kind === 'exam' ? review?.passLine ?? 0 : null,
@@ -239,25 +269,29 @@ export default function register(r) {
   /** 公开：按编号查询自己的答卷 */
   r.get('/api/public/forms/:id/query', async (req, res, { params }) => {
     const url = new URL(req.url, 'http://x')
-    const id = url.searchParams.get('submissionId')
+    const id = url.searchParams.get('submissionId') || url.searchParams.get('code')
     if (!id) fail(400, '缺少答卷编号')
-    const row = get('SELECT * FROM submissions WHERE id = ? AND form_id = ? AND deleted_at IS NULL', Number(id), Number(params.id))
-    if (!row) fail(404, '答卷不存在')
+    const row = findSubmission(params.id, id)
+    if (!row) fail(404, '答卷不存在或编号不正确')
     const form = pickForm(params.id)
     if (!form?.settings?.allowQuery) fail(403, '该问卷未开放查询')
-    // 编号是连续自增的，任何人都能猜。只放行「本设备 / 本账号 / 同 IP」提交的答卷
+    /*
+     * 旧实现用自增 id 当编号，只能靠「同设备 / 同账号 / 同 IP」兜底——但同 IP 在 NAT 与代理后面
+     * 等于没有（同一家公司、同一个学校出口都是同一个 IP），X-Forwarded-For 还能随手伪造，
+     * 于是换个 UA 就能翻别人的答卷。现在编号本身不可猜，身份校验作为第二道闸保留。
+     */
     const me = currentUser(req)
     const sameDevice = row.device && row.device === String(req.headers['user-agent'] || '').slice(0, 200)
     const sameUser = me?.id && row.user_id && Number(row.user_id) === Number(me.id)
-    const sameIp = row.ip && row.ip === clientIp(req)
-    if (!sameDevice && !sameUser && !sameIp) fail(403, '只能查询本设备提交过的答卷')
+    const sameOpenid = row.openid && row.openid === url.searchParams.get('openid')
+    if (!sameDevice && !sameUser && !sameOpenid) fail(403, '只能查询本设备提交过的答卷')
     const review = form?.kind === 'exam' && form.settings?.showResult !== false
       ? buildReview(form.schema, JSON.parse(row.data), form.settings, manualScoresOf(row))
       : null
     sendJson(res, 200, {
       ok: true,
       data: {
-        id: row.id, data: JSON.parse(row.data), score: row.score,
+        id: row.id, publicId: row.public_id || String(row.id), data: JSON.parse(row.data), score: row.score,
         passed: row.passed === 1, reviewed: !!row.reviewed_at, review, createdAt: row.created_at
       }
     })
@@ -456,6 +490,21 @@ const PUBLIC_SETTING_KEYS = [
   'submitText', 'buttonText', 'redirectUrl', 'headerImage', 'bgImage', 'bgColor', 'buttonColor',
   'allowQuery', 'onlyWechat', 'recordWechat', 'needPassword', 'passPercent', 'showResult', 'duration'
 ]
+
+/** 作答需要的 props 白名单；标准答案常藏在自定义属性里，一律不下发 */
+const PUBLIC_PROP_KEYS = [
+  'max', 'min', 'step', 'rows', 'fields', 'multiple', 'maxSize', 'accept', 'html',
+  'minLength', 'maxLength', 'unit', 'precision', 'labels', 'placeholder'
+]
+
+export function publicFieldProps(field = {}) {
+  const src = field.props && typeof field.props === 'object' ? field.props : {}
+  const out = {}
+  // 组件类型是这些时，matrix 的「行」本身就是要作答的内容；但个别组件会把答案塞进 props.rows
+  for (const k of PUBLIC_PROP_KEYS) if (src[k] !== undefined) out[k] = src[k]
+  // 未登记的自定义属性一律不下发，避免成为答案走私通道
+  return out
+}
 
 export function publicSettings(settings = {}) {
   const out = {}

@@ -1,4 +1,5 @@
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import crypto from 'node:crypto'
 import { get, all, run, now, setting, setSetting, DATA_DIR, log, db, switchDb } from '../lib/db.js'
@@ -44,22 +45,36 @@ export default function register(r) {
     const parts = parseMultipart(buf, boundary[1] || boundary[2])
     const file = parts.find(p => p.filename)
     if (!file) fail(400, '未找到备份文件')
-    const restoreDir = path.join(DATA_DIR, 'restore-' + Date.now())
-    fs.mkdirSync(restoreDir, { recursive: true })
+    // 解包目录放在数据目录之外：放在 DATA_DIR 里时，exportBackup 会把上一次解包的残留也打进去
+    const restoreDir = fs.mkdtempSync(path.join(os.tmpdir(), 'eqs-restore-'))
     try {
-      extractZip(file.data, restoreDir)
+      const unzipped = extractZip(file.data, restoreDir)
+      if (unzipped && unzipped.ok === false) fail(400, unzipped.reason || '备份文件无法解包')
       const root = findEqsData(restoreDir)
       if (!root) fail(400, '备份文件结构不正确')
-      const incoming = path.join(restoreDir, 'incoming.db')
+      const incoming = path.join(os.tmpdir(), `eqs-incoming-${Date.now()}.db`)
       fs.writeFileSync(incoming, fs.readFileSync(path.join(root, 'eqs.db')))
       // 切换连接：switchDb 内部 checkpoint → close → 覆盖 eqs.db → 重新打开（WAL 残留在里面清掉）
       switchDb(incoming)
-      if (fs.existsSync(path.join(root, 'files'))) {
-        fs.mkdirSync(path.join(DATA_DIR, 'files'), { recursive: true })
-        fs.cpSync(path.join(root, 'files'), path.join(DATA_DIR, 'files'), { recursive: true })
-      }
-      log(me, '导入备份', '已生效')
-      sendJson(res, 200, { ok: true, restartRequired: false, message: '备份已导入并生效' })
+      fs.rmSync(incoming, { force: true })
+      /*
+       * 合并而不是覆盖：旧备份里没有 files 目录时，之前这里一个都不动，
+       * 于是「恢复了一个不含附件的旧备份」→ 数据库回到旧状态，附件还是新的，两边对不上；
+       * 反过来若备份里带了 files，cpSync 又只覆盖不删除。两种情况都会留下孤儿文件或者丢附件。
+       * 文件按「日期/随机名」存放，同名就是同一个文件，不覆盖才怪——所以这里只补不删，并在结束时报数。
+       */
+      const backupFiles = path.join(root, 'files')
+      fs.mkdirSync(path.join(DATA_DIR, 'files'), { recursive: true })
+      const added = fs.existsSync(backupFiles)
+        ? fs.cpSync(backupFiles, path.join(DATA_DIR, 'files'), { recursive: true, force: false, errorOnExist: false }) ?? countFiles(backupFiles)
+        : 0
+      log(me, '导入备份', `已生效，附件合并 ${added || 0} 项`)
+      sendJson(res, 200, {
+        ok: true, restartRequired: false,
+        message: '备份已导入并生效',
+        filesMerged: added || 0,
+        note: '附件按合并处理：备份里没有的文件会保留，不会被删除'
+      })
     } finally {
       fs.rmSync(restoreDir, { recursive: true, force: true })
     }
@@ -233,6 +248,21 @@ async function upsertOAuthUser({ username, email, nickname, avatar }) {
 }
 
 const hashPasswordless = () => 'oauth$' + crypto.randomBytes(16).toString('hex')
+
+function countFiles(dir) {
+  let n = 0
+  const stack = [dir]
+  while (stack.length) {
+    const d = stack.pop()
+    let entries = []
+    try { entries = fs.readdirSync(d, { withFileTypes: true }) } catch { continue }
+    for (const e of entries) {
+      if (e.isDirectory()) stack.push(path.join(d, e.name))
+      else n++
+    }
+  }
+  return n
+}
 
 function findEqsData(dir) {
   const stack = [dir]

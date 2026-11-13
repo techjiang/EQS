@@ -210,23 +210,34 @@ export function renderControl(field, model, opts = {}) {
         val ? h('div', { class: 'tag brand', style: 'margin-top:8px' }, String(val)) : null
       ])
     case 'sort': {
-      const arr = Array.isArray(val) && val.length ? val : field.options.map(o => o.value)
-      return h('div', {}, arr.map((v, i) => {
-        const opt = field.options.find(o => o.value === v) || { label: v, value: v }
-        return h('div', { class: 'opt', key: v }, [
-          h('span', { class: 'num' }, String(i + 1)),
-          h('span', { style: 'flex:1' }, opt.label),
-          !dis ? h('span', { class: 'flex', style: 'gap:2px' }, [
-            h('button', { class: 'btn ghost sm', disabled: i === 0, onClick: () => move(i, i - 1) }, '↑'),
-            h('button', { class: 'btn ghost sm', disabled: i === arr.length - 1, onClick: () => move(i, i + 1) }, '↓')
-          ]) : null
-        ])
-        function move(a, b) {
-          const next = [...arr]
-          ;[next[a], next[b]] = [next[b], next[a]]
-          set(next)
-        }
-      }))
+      /*
+       * 排序题的默认值是「题目里的全部选项」，可它不是选出来的答案：
+       * 只要一个人碰了这一题，就必须留下一个明确而且能被校验的作答。
+       * 以前默认就填好、直接提交也能过，服务端的必填校验同样认为「数组非空 = 已作答」——
+       * 于是「请把下列选项按重要性排序」这道题，一个字没动也算填完了。
+       * 现在未作答时数组为空，展示用初始顺序，动一下才把顺序写入作答。
+       */
+      const picked = Array.isArray(val) && val.length ? val : []
+      const arr = picked.length ? picked : field.options.map(o => o.value)
+      return h('div', {}, [
+        !picked.length ? h('div', { class: 'small muted', style: 'margin-bottom:6px' }, '用上下箭头调整顺序，调整后才算作答') : null,
+        ...arr.map((v, i) => {
+          const opt = field.options.find(o => o.value === v) || { label: v, value: v }
+          return h('div', { class: 'opt', key: v }, [
+            h('span', { class: 'num' }, String(i + 1)),
+            h('span', { style: 'flex:1' }, opt.label),
+            !dis ? h('span', { class: 'flex', style: 'gap:2px' }, [
+              h('button', { class: 'btn ghost sm', disabled: i === 0, onClick: () => move(i, i - 1) }, '↑'),
+              h('button', { class: 'btn ghost sm', disabled: i === arr.length - 1, onClick: () => move(i, i + 1) }, '↓')
+            ]) : null
+          ])
+          function move(a, b) {
+            const next = [...arr]
+            ;[next[a], next[b]] = [next[b], next[a]]
+            set(next)
+          }
+        })
+      ])
     }
     case 'cascader':
       return h('select', {

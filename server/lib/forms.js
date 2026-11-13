@@ -45,6 +45,53 @@ export function normalizeField(f, i = 0) {
   return out
 }
 
+/** 判断类题目统一成「正确/错误」两个选项的单选题 */
+export function judgeOptions() {
+  return [{ label: '正确', value: '正确' }, { label: '错误', value: '错误' }]
+}
+
+/**
+ * 把答案改写成「当前题型认得的写法」。
+ * 题库这边存的是「正确答案：A / 正确」，卷面判分比的是选项值（多选比数组）。
+ * 两条路各写各的，就会出现：卷面上明明选了 A，判分说 0 分——因为标准答案是 ['A']，选项值却是 '选项一'。
+ * 所有把题库题目搬进卷面的地方都必须先过这一道，否则只修一处、另一处照旧静默出错。
+ */
+export function coerceAnswerToField(field) {
+  if (!field || !Array.isArray(field.answer)) return field
+  const type = field.type
+  if (type === 'judge') field.type = 'radio'
+  if (field.type === 'radio' && /判断/.test(String(field.label || '')) && !field.options.length) {
+    field.options = judgeOptions()
+  }
+  const opts = Array.isArray(field.options) ? field.options : []
+  const values = new Set(opts.map(o => String(o.value)))
+  const labels = new Map(opts.map(o => [String(o.label), String(o.value)]))
+  const isJudge = /判断/.test(String(field.label || '')) &&
+    opts.length === 2 && values.has('正确') && values.has('错误')
+
+  const mapped = []
+  for (const raw of field.answer) {
+    const tok = String(raw).trim()
+    if (!tok) continue
+    // 判断题的字母写法：A/B、T/F、对/错
+    if (isJudge) {
+      if (/^(A|T|true|对|正确|是)$/i.test(tok)) { mapped.push('正确'); continue }
+      if (/^(B|F|false|错|错误|否)$/i.test(tok)) { mapped.push('错误'); continue }
+    }
+    if (values.has(tok)) { mapped.push(tok); continue }
+    if (labels.has(tok)) { mapped.push(labels.get(tok)); continue }
+    // 字母写法 A / B / C → 对应选项值（判断题上面已处理）
+    if (/^[A-Za-z]$/.test(tok)) {
+      const opt = opts[tok.toUpperCase().charCodeAt(0) - 65]
+      if (opt) { mapped.push(String(opt.value)); continue }
+    }
+    mapped.push(tok)
+  }
+  // 判分逻辑对单选/多选都按数组比较，这里保持数组，只保证元素是选项值
+  field.answer = [...new Set(mapped)]
+  return field
+}
+
 export function normalizeSchema(schema) {
   if (!Array.isArray(schema)) return []
   return schema.map(normalizeField)
@@ -98,6 +145,7 @@ export function validateSubmission(schema, data) {
     if (!fieldVisible(f, data)) continue
     if (['divider', 'richtext', 'image', 'html'].includes(f.type)) continue
     const v = data[f.id]
+    // 排序题的空数组要真正算「没作答」：它一旦被默认填满，必填就成了摆设
     const empty = v === undefined || v === null || v === '' || (Array.isArray(v) && v.length === 0)
     if (f.required && empty) { errors.push(`${f.label} 为必填项`); continue }
     if (empty) continue

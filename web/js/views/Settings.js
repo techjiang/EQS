@@ -108,7 +108,9 @@ export default {
         const res = await fetch('/api/backup/import', { method: 'POST', body: fd, credentials: 'same-origin' })
         const j = await res.json()
         if (!j.ok) throw new Error(j.message)
-        ok(j.message)
+        ok(j.message + (j.note ? `；${j.note}` : ''))
+        // 数据库整个被替换了：当前页面里的表单列表、统计数字全是旧库的，必须重新拉一遍
+        await load()
       } catch (e) { err(e.message) }
     }
 

@@ -167,13 +167,14 @@ export default {
                   h('div', { class: 'flex between', style: 'gap:8px' }, [
                     h('div', { style: 'font-size:13.5px;font-weight:560' }, `${i + 1}. ${it.label}`),
                     h('span', { class: 'small', style: 'flex:none;color:' + (it.judged ? (it.correct ? 'var(--ok)' : 'var(--danger)') : 'var(--text-3)') },
-                      it.judged ? (it.correct ? `✓ +${it.score}` : `✕ 0/${it.score}`) : '未设答案')
+                      // 「未设答案」在阅卷环节是错的：主观题不是没设答案，是等人给分
+                      it.judged ? (it.correct ? `✓ +${it.score}` : `✕ 0/${it.score}`) : (it.score > 0 ? '待人工批阅' : '不计分'))
                   ]),
                   it.judged && !it.correct ? h('div', { class: 'small muted', style: 'margin-top:4px' }, `你的作答：${it.given.join('、') || '（空）'} · 正确答案：${it.answer.join('、')}`) : null,
                   it.analysis ? h('div', { class: 'small muted', style: 'margin-top:4px' }, '解析：' + it.analysis) : null
                 ]))
               ]) : null,
-              h('div', { class: 'small muted', style: 'margin-top:10px' }, `答卷编号 #${result.value?.id}，可凭此编号查询`),
+              h('div', { class: 'small muted', style: 'margin-top:10px' }, `答卷编号 ${result.value?.publicId || result.value?.id}，可凭此编号查询`),
               h('button', {
                 class: 'btn mt2',
                 onClick: () => {
@@ -215,7 +216,7 @@ export default {
                 queryOpen.value ? h('div', { style: 'margin-top:10px;padding:14px;border:1px solid var(--line);border-radius:12px' }, [
                   h('div', { class: 'flex', style: 'gap:8px' }, [
                     h('input', {
-                      class: 'input', placeholder: '答卷编号，例如 12', value: queryId.value,
+                      class: 'input', placeholder: '答卷编号，例如 k3m9xz-7qp2', value: queryId.value,
                       onInput: e => queryId.value = e.target.value,
                       onKeydown: e => { if (e.key === 'Enter') lookup() }
                     }),
@@ -223,7 +224,7 @@ export default {
                   ]),
                   queryResult.value ? h('div', { style: 'margin-top:12px;font-size:13px' }, [
                     h('div', { class: 'small muted', style: 'margin-bottom:6px' },
-                      `答卷 #${queryResult.value.id} · ${fmtDate(queryResult.value.createdAt)}` +
+                      `答卷 ${queryResult.value.publicId || queryResult.value.id} · ${fmtDate(queryResult.value.createdAt)}` +
                       (queryResult.value.score != null ? ` · 得分 ${queryResult.value.score}` : '') +
                       (queryResult.value.reviewed ? ' · 已人工批阅' : '')),
                     queryResult.value.review ? h('div', { class: 'small', style: 'margin-bottom:8px;color:' + (queryResult.value.passed ? 'var(--ok)' : 'var(--danger)') },

@@ -239,15 +239,53 @@ export default {
               h('button', { class: 'btn ghost sm', onClick: () => editQ.value.options.push({ label: `选项 ${editQ.value.options.length + 1}`, value: `选项 ${editQ.value.options.length + 1}` }) }, '+ 添加')
             ]),
             editQ.value.options.map((o, i) => h('div', { class: 'opt-row' }, [
-              h('input', { class: 'input', value: o.label, onInput: e => { o.label = e.target.value; o.value = e.target.value } }),
-              h('button', { onClick: () => editQ.value.options.splice(i, 1) }, '×')
+              h('input', {
+                class: 'input', value: o.label,
+                onInput: e => {
+                  const next = e.target.value
+                  // 改选项名要同步改答案：只改 o.label 时 o.value 已是旧值，答案指着一个不存在的选项
+                  editQ.value.answer = (editQ.value.answer || []).map(a => (a === o.value || a === o.label ? next : a))
+                  o.label = next
+                  o.value = next
+                }
+              }),
+              h('button', { onClick: () => { editQ.value.answer = (editQ.value.answer || []).filter(a => a !== o.value); editQ.value.options.splice(i, 1) } }, '×')
             ]))
           ]) : null,
           editQ.value.options.length ? h('div', { class: 'field' }, [
-            h('label', {}, '正确答案（逗号分隔）'),
+            h('label', {}, editQ.value.type === 'checkbox' ? '正确答案（可勾选多个）' : '正确答案（点选，也可直接写 A/B）'),
+            h('div', { class: 'flex wrap', style: 'gap:6px' },
+              editQ.value.options.map((o, i) => h('label', {
+                class: ['btn', 'sm', (editQ.value.answer || []).includes(o.value) ? 'primary' : ''],
+                style: 'cursor:pointer'
+              }, [
+                h('input', {
+                  type: editQ.value.type === 'checkbox' ? 'checkbox' : 'radio',
+                  name: 'q-answer', class: 'hide',
+                  checked: (editQ.value.answer || []).includes(o.value),
+                  onChange: () => {
+                    const cur = new Set(editQ.value.answer || [])
+                    if (editQ.value.type === 'checkbox') { cur.has(o.value) ? cur.delete(o.value) : cur.add(o.value) }
+                    else { cur.clear(); cur.add(o.value) }
+                    editQ.value.answer = [...cur]
+                  }
+                }),
+                `${String.fromCharCode(65 + i)}. ${o.label}`
+              ]))),
             h('input', {
-              class: 'input', value: (editQ.value.answer || []).join(','),
-              onInput: e => editQ.value.answer = e.target.value.split(',').map(s => s.trim()).filter(Boolean)
+              class: 'input', style: 'margin-top:8px', placeholder: '也可以手写，例如 A,C',
+              value: (editQ.value.answer || []).join(','),
+              onInput: e => {
+                const tokens = e.target.value.split(/[,，]/).map(s => s.trim()).filter(Boolean)
+                // 手写的字母要翻成选项值，否则存下一个 'A' 而选项值叫「选项一」，从此永远判错
+                editQ.value.answer = tokens.map(t => {
+                  if (/^[A-Za-z]$/.test(t)) {
+                    const opt = editQ.value.options[t.toUpperCase().charCodeAt(0) - 65]
+                    return opt ? opt.value : t
+                  }
+                  return t
+                })
+              }
             })
           ]) : null,
           h('div', { class: 'field' }, [h('label', {}, '答案解析'), h('textarea', {

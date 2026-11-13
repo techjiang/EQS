@@ -24,6 +24,27 @@ export default {
     const importing = ref(false)
     const review = ref(null)
 
+    /** 与服务端 fieldVisible 同口径：隐藏的题不该出现在批阅清单里 */
+    const flat = v => (Array.isArray(v) ? v.join(',') : v)
+    const visible = (q, data) => {
+      const rules = q.logic || []
+      if (!rules.length) return true
+      return rules.every(rule => {
+        const v = flat(data[rule.fieldId])
+        switch (rule.op) {
+          case 'eq': return String(v) === String(rule.value)
+          case 'ne': return String(v) !== String(rule.value)
+          case 'in': return Array.isArray(rule.value) ? rule.value.map(String).includes(String(v)) : String(v) === String(rule.value)
+          case 'contains': return Array.isArray(data[rule.fieldId]) ? data[rule.fieldId].map(String).includes(String(rule.value)) : String(v ?? '').includes(String(rule.value))
+          case 'gt': return Number(v) > Number(rule.value)
+          case 'lt': return Number(v) < Number(rule.value)
+          case 'empty': return v === '' || v === undefined || v === null
+          case 'notEmpty': return !(v === '' || v === undefined || v === null)
+          default: return true
+        }
+      })
+    }
+
     const loadForms = async () => {
       const r = await api.get('/api/forms?pageSize=200')
       forms.value = r.data
@@ -167,15 +188,26 @@ export default {
 
     const openDetail = (row) => { detail.value = row }
 
-    /** 打开批阅：拉最新答卷，把主观题与人工分摊成表单 */
+    /**
+     * 打开批阅：拉最新答卷，把主观题与人工分摊成表单。
+     * 判据必须和后台 pendingLeft 一致：有分值、无标准答案、当前可见、不是说明类组件。
+     * 之前这里只看「有分值无答案」，隐藏起来的主观题也列出来，老师给完分提交，
+     * 后台过滤掉隐藏题后队列里还剩它——批了也不消失。
+     */
+    const NO_GRADE = ['divider', 'richtext', 'html', 'image', 'captcha']
+    const isSubjective = (q, data) => Number(q.score) > 0 && !(q.answer || []).length &&
+      !NO_GRADE.includes(q.type) && visible(q, data)
+
     const openReview = async (row) => {
       try {
+        // 全部表单视图下 form.value 可能是别的表单，批阅必须用这条答卷自己的卷子
         const r = await api.get(`/api/submissions/${row.id}`)
         const sub = r.data
         const f = sub.form
         if (!f || f.kind !== 'exam') return err('只有考试答卷需要批阅')
-        const subjective = (f.schema || []).filter(q => q.score > 0 && !(q.answer || []).length)
-        if (!subjective.length) return err('这份卷子没有主观题')
+        const data = sub.data || {}
+        const subjective = (f.schema || []).filter(q => isSubjective(q, data))
+        if (!subjective.length) return err('这份卷子没有待批阅的主观题')
         review.value = {
           id: row.id,
           title: f.title,
@@ -184,10 +216,17 @@ export default {
           scores: { ...(sub.manual_scores || {}) },
           items: subjective.map(q => ({
             id: q.id, label: q.label, score: Number(q.score) || 0,
-            given: sub.data[q.id], analysis: q.analysis || ''
+            given: data[q.id], analysis: q.analysis || ''
           }))
         }
       } catch (e) { err(e.message) }
+    }
+
+    /** 默认把「还没给过分」的题按 0 分填上：卷面分先落地，避免整张卷子永远停在待批阅 */
+    const fillZero = () => {
+      for (const it of review.value.items) {
+        if (review.value.scores[it.id] === undefined || review.value.scores[it.id] === '') review.value.scores[it.id] = 0
+      }
     }
 
     const saveReview = async () => {
@@ -202,15 +241,18 @@ export default {
       } catch (e) { err(e.message) }
     }
     const openEdit = async (row) => {
-      // 全部表单视图下，先按行的所属表单加载 schema，编辑弹窗才画得出控件
-      if (row.form_id && row.form_id !== formId.value) {
+      // 编辑弹窗用的是这条答卷自己的卷子。之前直接改 form.value，
+      // 结果「全部表单」视图下点一行，左上角选中的表单也跟着变了，关掉弹窗列表就换了一批数据
+      let schema = form.value?.schema || []
+      const targetForm = row.form_id || formId.value
+      if (!targetForm) return err('请先在左上角选择一个具体表单')
+      if (targetForm !== formId.value) {
         try {
-          const r = await api.get(`/api/forms/${row.form_id}`)
-          form.value = r.data
+          const r = await api.get(`/api/forms/${targetForm}`)
+          schema = r.data?.schema || []
         } catch (e) { return err(e.message) }
       }
-      if (!form.value) return err('该表单已不存在')
-      editing.value = { id: row.id || 0, data: JSON.parse(JSON.stringify(row.data || {})), marked: row.marked || 0, formId: row.form_id || formId.value }
+      editing.value = { id: row.id || 0, data: JSON.parse(JSON.stringify(row.data || {})), marked: row.marked || 0, formId: targetForm, schema }
     }
 
     const saveEdit = async () => {
@@ -239,7 +281,12 @@ export default {
             class: 'btn sm',
             onClick: () => {
               if (!needForm()) return
-              api.download(`/api/forms/${formId.value}/attachments.zip`, `${form.value?.title || 'form'}-附件.zip`).catch(e => err(e.message))
+              api.download(`/api/forms/${formId.value}/attachments.zip`, `${form.value?.title || 'form'}-附件.zip`)
+                .then(r => {
+                  if (!r.files && !r.missing) return ok('该表单还没有答卷附件')
+                  ok(`已打包 ${r.files} 个文件` + (r.missing ? `，另有 ${r.missing} 个文件已从磁盘丢失，已跳过` : ''))
+                })
+                .catch(e => err(e.message))
             }
           }, '打包附件')
         ])
@@ -297,7 +344,11 @@ export default {
                   }
                 })),
                 h('td', {}, [
-                  h('span', { class: 'mono' }, '#' + r.id),
+                  // 编号是给人抄的，折成两行既难读又把整张表撑高
+                  h('div', { style: 'white-space:nowrap;line-height:1.35' }, [
+                    h('span', { class: 'mono' }, '#' + r.id),
+                    r.public_id ? h('div', { class: 'mono', style: 'font-size:11px;color:var(--text-3)' }, r.public_id) : null
+                  ]),
                   r.marked ? h('span', { class: 'tag warn', style: 'margin-left:6px' }, '标记') : null
                 ]),
                 h('td', { class: 'nowrap' }, fmtDate(r.created_at)),
@@ -343,6 +394,10 @@ export default {
           h('div', { class: 'small muted mb' }, review.value.reviewedAt
             ? `上次批阅：${fmtDate(review.value.reviewedAt)}，可再次调整`
             : '主观题没有标准答案，需要人工给分；给完分系统会重算总分与及格判定'),
+          review.value.items.length > 1 ? h('div', { class: 'flex between mb' }, [
+            h('span', { class: 'small muted' }, `共 ${review.value.items.length} 道主观题，未填的按 0 分算`),
+            h('button', { class: 'btn sm', onClick: fillZero }, '未填的按 0 分')
+          ]) : null,
           ...review.value.items.map(it => h('div', { class: 'mb', style: 'padding:12px 14px;border:1px solid var(--line);border-radius:10px' }, [
             h('div', { class: 'flex between', style: 'gap:10px;align-items:flex-start' }, [
               h('b', { style: 'font-size:14px;line-height:1.5' }, it.label),
@@ -388,7 +443,7 @@ export default {
       editing.value ? Modal({
         title: editing.value.id ? `编辑答卷 #${editing.value.id}` : '新增答卷',
         modelValue: true, onClose: () => editing.value = null, wide: true,
-        children: h('div', {}, (form.value?.schema || [])
+        children: h('div', {}, (editing.value.schema || [])
           .filter(f => !['divider', 'richtext', 'html', 'image'].includes(f.type))
           .map(f => h('div', { class: 'field' }, [
             h('label', {}, f.label),

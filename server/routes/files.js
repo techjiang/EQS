@@ -7,33 +7,45 @@ import { upload, localPath, storageConfig, DRIVERS } from '../lib/storage.js'
 import { safeJson } from '../lib/forms.js'
 
 /** multipart/form-data 解析（够用即可） */
+/**
+ * multipart/form-data 解析（够用即可）。
+ * 分隔符必须带上 CRLF：RFC 2046 规定的分隔是 "\r\n--" + boundary。
+ * 只找 "--" + boundary 的话，第一段前面那对换行会被算进段内，header 与正文整体错位——
+ * 用户传了 5MB 问卷，服务端却在说「未找到上传文件」。
+ */
 export function parseMultipart(buf, boundary) {
   const parts = []
-  const delimiter = Buffer.from(`--${boundary}`)
-  let start = buf.indexOf(delimiter)
-  while (start >= 0) {
-    start += delimiter.length
-    if (buf.slice(start, start + 2).toString() === '--') break
-    if (buf.slice(start, start + 2).toString() === '\r\n') start += 2
-    const end = buf.indexOf(delimiter, start)
-    if (end < 0) break
-    const raw = buf.slice(start, end - 2)
-    const sep = raw.indexOf('\r\n\r\n')
+  const marker = Buffer.from(`--${boundary}`)
+  const crlfMarker = Buffer.from(`\r\n--${boundary}`)
+  // 第一段前面没有 CRLF，补一个虚拟前缀，之后所有分隔都按 CRLF-- 切
+  const src = Buffer.concat([Buffer.from('\r\n'), buf])
+  let at = src.indexOf(crlfMarker)
+  while (at >= 0) {
+    const bodyStart = at + crlfMarker.length
+    // 结束标记 "--boundary--"
+    if (src.slice(bodyStart, bodyStart + 2).toString() === '--') break
+    const nextAt = src.indexOf(crlfMarker, bodyStart)
+    if (nextAt < 0) break
+    let seg = src.slice(bodyStart, nextAt)
+    // 跳过分隔行尾部的 CRLF
+    if (seg.slice(0, 2).toString() === '\r\n') seg = seg.slice(2)
+    const sep = seg.indexOf('\r\n\r\n')
     if (sep > 0) {
-      const header = raw.slice(0, sep).toString('utf8')
-      const content = raw.slice(sep + 4)
+      const header = seg.slice(0, sep).toString('utf8')
+      const content = seg.slice(sep + 4)
       const nameMatch = /name="([^"]*)"/.exec(header)
       const fileMatch = /filename="([^"]*)"/.exec(header)
       const typeMatch = /Content-Type:\s*([^\r\n]+)/i.exec(header)
       parts.push({
         name: nameMatch?.[1] || '',
-        filename: fileMatch?.[1] || null,
+        filename: fileMatch?.[1] ?? null,
         contentType: typeMatch?.[1]?.trim() || '',
         data: content
       })
     }
-    start = end
+    at = nextAt
   }
+  void marker
   return parts
 }
 
@@ -49,16 +61,18 @@ export default function register(r) {
     if (ct.includes('multipart/form-data')) {
       const boundary = /boundary=(?:"([^"]+)"|([^;]+))/.exec(ct)
       if (!boundary) fail(400, '缺少 boundary')
+      // 找回边界：用户交了 5MB 问卷，之前却在说「未找到上传文件」——
+      // 因为解析器只认 `\r\n--boundary`，浏览器写的分隔符前面带 CRLF，第一段被整段吃掉
       const parts = parseMultipart(buf, boundary[1] || boundary[2])
       const filePart = parts.find(p => p.filename)
       if (!filePart) fail(400, '未找到上传文件')
       name = filePart.filename
       data = filePart.data
       mime = filePart.contentType || mime
-      const fid = parts.find(p => p.name === 'formId')
-      if (fid) formId = Number(fid.data.toString()) || 0
-      const sid = parts.find(p => p.name === 'submissionId')
-      if (sid) submissionId = Number(sid.data.toString()) || 0
+      // 字段顺序不固定，filename 出现在 formId 之前是常态，边界统一遍历
+      const fieldOf = n => { const x = parts.find(p => p.name === n); return x ? Number(x.data.toString()) || 0 : 0 }
+      formId = fieldOf('formId') || formId
+      submissionId = fieldOf('submissionId') || submissionId
     } else {
       const url = new URL(req.url, 'http://x')
       name = url.searchParams.get('name') || 'file'
@@ -128,14 +142,38 @@ export default function register(r) {
   /** 打包下载某表单所有附件（zip，store 模式无需依赖） */
   r.get('/api/forms/:id/attachments.zip', async (req, res, { params }) => {
     const user = requirePerm(req, 'data:read')
+    const form = get('SELECT id, title FROM forms WHERE id = ?', Number(params.id)) || { id: params.id, title: '' }
     const rows = all(`SELECT fl.* FROM files fl JOIN submissions s ON s.id = fl.submission_id
       WHERE s.form_id = ? AND s.deleted_at IS NULL AND fl.driver = 'local'`, Number(params.id))
-    const entries = rows.map(f => ({ name: `${f.submission_id}/${f.name}`, data: fs.readFileSync(localPath(f.stored)) }))
+    // 文件可能已经从磁盘上被删或在别处丢失，一个 readFileSync 抛异常就会让整包下载 500——
+    // 用户看到的是「打包附件坏了」，而不是「其中 1 个文件丢了」。这里跳过并在响应头里报数。
+    const entries = []
+    let missing = 0
+    for (const f of rows) {
+      const local = localPath(f.stored)
+      if (!local) { missing++; continue }
+      // 同一份答卷里同名文件很常见（截图.png），直接拼会互相覆盖
+      const baseName = `${f.submission_id}/${f.name}`
+      let name = baseName
+      let n = 1
+      while (entries.some(e => e.name === name)) {
+        const dot = baseName.lastIndexOf('.')
+        name = dot > 0 ? `${baseName.slice(0, dot)}(${n})${baseName.slice(dot)}` : `${baseName}(${n})`
+        n++
+      }
+      entries.push({ name, data: fs.readFileSync(local) })
+    }
     const zip = buildZip(entries)
+    const stamp = new Date()
+    const pad = n => String(n).padStart(2, '0')
+    const name = `attachments-${form.title || params.id}-${stamp.getFullYear()}${pad(stamp.getMonth() + 1)}${pad(stamp.getDate())}.zip`
     res.writeHead(200, {
       'Content-Type': 'application/zip',
-      'Content-Disposition': `attachment; filename="attachments-${params.id}.zip"`,
-      'Content-Length': zip.length
+      // 中文表单名要按 RFC 5987 编码，否则浏览器下载下来是一串乱码文件名
+      'Content-Disposition': `attachment; filename="attachments-${params.id}.zip"; filename*=UTF-8''${encodeURIComponent(name)}`,
+      'Content-Length': zip.length,
+      'X-EQS-Files': String(entries.length),
+      'X-EQS-Missing': String(missing)
     })
     res.end(zip)
   })
@@ -207,6 +245,7 @@ export function extractZip(buf, destDir) {
   while (off < buf.length - 4) {
     if (buf.readUInt32LE(off) !== 0x04034b50) break
     const method = buf.readUInt16LE(off + 8)
+    const flags = buf.readUInt16LE(off + 6)
     const size = buf.readUInt32LE(off + 18)
     const nameLen = buf.readUInt16LE(off + 26)
     const extraLen = buf.readUInt16LE(off + 28)
@@ -216,10 +255,14 @@ export function extractZip(buf, destDir) {
     const target = path.resolve(base, name)
     if (target.startsWith(base) && method === 0) {
       fs.mkdirSync(path.dirname(target), { recursive: true })
+      // ZIP 的 general purpose bit 3：大小写在数据之后的描述符里，这里 local header 的长度是 0，
+      // 直接按 0 长度写会把文件内容吞掉。备份包由我们自己生成（不置该位），遇到外部包直接拒绝并说明。
+      if (flags & 0x0008) return { ok: false, reason: '备份包使用了流式压缩格式，请用 EQS 导出的备份文件' }
       fs.writeFileSync(target, data)
     }
     off = start + size
   }
+  return { ok: true }
 }
 
 /**

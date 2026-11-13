@@ -217,7 +217,7 @@ function pickTypeTag(line) {
   return null
 }
 
-export function parseTextToFields(text) {
+export function parseTextToFields(text, { defaultScore = 0 } = {}) {
   const lines = String(text).replace(/\r/g, '').split('\n')
   const fields = []
   let cur = null
@@ -247,7 +247,7 @@ export function parseTextToFields(text) {
       explicit: type !== 'radio' ? true : false,
       id: 'f_' + Math.random().toString(36).slice(2, 9),
       type, label: title, required,
-      options: [], placeholder: '', description: '', defaultValue: '', score: 0,
+      options: [], placeholder: '', description: '', defaultValue: '', score: defaultScore,
       answer: [], analysis: '', logic: [], props: {}
     }
   }
