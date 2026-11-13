@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="EQS">
+  <defs>
+    <linearGradient id="g1" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#5b7cfa"/>
+      <stop offset="0.55" stop-color="#7b5bfa"/>
+      <stop offset="1" stop-color="#b45bfa"/>
+    </linearGradient>
+    <linearGradient id="g2" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0" stop-color="#22d3ee"/>
+      <stop offset="1" stop-color="#5b7cfa"/>
+    </linearGradient>
+  </defs>
+
+  <!-- 圆角对话气泡：问卷 = 提问 + 收集 -->
+  <path d="M256 40c119.3 0 216 84.3 216 188.4 0 104-96.7 188.4-216 188.4-22.5 0-44.2-3-64.6-8.6l-88.7 47.4c-10.2 5.4-21.8-4.9-17.5-15.6l22.9-57.2C63.4 350.9 40 292.5 40 228.4 40 124.3 136.7 40 256 40Z"
+        fill="url(#g1)"/>
+
+  <!-- 内部三条「选项」：白线 + 圆点，暗示单选/清单 -->
+  <g fill="#fff">
+    <circle cx="152" cy="168" r="15" opacity="0.95"/>
+    <rect x="196" y="156" width="164" height="24" rx="12" opacity="0.95"/>
+    <circle cx="152" cy="232" r="15" opacity="0.85"/>
+    <rect x="196" y="220" width="128" height="24" rx="12" opacity="0.85"/>
+    <circle cx="152" cy="296" r="15" opacity="0.75"/>
+    <rect x="196" y="284" width="92" height="24" rx="12" opacity="0.75"/>
+  </g>
+
+  <!-- 右下角对勾徽章：完成/通过 -->
+  <circle cx="392" cy="352" r="58" fill="#f7f8ff"/>
+  <circle cx="392" cy="352" r="50" fill="url(#g2)"/>
+  <path d="M370 353.5l15.5 16L416 336" fill="none" stroke="#fff" stroke-width="14"
+        stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
