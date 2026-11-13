@@ -89,7 +89,13 @@ export default {
           tooltip: { trigger: 'axis' },
           xAxis: { type: 'category', data: data.value.trend.map(t => t.date.slice(5)), axisLabel: { color: axisColor, fontSize: 11 }, axisLine: { lineStyle: { color: splitColor } } },
           yAxis: { type: 'value', minInterval: 1, axisLabel: { color: axisColor, fontSize: 11 }, splitLine: { lineStyle: { color: splitColor } } },
-          series: [{ type: 'line', data: data.value.trend.map(t => t.count), smooth: true, areaStyle: { opacity: .14 }, symbolSize: 7, lineStyle: { width: 2.5 } }]
+          series: [{
+            type: 'line', smooth: true, areaStyle: { opacity: .14 }, lineStyle: { width: 2.5 },
+            // 只有一天的数据画折线只能得到一个孤立圆点，看起来像加载失败；改成柱状至少读得出「今天 N 份」
+            ...(data.value.trend.length > 1
+              ? { data: data.value.trend.map(t => t.count), symbolSize: 7 }
+              : { type: 'bar', barMaxWidth: 42, data: data.value.trend.map(t => t.count), itemStyle: { borderRadius: [6, 6, 0, 0] } })
+          }]
         })
       }
     }

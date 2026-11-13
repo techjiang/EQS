@@ -101,7 +101,7 @@ export default {
 
     const restore = async (file) => {
       if (!file) return
-      if (!await confirmBox('导入备份会生成新数据库文件，重启后生效。继续？')) return
+      if (!await confirmBox('导入备份会立即覆盖当前全部数据，且无法撤销。确认继续？')) return
       try {
         const fd = new FormData()
         fd.append('file', file)
@@ -309,14 +309,17 @@ export default {
             ]),
             h('div', { class: 'card pad' }, [
               h('b', {}, '备份与迁移'),
-              h('p', { class: 'small muted', style: 'margin:6px 0 12px' }, '导出包含数据库与全部上传文件的压缩包；迁移到新机器时解压到 data 目录即可。'),
-              h('div', { class: 'flex' }, [
+              h('p', { class: 'small muted', style: 'margin:6px 0 12px' },
+                '导出的压缩包包含数据库与全部上传文件。导入会立即覆盖当前数据并生效，导入前建议先导出一次。'),
+              h('div', { class: 'flex wrap' }, [
                 h('button', { class: 'btn primary', onClick: backup }, '导出备份'),
                 h('label', { class: 'btn' }, ['导入备份', h('input', {
                   type: 'file', accept: '.zip', class: 'hide',
                   onChange: e => { restore(e.target.files?.[0]); e.target.value = '' }
                 })])
-              ])
+              ]),
+              h('div', { class: 'small muted', style: 'margin-top:12px' },
+                '命令行也可以直接备份：bash scripts/backup.sh（服务运行中同样安全，会先做事一致快照）。')
             ])
           ])
         }

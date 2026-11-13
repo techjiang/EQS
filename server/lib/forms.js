@@ -16,7 +16,8 @@ export function normalizeField(f, i = 0) {
     id: f.id || 'f_' + crypto.randomBytes(5).toString('hex'),
     type,
     label: String(f.label ?? `题目 ${i + 1}`),
-    required: !!f.required,
+    // 空字符串要理解成「没填」：否则评分题 / NPS 的默认值 '' 会静默清空 0 分作答
+    required: f.required === true || f.required === 'true' || f.required === 1,
     placeholder: f.placeholder || '',
     description: f.description || '',
     options: Array.isArray(f.options) ? f.options.map(o => (typeof o === 'string' ? { label: o, value: o } : { label: String(o.label ?? ''), value: String(o.value ?? o.label ?? '') })) : [],
@@ -34,7 +35,11 @@ export function normalizeField(f, i = 0) {
     out.props.rows = ['行 1', '行 2']
     out.options = [{ label: '很满意', value: '5' }, { label: '满意', value: '4' }, { label: '一般', value: '3' }]
   }
-  if (type === 'nps') out.props.max = 10
+  if (type === 'nps') {
+    out.props.max = Number(out.props.max) || 10
+    // 0 是合法下限，不能用 || 兜底
+    out.props.min = out.props.min === undefined || out.props.min === null || out.props.min === '' ? 0 : Number(out.props.min)
+  }
   if (type === 'rate') out.props.max = Number(out.props.max) || 5
   if (type === 'slider') { out.props.min ??= 0; out.props.max ??= 100; out.props.step ??= 1 }
   return out
@@ -190,8 +195,9 @@ export function computeStats(form, submissions) {
       let optionPairs = f.options.map(o => ({ name: o.label, value: counts[o.value] || 0 }))
       if (f.type === 'rate' || f.type === 'nps') {
         const max = Number(f.props?.max) || (f.type === 'nps' ? 10 : 5)
-        const from = f.type === 'nps' ? 0 : 1
-        optionPairs = Array.from({ length: max - from + 1 }, (_, i) => ({ name: String(from + i), value: counts[String(from + i)] || 0 }))
+        // 与前端 renderer 的 npsRange 同口径，否则 -2 这类负档位的作答在报表里凭空消失
+        const from = f.type === 'nps' ? Number(f.props?.min ?? 0) : 1
+        optionPairs = Array.from({ length: Math.max(0, max - from + 1) }, (_, i) => ({ name: String(from + i), value: counts[String(from + i)] || 0 }))
       }
       item.series = optionPairs
       item.average = values.length ? Math.round((values.reduce((a, b) => a + (Number(flat(b)) || 0), 0) / values.length) * 100) / 100 : 0

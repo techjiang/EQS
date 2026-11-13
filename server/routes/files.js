@@ -1,6 +1,6 @@
 import fs from 'node:fs'
 import path from 'node:path'
-import { get, all, run, now, DATA_DIR } from '../lib/db.js'
+import { get, all, run, now, DATA_DIR, db } from '../lib/db.js'
 import { readBody, sendJson, fail, send, clientIp } from '../lib/http.js'
 import { requireUser, requirePerm, currentUser } from '../lib/auth.js'
 import { upload, localPath, storageConfig, DRIVERS } from '../lib/storage.js'
@@ -200,8 +200,39 @@ export function buildZip(entries) {
   return Buffer.concat([...chunks, centralBuf, end])
 }
 
-/** 备份/迁移：导出整个数据目录为 zip */
+/** 极简 zip 解包（仅 store 模式，配合自带备份包） */
+export function extractZip(buf, destDir) {
+  let off = 0
+  const base = path.resolve(destDir)
+  while (off < buf.length - 4) {
+    if (buf.readUInt32LE(off) !== 0x04034b50) break
+    const method = buf.readUInt16LE(off + 8)
+    const size = buf.readUInt32LE(off + 18)
+    const nameLen = buf.readUInt16LE(off + 26)
+    const extraLen = buf.readUInt16LE(off + 28)
+    const name = buf.slice(off + 30, off + 30 + nameLen).toString('utf8')
+    const start = off + 30 + nameLen + extraLen
+    const data = buf.slice(start, start + size)
+    const target = path.resolve(base, name)
+    if (target.startsWith(base) && method === 0) {
+      fs.mkdirSync(path.dirname(target), { recursive: true })
+      fs.writeFileSync(target, data)
+    }
+    off = start + size
+  }
+}
+
+/**
+ * 备份/迁移：导出整个数据目录为 zip
+ * WAL 模式下新数据先落在 eqs.db-wal，eqs.db 主文件可能还是空的。
+ * 不先 checkpoint 就打包，得到的 eqs.db 是个没有表的空壳——「备份成功，恢复全空」。
+ */
 export function exportBackup() {
+  try {
+    db.exec('PRAGMA wal_checkpoint(TRUNCATE)')
+  } catch (e) {
+    console.error('[EQS] 备份前 checkpoint 失败', e.message)
+  }
   const entries = []
   const walk = (dir, prefix = '') => {
     for (const name of fs.readdirSync(dir)) {

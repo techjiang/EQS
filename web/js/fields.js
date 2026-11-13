@@ -106,9 +106,11 @@ export function blankField(type) {
 export function defaultData(schema) {
   const data = {}
   for (const f of schema) {
-    if (f.type === 'checkbox' || f.type === 'sort') data[f.id] = f.defaultValue ? [f.defaultValue] : []
+    // 表单里写「默认值」是一个输入框，多选/排序写的是「A,B」，不拆开就是一个不存在的选项
+    const multi = String(f.defaultValue ?? '').split(/[,，]/).map(s => s.trim()).filter(Boolean)
+    if (f.type === 'checkbox' || f.type === 'sort') data[f.id] = multi
     else if (f.type === 'matrix') data[f.id] = {}
-    else if (f.type === 'switch') data[f.id] = !!f.defaultValue
+    else if (f.type === 'switch') data[f.id] = f.defaultValue === true || f.defaultValue === 'true' || f.defaultValue === 1
     else if (f.type === 'subform') data[f.id] = []
     else data[f.id] = f.defaultValue ?? ''
   }

@@ -88,6 +88,9 @@ node:http 服务器 ── 路由表 ── 鉴权中间件 ── 业务模块
 ## 性能要点
 
 - **WAL + `synchronous=NORMAL`**：写入不阻塞读取，牺牲极端断电一致性换取吞吐。
+  代价是新数据先落在 `eqs.db-wal`，`eqs.db` 主文件可能长时间是空的——任何备份/恢复路径
+  都必须先 `PRAGMA wal_checkpoint`（或 `VACUUM INTO`）拿到一致快照，
+  否则打出来的「备份」是一个没有表的空库，恢复后全站空白。
 - **无 ORM**：直接 prepared statement，避免查询构造开销。
 - **JSON 一次解析**：读表时集中 `safeJson`，避免逐字段解析。
 - **统计在内存聚合**：报表在 SQL 取原始答卷后于 Node 内聚合成图表数据，省去多次往返。

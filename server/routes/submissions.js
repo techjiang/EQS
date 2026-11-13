@@ -1,7 +1,7 @@
 import { get, all, run, now, log } from '../lib/db.js'
 import { readJson, fail, sendJson, clientIp } from '../lib/http.js'
 import { requireUser, requirePerm, currentUser, can } from '../lib/auth.js'
-import { pickForm, validateSubmission, gradeSubmission, computeStats, submissionData, paginate, fieldVisible, passLineOf, manualScoresOf, passHintOf } from '../lib/forms.js'
+import { pickForm, validateSubmission, gradeSubmission, computeStats, submissionData, paginate, fieldVisible, passLineOf, manualScoresOf, passHintOf, captchaChallenge, safeJson } from '../lib/forms.js'
 
 const flatAnswer = v => (Array.isArray(v) ? v.map(String) : v === undefined || v === null || v === '' ? [] : [String(v)])
 const sameSet = (a, b) => a.length === b.length && [...a].sort().every((x, i) => x === [...b].sort()[i])
@@ -28,6 +28,21 @@ function collectFileIds(data) {
   }
   visit(data)
   return [...ids]
+}
+
+/**
+ * 只保留当前可见题目的作答。
+ * 显隐逻辑要求「隐藏的题不校验必填」，但它的值还留在 data 里，于是：
+ * 用户先选了 A（显示追问）再改回 B（追问隐藏），那份残留作答照样入库、照样进报表。
+ */
+export function pickVisibleAnswers(schema, raw) {
+  const src = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}
+  const out = {}
+  for (const f of schema) {
+    if (!fieldVisible(f, src)) continue
+    if (src[f.id] !== undefined) out[f.id] = src[f.id]
+  }
+  return out
 }
 
 /** 校验答题限制：微信/账号/IP/设备/次数/时间窗口 */
@@ -68,6 +83,29 @@ export function checkLimit(form, req, extra = {}) {
   return fp
 }
 
+/** 验证码是防机器人的，不是题目；哪怕误填了分值也不该进阅卷队列 */
+const NO_GRADE_TYPES = new Set(['captcha', 'divider', 'richtext', 'html', 'image'])
+
+/** 需要人工给分的题：有分值、无标准答案、不是说明类组件 */
+export function isSubjective(f) {
+  return Number(f?.score) > 0 && !(f?.answer?.length) && !NO_GRADE_TYPES.has(f?.type)
+}
+
+/**
+ * 这份答卷还剩几道主观题没给分。
+ * 与 gradeSubmission 同口径：有分值、无标准答案、当前可见、且没出现在 manual_scores 里。
+ */
+export function pendingLeft(form, row) {
+  if (!form || form.kind !== 'exam') return 0
+  const data = safeJson(row.data, {})
+  const manual = manualScoresOf(row)
+  // 直接查库拿到的是未解析的行，schema 还是 JSON 字符串
+  const schema = Array.isArray(form.schema) ? form.schema : safeJson(form.schema, [])
+  return schema.filter(f =>
+    isSubjective(f) && fieldVisible(f, data) && !Object.prototype.hasOwnProperty.call(manual, f.id)
+  ).length
+}
+
 /** 列表/详情统一带上人工分，前端不用再 parse 一次 */
 function withManual(row) {
   return { ...submissionData(row), manual_scores: manualScoresOf(row) }
@@ -79,7 +117,13 @@ export default function register(r) {
     const form = pickForm(params.id)
     if (!form) fail(404, '表单不存在或已删除')
     if (form.status !== 'published') fail(403, '表单未发布')
-    const schema = form.schema.map(f => ({ ...f, answer: [], analysis: '' }))
+    // 验证码的题面（a + b）必须在这里下发：之前只清空 answer，前端算不出题面，
+    // 唯一能对照的答案又被清空了，只能去后台表单详情里翻——验证码整体不可用
+    const schema = form.schema.map(f => {
+      const out = { ...f, answer: [], analysis: '' }
+      if (f.type === 'captcha') out.challenge = captchaChallenge(f.id)
+      return out
+    })
     sendJson(res, 200, {
       ok: true,
       data: {
@@ -101,7 +145,7 @@ export default function register(r) {
       userId: user?.id || 0,
       password: body.password
     })
-    const data = body.data && typeof body.data === 'object' ? body.data : {}
+    const data = pickVisibleAnswers(form.schema, body.data)
     const errors = validateSubmission(form.schema, data)
     if (errors.length) fail(422, errors.join('；'))
     const ts = now()
@@ -225,6 +269,10 @@ export default function register(r) {
     const url = new URL(req.url, 'http://x')
     const where = ['s.deleted_at IS NULL']
     const args = []
+    // 有主观题（带分值、无标准答案）的考试表单；这些表单的答卷才需要过阅卷队列
+    const pendingFormIds = all(`SELECT id, schema FROM forms WHERE kind = 'exam' AND deleted_at IS NULL`)
+      .filter(f => safeJson(f.schema, []).some(isSubjective))
+      .map(f => f.id)
     const formId = url.searchParams.get('formId')
     if (formId) { where.push('s.form_id = ?'); args.push(Number(formId)) }
     if (!can(user, '*')) { where.push('f.created_by = ?'); args.push(user.id) }
@@ -232,7 +280,24 @@ export default function register(r) {
     if (keyword) { where.push('s.data LIKE ?'); args.push(`%${keyword}%`) }
     if (url.searchParams.get('marked') === '1') where.push('s.marked = 1')
     // 待批阅：考试答卷里还有主观题没给分
-    if (url.searchParams.get('pending') === '1') where.push("(s.reviewed_at IS NULL OR s.reviewed_at = '') AND f.kind = 'exam'")
+    if (url.searchParams.get('pending') === '1') {
+      // 待批阅 = 这份卷子里确实还有主观题没给分，不是「没批过」就算；
+      // 只含客观题的交卷不该堆进阅卷队列——队列一有噪音，老师就不看了。
+      // 「还差几题没批」属于判分口径，和 gradeSubmission 一样放在 JS 里算：
+      // 在 SQL 里拆 JSON 时，字段 id 的下划线在 LIKE 里是通配符，判据会静默出错。
+      const finished = []
+      for (const row of all('SELECT id, form_id, data, manual_scores FROM submissions WHERE deleted_at IS NULL')) {
+        if (!pendingFormIds.includes(row.form_id)) continue
+        if (pendingLeft(pickForm(row.form_id), row) === 0) finished.push(row.id)
+      }
+      if (finished.length) {
+        where.push(`s.id NOT IN (${finished.map(() => '?').join(',')})`)
+        args.push(...finished)
+      }
+      // 一张卷子要么留着等批、要么整张不在队列里：只收「有主观题」的表单
+      where.push(`s.form_id IN (${pendingFormIds.length ? pendingFormIds.map(() => '?').join(',') : 'NULL'})`)
+      args.push(...pendingFormIds)
+    }
     if (url.searchParams.get('from')) { where.push('s.created_at >= ?'); args.push(url.searchParams.get('from')) }
     if (url.searchParams.get('to')) { where.push('s.created_at <= ?'); args.push(url.searchParams.get('to') + 'T23:59:59') }
     const base = `FROM submissions s JOIN forms f ON f.id = s.form_id WHERE ${where.join(' AND ')}`
@@ -306,7 +371,7 @@ export default function register(r) {
     const body = await readJson(req)
     const data = JSON.parse(row.data)
     // 只认这份卷子里真有、且确实没有标准答案的题，防止给选择题凭空加分
-    const subjective = new Map(form.schema.filter(f => f.score > 0 && !f.answer?.length && fieldVisible(f, data)).map(f => [f.id, f]))
+    const subjective = new Map(form.schema.filter(f => isSubjective(f) && fieldVisible(f, data)).map(f => [f.id, f]))
     const scores = {}
     for (const [fid, raw] of Object.entries(body.scores || {})) {
       const f = subjective.get(fid)

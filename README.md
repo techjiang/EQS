@@ -120,13 +120,16 @@ sudo nginx -s reload
 EQS 的所有状态都在 `data/` 目录里：`eqs.db`（数据库）和 `files/`（上传文件）。
 
 **方式一：后台导出**
-系统设置 → 系统与备份 → 导出备份，得到一个 ZIP 包。
+系统设置 → 系统与备份 → 导出备份，得到一个 ZIP 包；导入同一个 ZIP 即恢复，重启服务后生效。
 
 **方式二：直接打包目录**
 
 ```bash
 bash scripts/backup.sh          # 生成 backups/eqs-backup-<时间>.tar.gz
 ```
+
+> 两种方式都会先用 SQLite 的一致性快照（`wal_checkpoint` / `VACUUM INTO`）把 WAL 里的数据落盘再打包。
+> 服务运行中直接 `tar data/` 可能拿到一个没有表的空库——那是 WAL 模式的坑，不是备份成功。
 
 **迁移到新机器**
 
@@ -201,7 +204,7 @@ bash scripts/start.sh                        # 启动即完成迁移
 
 ```bash
 node --watch server/index.js   # 热重启
-node tests/smoke.test.js       # 冒烟测试（57 项）
+node tests/smoke.test.js       # 冒烟测试（147 项）
 ```
 
 ## 项目结构

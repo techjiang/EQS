@@ -101,23 +101,28 @@ export function renderControl(field, model, opts = {}) {
       ])
     case 'rate': {
       const max = Number(field.props?.max) || 5
+      // 没作答时星星要显示「未评分」，不能默认点亮 cur>i 的第一颗：
+      // 默认值模型里是 ''，静默点亮星星会让用户以为已经答完了，考试里等于白送一分
       const cur = val === '' || val === null || val === undefined ? 0 : Number(val)
-      return h('div', { class: 'flex', style: 'gap:4px;font-size:24px' }, Array.from({ length: max }, (_, i) =>
+      return h('div', { class: 'flex', style: 'gap:4px;font-size:26px;line-height:1.2' }, Array.from({ length: max }, (_, i) =>
         h('span', {
-          key: i, style: `cursor:pointer;color:${cur > i ? '#f59e0b' : 'var(--line)'};transition:.1s`,
+          key: i, role: 'button', 'aria-label': `${i + 1} 分`,
+          // 未选中的星星用浅灰描边而不是描边字符：☆ 在部分字体里会淡到看不见，整题像空白
+          style: `cursor:${dis ? 'default' : 'pointer'};color:${cur > i ? '#f59e0b' : 'var(--text-3)'};opacity:${cur > i ? 1 : .45};transition:.1s`,
           onClick: () => !dis && set(i + 1)
         }, '★')))
     }
     case 'nps': {
       const max = Number(field.props?.max) || 10
+      const [from, to] = npsRange(field)
       return h('div', {}, [
-        h('div', { class: 'flex wrap', style: 'gap:6px' }, Array.from({ length: max + 1 }, (_, i) =>
+        h('div', { class: 'flex wrap', style: 'gap:6px' }, Array.from({ length: to - from + 1 }, (_, i) =>
           h('button', {
             key: i, type: 'button',
-            class: ['btn', 'sm', val !== '' && val !== null && val !== undefined && Number(val) === i ? 'primary' : ''],
+            class: ['btn', 'sm', val !== '' && val !== null && val !== undefined && Number(val) === from + i ? 'primary' : ''],
             style: 'min-width:34px',
-            onClick: () => !dis && set(i)
-          }, String(i)))),
+            onClick: () => !dis && set(from + i)
+          }, String(from + i)))),
         h('div', { class: 'flex between small muted', style: 'margin-top:4px' }, [h('span', {}, '完全不会'), h('span', {}, '非常愿意')])
       ])
     }
@@ -270,7 +275,8 @@ export function renderControl(field, model, opts = {}) {
       ])
     }
     case 'captcha': {
-      const { a, b } = captchaChallenge(field.id)
+      // 优先用服务端下发的题面（公开填写页），预览态没有就本地按同一算式算
+      const { a, b } = field.challenge || captchaChallenge(field.id)
       return h('div', {}, [
         h('div', { class: 'flex', style: 'gap:8px' }, [
           h('input', {
@@ -310,6 +316,13 @@ function toastOnce() {
 export function captchaChallenge(id) {
   const sum = String(id || '').split('').reduce((acc, c) => acc + c.charCodeAt(0), 0) || 1
   return { a: (sum % 7) + 2, b: (sum % 5) + 2 }
+}
+
+/** NPS 区间：默认 0-10，props.min 可下探到负数（比如 -2 到 2 的意愿度） */
+export function npsRange(field) {
+  const from = field?.props?.min === undefined ? 0 : Number(field.props.min)
+  const to = Number(field.props?.max ?? 10)
+  return [from, Math.max(from, Number.isFinite(to) ? to : 10)]
 }
 
 function inputHint(type) {

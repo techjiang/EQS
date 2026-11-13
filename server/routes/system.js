@@ -1,10 +1,10 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import crypto from 'node:crypto'
-import { get, all, run, now, setting, setSetting, DATA_DIR, log } from '../lib/db.js'
+import { get, all, run, now, setting, setSetting, DATA_DIR, log, db, switchDb } from '../lib/db.js'
 import { readBody, sendJson, fail, readJson } from '../lib/http.js'
 import { requireUser, can, signSession } from '../lib/auth.js'
-import { exportBackup, parseMultipart } from './files.js'
+import { exportBackup, parseMultipart, extractZip } from './files.js'
 import { smtpSend, wxAccessToken } from '../lib/notify.js'
 import { generateForm } from '../lib/ai.js'
 
@@ -28,7 +28,11 @@ export default function register(r) {
     res.end(zip)
   })
 
-  /** 迁移导入：上传备份 zip，解开覆盖 data 目录（需重启） */
+  /**
+   * 迁移导入：上传备份 zip，直接顶替当前数据库。
+   * 不能只写一个待生效的文件等重启：面板已经显示「导入成功」，用户看到的却是空站。
+   * 「导入成功」必须当场是真的，所以这里直接切连接（switchDb）。
+   */
   r.post('/api/backup/import', async (req, res) => {
     const me = requireUser(req)
     if (!can(me, '*')) fail(403, '权限不足')
@@ -36,20 +40,29 @@ export default function register(r) {
     const buf = await readBody(req)
     if (!ct.includes('multipart/form-data')) fail(400, '请上传 zip 备份文件')
     const boundary = /boundary=(?:"([^"]+)"|([^;]+))/.exec(ct)
+    if (!boundary) fail(400, '缺少 boundary')
     const parts = parseMultipart(buf, boundary[1] || boundary[2])
     const file = parts.find(p => p.filename)
     if (!file) fail(400, '未找到备份文件')
     const restoreDir = path.join(DATA_DIR, 'restore-' + Date.now())
     fs.mkdirSync(restoreDir, { recursive: true })
-    extractZip(file.data, restoreDir)
-    const root = findEqsData(restoreDir)
-    if (!root) fail(400, '备份文件结构不正确')
-    fs.copyFileSync(path.join(root, 'eqs.db'), path.join(DATA_DIR, 'eqs.db.next'))
-    if (fs.existsSync(path.join(root, 'files'))) {
-      fs.cpSync(path.join(root, 'files'), path.join(DATA_DIR, 'files'), { recursive: true })
+    try {
+      extractZip(file.data, restoreDir)
+      const root = findEqsData(restoreDir)
+      if (!root) fail(400, '备份文件结构不正确')
+      const incoming = path.join(restoreDir, 'incoming.db')
+      fs.writeFileSync(incoming, fs.readFileSync(path.join(root, 'eqs.db')))
+      // 切换连接：switchDb 内部 checkpoint → close → 覆盖 eqs.db → 重新打开（WAL 残留在里面清掉）
+      switchDb(incoming)
+      if (fs.existsSync(path.join(root, 'files'))) {
+        fs.mkdirSync(path.join(DATA_DIR, 'files'), { recursive: true })
+        fs.cpSync(path.join(root, 'files'), path.join(DATA_DIR, 'files'), { recursive: true })
+      }
+      log(me, '导入备份', '已生效')
+      sendJson(res, 200, { ok: true, restartRequired: false, message: '备份已导入并生效' })
+    } finally {
+      fs.rmSync(restoreDir, { recursive: true, force: true })
     }
-    log(me, '导入备份', restoreDir)
-    sendJson(res, 200, { ok: true, message: '备份已导入，重启服务后生效（数据库文件：eqs.db.next）' })
   })
 
   r.get('/api/system/info', async (req, res) => {
@@ -220,28 +233,6 @@ async function upsertOAuthUser({ username, email, nickname, avatar }) {
 }
 
 const hashPasswordless = () => 'oauth$' + crypto.randomBytes(16).toString('hex')
-
-/** 极简 zip 解包（仅 store 模式，配合自带备份包） */
-export function extractZip(buf, destDir) {
-  let off = 0
-  const base = path.resolve(destDir)
-  while (off < buf.length - 4) {
-    if (buf.readUInt32LE(off) !== 0x04034b50) break
-    const method = buf.readUInt16LE(off + 8)
-    const size = buf.readUInt32LE(off + 18)
-    const nameLen = buf.readUInt16LE(off + 26)
-    const extraLen = buf.readUInt16LE(off + 28)
-    const name = buf.slice(off + 30, off + 30 + nameLen).toString('utf8')
-    const start = off + 30 + nameLen + extraLen
-    const data = buf.slice(start, start + size)
-    const target = path.resolve(base, name)
-    if (target.startsWith(base) && method === 0) {
-      fs.mkdirSync(path.dirname(target), { recursive: true })
-      fs.writeFileSync(target, data)
-    }
-    off = start + size
-  }
-}
 
 function findEqsData(dir) {
   const stack = [dir]

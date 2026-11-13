@@ -5,8 +5,8 @@ import path from 'node:path'
 const DATA_DIR = process.env.EQS_DATA_DIR || path.join(process.cwd(), 'data')
 fs.mkdirSync(path.join(DATA_DIR, 'files'), { recursive: true })
 
-const dbFile = process.env.EQS_DB_FILE || path.join(DATA_DIR, 'eqs.db')
-export const db = new DatabaseSync(dbFile)
+export const dbFile = process.env.EQS_DB_FILE || path.join(DATA_DIR, 'eqs.db')
+export let db = new DatabaseSync(dbFile)
 
 db.exec(`
 PRAGMA journal_mode = WAL;
@@ -182,6 +182,25 @@ ensureColumns('submissions', {
   reviewed_by: 'INTEGER NOT NULL DEFAULT 0',
   review_note: "TEXT DEFAULT ''"
 })
+
+/**
+ * 换库：checkpoint → 关闭 → 用新文件顶替 → 重新打开。
+ * 运行中的进程不能直接覆盖正在读的库文件（WAL 还开着，覆盖会得到半新半旧的库）。
+ */
+export function switchDb(nextFile) {
+  try { db.exec('PRAGMA wal_checkpoint(TRUNCATE)') } catch {}
+  db.close()
+  for (const ext of ['-wal', '-shm']) fs.rmSync(dbFile + ext, { force: true })
+  fs.copyFileSync(nextFile, dbFile)
+  db = new DatabaseSync(dbFile)
+  db.exec(`
+PRAGMA journal_mode = WAL;
+PRAGMA synchronous = NORMAL;
+PRAGMA foreign_keys = ON;
+PRAGMA busy_timeout = 5000;
+`)
+  return db
+}
 
 export const get = (sql, ...params) => db.prepare(sql).get(...params)
 export const all = (sql, ...params) => db.prepare(sql).all(...params)

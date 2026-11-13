@@ -414,7 +414,7 @@ try {
   assert(bs[3].type === 'textarea', '多行题型识别正确', bs[3].type)
 
 
-  console.log('\n[19] 主观题人工批阅')
+  console.log('\n[18] 主观题人工批阅')
   // 建一份「客观题 20 分 + 主观题 20 分」的卷子
   r = await req('POST', '/api/forms', {
     title: '批阅测试卷', kind: 'exam',
@@ -476,7 +476,7 @@ try {
   r = await req('GET', `/api/submissions?pending=1&pageSize=100`)
   assert(Array.isArray(r.json.data), '待批阅筛选可查询')
 
-  console.log('\n[20] 多题库混合组卷')
+  console.log('\n[19] 多题库混合组卷')
   r = await req('POST', '/api/banks', { name: '组卷库 A' })
   const bankA = r.json.id
   r = await req('POST', '/api/banks', { name: '组卷库 B' })
@@ -505,7 +505,121 @@ try {
   r = await req('POST', '/api/banks/paper', { bankIds: [999999], count: 3 })
   assert(r.status === 400, '非法题库 id 被拒绝', 'status=' + r.status)
 
-  console.log('\n[18] 前端静态资源')
+  console.log('\n[20] 备份包必须能恢复出完整数据库')
+  {
+    // WAL 模式下新数据先落 eqs.db-wal，eqs.db 主文件可能还是空的。
+    // 之前导出不做 checkpoint，备份包里的 eqs.db 是个没有表的空壳——「备份成功，恢复全空」。
+    const bak = await fetch(BASE + '/api/backup/export', { headers: { Cookie: cookie } })
+    const buf = Buffer.from(await bak.arrayBuffer())
+    const entries = []
+    let off = 0
+    while (off < buf.length - 4) {
+      if (buf.readUInt32LE(off) !== 0x04034b50) break
+      const size = buf.readUInt32LE(off + 18)
+      const nl = buf.readUInt16LE(off + 26)
+      const el = buf.readUInt16LE(off + 28)
+      entries.push({ name: buf.slice(off + 30, off + 30 + nl).toString('utf8'), data: buf.slice(off + 30 + nl + el, off + 30 + nl + el + size) })
+      off = off + 30 + nl + el + size
+    }
+    const dbEntry = entries.find(e => e.name === 'eqs-data/eqs.db')
+    assert(!!dbEntry && dbEntry.data.length > 8192, '备份包里有非空的 eqs.db', `size=${dbEntry?.data.length}`)
+    const restored = path.join(DATA_DIR, 'restored-check.db')
+    fs.writeFileSync(restored, dbEntry.data)
+    const { DatabaseSync } = await import('node:sqlite')
+    const rdb = new DatabaseSync(restored)
+    const userCount = rdb.prepare('SELECT COUNT(*) c FROM users').get().c
+    const formCount = rdb.prepare('SELECT COUNT(*) c FROM forms').get().c
+    rdb.close()
+    assert(userCount >= 1, '从备份的 eqs.db 能读出用户表', String(userCount))
+    assert(formCount >= 1, '从备份的 eqs.db 能读出表单表', String(formCount))
+  }
+
+  console.log('\n[21] 备份导入当场生效')
+  {
+    // 之前导入只写一个 eqs.db.next 等重启，但面板已经显示「导入成功」，
+    // 用户看到的是一个空站。现在要求导入后立刻能读到备份里的数据。
+    let r = await req('POST', '/api/forms', { title: '只有备份里才有的表单', kind: 'survey' })
+    const markId = r.json.id
+    const zip2 = Buffer.from(await (await fetch(BASE + '/api/backup/export', { headers: { Cookie: cookie } })).arrayBuffer())
+    await req('DELETE', `/api/forms/${markId}`)
+    r = await req('GET', `/api/forms/${markId}`)
+    assert(!!r.json.data?.deleted_at, '删除后表单进入回收站')
+
+    const fd = new FormData()
+    fd.append('file', new Blob([zip2]), 'backup.zip')
+    const imp = await fetch(BASE + '/api/backup/import', { method: 'POST', headers: { Cookie: cookie }, body: fd })
+    const impJson = await imp.json()
+    assert(imp.ok && impJson.ok, '备份导入接口返回成功', JSON.stringify(impJson))
+    assert(impJson.restartRequired === false, '导入后无需重启即生效', String(impJson.restartRequired))
+    r = await req('GET', `/api/forms/${markId}`)
+    assert(r.status === 200 && !r.json.data?.deleted_at, '导入后立刻能读到备份里的表单', `status=${r.status}`)
+    assert(zip2.length > 8000, '备份包不是空壳', String(zip2.length))
+  }
+
+  console.log('\n[22] 隐藏题残留作答与验证码题面')
+  {
+    const schema = [
+      { id: 'logic_base', type: 'radio', label: '是否有过敏史', required: true, options: [{ label: '是', value: 'y' }, { label: '否', value: 'n' }] },
+      { id: 'logic_follow', type: 'text', label: '过敏原', required: true, logic: [{ fieldId: 'logic_base', op: 'eq', value: 'y' }] },
+      { id: 'captcha_x', type: 'captcha', label: '安全校验', required: true },
+      { id: 'nps_x', type: 'nps', label: '推荐意愿', required: true, score: 5, answer: ['0'], props: { min: -2, max: 2 } }
+    ]
+    let r = await req('POST', '/api/forms', { title: '逻辑探针', kind: 'exam', schema, settings: { passPercent: 60 } })
+    const fid = r.json.id
+    await req('PUT', `/api/forms/${fid}`, { status: 'published' })
+    r = await req('GET', `/api/public/forms/${fid}`)
+    const cap = r.json.data.schema.find(f => f.type === 'captcha')
+    assert(!!cap.challenge && typeof cap.challenge.a === 'number', '公开页下发了验证码题面', JSON.stringify(cap.challenge))
+    assert(!cap.answer?.length, '验证码答案仍未下发')
+    const nps = r.json.data.schema.find(f => f.type === 'nps')
+    assert(nps.props.min === -2 && nps.props.max === 2, 'NPS 负数下限被保留', JSON.stringify(nps.props))
+
+    // 选「否」时追问隐藏，但请求里仍带着追问的值：必须被丢弃，不能入库
+    r = await req('POST', `/api/public/forms/${fid}/submit`, {
+      data: { logic_base: 'n', logic_follow: '残留的过敏原', captcha_x: String(cap.challenge.a + cap.challenge.b), nps_x: 0 }
+    })
+    assert(r.status === 201, '隐藏题的必填不再拦截', `status=${r.status} ${r.json.message || ''}`)
+    const sid = r.json.id
+    r = await req('GET', `/api/submissions/${sid}`)
+    assert(r.json.data.data.logic_follow === undefined, '隐藏题的残留作答被丢弃', JSON.stringify(r.json.data.data))
+    assert(String(r.json.data.data.nps_x) === '0', 'NPS 选 0 分被保存', String(r.json.data.data.nps_x))
+
+    // 隐藏题不填也能提交；显示出来就必须填
+    r = await req('POST', `/api/public/forms/${fid}/submit`, {
+      data: { logic_base: 'y', captcha_x: String(cap.challenge.a + cap.challenge.b), nps_x: 0 }
+    })
+    assert(r.status === 422 && /过敏原/.test(r.json.message), '显示出来的必填题仍然拦截', r.json.message)
+
+    // 待批阅筛选：纯客观题的交卷不该进阅卷队列
+    r = await req('GET', '/api/submissions?pending=1&pageSize=200')
+    const pendingIds = (r.json.data || []).map(x => x.id)
+    const own = await req('GET', `/api/forms/${fid}`)
+    const subjIds = (own.json.data.schema || []).filter(f => Number(f.score) > 0 && !(f.answer || []).length).map(f => f.id)
+    // 队列里有别的卷子时，确认这份纯客观卷不在其中
+    assert(sid > 0 && subjIds.length === 0, '这份卷子确实没有主观题', JSON.stringify(subjIds))
+    const queued = await req('GET', `/api/submissions?formId=${fid}&pending=1&pageSize=200`)
+    assert(!(queued.json.data || []).some(x => x.id === sid), '没有主观题的交卷不进待批阅队列',
+      JSON.stringify((queued.json.data || []).map(x => x.id)))
+
+    // 只批了一部分主观题：剩下那道还应该留在队列里
+    let rb = await req('POST', '/api/forms', { title: '部分批阅探针', kind: 'exam', schema: [
+      { id: 'subj_a', type: 'textarea', label: '简答一', score: 10 },
+      { id: 'subj_b', type: 'textarea', label: '简答二', score: 10 }
+    ], settings: { passPercent: 60 } })
+    const bid = rb.json.id
+    await req('PUT', `/api/forms/${bid}`, { status: 'published' })
+    rb = await req('POST', '/api/forms', { title: '占位' }) // 触发一次写，确保 WAL 里也有新数据
+    rb = await req('POST', `/api/public/forms/${bid}/submit`, { data: { subj_a: '甲', subj_b: '乙' } })
+    const partId = rb.json.id
+    await req('PUT', `/api/submissions/${partId}/review`, { scores: { subj_a: 8 } })
+    r = await req('GET', '/api/submissions?pending=1&pageSize=200')
+    assert((r.json.data || []).some(x => x.id === partId), '只批了一部分的主观题仍留在待批阅队列')
+    await req('PUT', `/api/submissions/${partId}/review`, { scores: { subj_a: 8, subj_b: 9 } })
+    r = await req('GET', '/api/submissions?pending=1&pageSize=200')
+    assert(!(r.json.data || []).some(x => x.id === partId), '全部批完后移出待批阅队列')
+  }
+
+  console.log('\n[23] 前端静态资源')
   for (const p of ['/', '/js/main.js', '/css/app.css', '/assets/eqs-mark.svg', '/vendor/echarts.min.js']) {
     const res = await fetch(BASE + p)
     assert(res.ok, `静态资源可访问：${p}`)
