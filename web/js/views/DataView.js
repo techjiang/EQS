@@ -376,7 +376,8 @@ export default {
                   : '-'),
                 h('td', { class: 'nowrap stick-ops' }, h('div', { class: 'flex', style: 'gap:4px' }, [
                   h('button', { class: 'btn ghost sm', onClick: () => openDetail(r) }, '查看'),
-                  h('button', { class: 'btn ghost sm', onClick: () => openReview(r) }, '批阅'),
+                  // 只有考试答卷需要批阅：问卷也摆一个「批阅」，点下去才弹错误，属于让人白点
+                  r.form_kind === 'exam' ? h('button', { class: 'btn ghost sm', onClick: () => openReview(r) }, '批阅') : null,
                   h('button', { class: 'btn ghost sm', onClick: () => openEdit(r) }, '编辑'),
                   h('button', { class: 'btn ghost sm', onClick: () => toggleMark(r) }, r.marked ? '取消标记' : '标记'),
                   h('button', { class: 'btn ghost sm danger', onClick: () => remove(r) }, '删除')

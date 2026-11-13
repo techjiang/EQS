@@ -14,8 +14,50 @@ function mask(obj) {
   const out = Array.isArray(obj) ? [] : {}
   for (const [k, v] of Object.entries(obj)) {
     if (v && typeof v === 'object') out[k] = mask(v)
-    else if (SECRET_FIELDS.includes(k) && typeof v === 'string' && v.length > 4) out[k] = v.slice(0, 2) + '****' + v.slice(-2)
+    else if (isSecretKey(k) && typeof v === 'string' && v.length > 4) out[k] = v.slice(0, 2) + '****' + v.slice(-2)
     else out[k] = v
+  }
+  return out
+}
+
+/**
+ * 密钥字段名判断：不分大小写，并覆盖「名字里带这些东西」的组合词。
+ * 之前只做精确匹配，clientSecret / sdkAppId 这类名字漏网，密钥被原样下发到浏览器。
+ */
+const SECRET_SUFFIX = ['secret', 'secretkey', 'secretid', 'password', 'pass', 'apikey', 'accesskey', 'token']
+function isSecretKey(key) {
+  const k = String(key).toLowerCase()
+  if (SECRET_FIELDS.some(f => f.toLowerCase() === k)) return true
+  return SECRET_SUFFIX.some(s2 => k.endsWith(s2))
+}
+
+/** 单个密钥值脱敏：短密钥整体遮掉，避免「前 2 后 2」把 6 位的 key 泄露一半 */
+function maskSecret(v) {
+  const s2 = String(v ?? '')
+  if (!s2) return ''
+  return s2.length > 8 ? s2.slice(0, 2) + '****' + s2.slice(-2) : '****'
+}
+
+/** 值里带 **** 就是脱敏残留，回写时必须换成库里的原值，否则密钥被这一串星号覆盖掉 */
+const MASKED = /\*\*\*\*/
+
+/**
+ * 把前端提交的配置合并到现有配置上。
+ * 值为脱敏串（含 ****）时保留库里的原值；对象递归合并，数组直接替换。
+ */
+function mergeMasked(prev, next) {
+  if (next === null || next === undefined) return prev
+  if (typeof next === 'string') return MASKED.test(next) ? prev : next
+  if (typeof next !== 'object') return next
+  if (Array.isArray(next)) return next
+  const base = prev && typeof prev === 'object' && !Array.isArray(prev) ? prev : {}
+  const out = { ...base }
+  for (const [k, v] of Object.entries(next)) {
+    if (isSecretKey(k) && typeof v === 'string' && MASKED.test(v)) {
+      // 名字就是密钥的字段，脱敏串一律视为「没改」
+      if (typeof base[k] === 'string') continue
+    }
+    out[k] = k in base ? mergeMasked(base[k], v) : v
   }
   return out
 }
@@ -181,12 +223,10 @@ export default function register(r) {
     if (!CONFIG_KEYS.includes(params.key)) fail(400, '不支持的配置项')
     const body = await readJson(req)
     const prev = setting(params.key, {})
-    // 未修改的脱敏值保留原值
-    const merged = { ...prev }
-    for (const [k, v] of Object.entries(body)) {
-      if (typeof v === 'string' && v.includes('****') && typeof prev[k] === 'string') continue
-      merged[k] = v
-    }
+    // 合并而不是整块替换：clientId / apiKey 这些是嵌套两层的对象，
+    // 只比顶层 key 时，前端提交的 {'google': {clientSecret: 'GO****ET'}} 会整块顶上，
+    // 脱敏串被当成真密钥写回库里——保存一次，密钥就废了。
+    const merged = mergeMasked(prev, body)
     setSetting(params.key, merged)
     log(me, '修改设置', params.key)
     sendJson(res, 200, { ok: true })
@@ -225,8 +265,14 @@ export default function register(r) {
 
   /* ---------------- WebHook / API Key ---------------- */
   r.get('/api/webhooks', async (req, res) => {
-    requirePerm(req, 'form:read')
-    sendJson(res, 200, { ok: true, data: all('SELECT * FROM webhooks ORDER BY id').map(x => ({ ...x, events: safeJson(x.events, []) })) })
+    const me = requirePerm(req, 'form:read')
+    // 订阅地址和签名密钥是管理员的东西：普通用户带 form:read 也能拿到 secret，
+    // 就等于拿到伪造回调签名的能力。非管理员只被告知「有配置」，不给内容。
+    if (!can(me, '*')) return sendJson(res, 200, { ok: true, data: [], masked: true })
+    sendJson(res, 200, {
+      ok: true,
+      data: all('SELECT * FROM webhooks ORDER BY id').map(x => ({ ...x, secret: maskSecret(x.secret), events: safeJson(x.events, []) }))
+    })
   })
 
   r.post('/api/webhooks', async (req, res) => {
@@ -245,9 +291,11 @@ export default function register(r) {
     const h = get('SELECT * FROM webhooks WHERE id = ?', Number(params.id))
     if (!h) fail(404, 'WebHook 不存在')
     const body = await readJson(req)
+    // 前端拿到的是脱敏后的 secret，原样提交回来不能把真密钥覆盖成一串星号
+    const secret = typeof body.secret === 'string' && MASKED.test(body.secret) ? h.secret : (body.secret ?? h.secret)
     run('UPDATE webhooks SET name = ?, url = ?, events = ?, secret = ?, enabled = ? WHERE id = ?',
       body.name ?? h.name, body.url ?? h.url, JSON.stringify(body.events ?? safeJson(h.events, [])),
-      body.secret ?? h.secret, body.enabled === undefined ? h.enabled : (body.enabled ? 1 : 0), h.id)
+      secret, body.enabled === undefined ? h.enabled : (body.enabled ? 1 : 0), h.id)
     sendJson(res, 200, { ok: true })
   })
 

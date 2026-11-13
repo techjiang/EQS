@@ -358,7 +358,9 @@ export default function register(r) {
     const total = get(`SELECT COUNT(*) c ${base}`, ...args).c
     const p = paginate(req, total)
     const order = url.searchParams.get('order') === 'asc' ? 'ASC' : 'DESC'
-    const rows = all(`SELECT s.*, f.title AS form_title ${base} ORDER BY s.id ${order} LIMIT ? OFFSET ?`, ...args, p.pageSize, p.offset)
+    // 带上表单类型：前端要按它决定「批阅」按钮出不出。
+    // 之前列表里没有这个字段，问卷答卷也摆着「批阅」，点了才弹「只有考试答卷需要批阅」。
+    const rows = all(`SELECT s.*, f.title AS form_title, f.kind AS form_kind ${base} ORDER BY s.id ${order} LIMIT ? OFFSET ?`, ...args, p.pageSize, p.offset)
     sendJson(res, 200, { ok: true, data: rows.map(withManual), total, page: p.page, pageSize: p.pageSize, totalPages: p.totalPages })
   })
 

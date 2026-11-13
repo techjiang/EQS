@@ -1,4 +1,4 @@
-import { h, ref, onMounted, onBeforeUnmount, computed } from '/vendor/vue.esm.js'
+import { h, ref, onMounted, onBeforeUnmount, computed, nextTick } from '/vendor/vue.esm.js'
 import { api } from '../api.js'
 import { route } from '../router.js'
 import { ok, err, fmtDate } from '../ui.js'
@@ -86,11 +86,14 @@ export default {
         window.scrollTo({ top: 0, behavior: 'smooth' })
       } catch (e) {
         const msg = String(e.message || '提交失败')
-        fieldErrors.value = msg.split(/[；;]/).map(x => x.trim()).filter(Boolean)
+        const list = msg.split(/[；;]/).map(x => x.trim()).filter(Boolean)
         err(msg)
-        // 滚动并高亮到第一个出错的题目
-        const first = fieldErrors.value[0]
-        const target = first && [...document.querySelectorAll('.q-block.has-err')][0]
+        fieldErrors.value = list
+        // 必须等一帧再找：错误文案刚塞进响应式状态，DOM 还没渲染出 .has-err，
+        // 当场 querySelectorAll 拿到空数组，滚动根本不发生；
+        // 而错误块插在上方会让浏览器做滚动锚定，用户反而被带到页面最底下。
+        await nextTick()
+        const target = document.querySelector('.q-block.has-err')
         if (target) target.scrollIntoView({ behavior: 'smooth', block: 'center' })
       } finally { submitting.value = false }
     }

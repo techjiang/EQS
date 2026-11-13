@@ -6,6 +6,18 @@ import { parseTextToFields } from './forms.js'
 
 const parseQ = q => ({ ...q, options: safeJson(q.options, []), answer: safeJson(q.answer, []) })
 
+/**
+ * 题库是「我的」资源：列表、组卷、删除都按 owner 过滤，
+ * 但读题、刷题、看进度三处漏了同一道校验——任何登录用户换一个 id 就能读到别人题库的
+ * 全部题目和标准答案（连做题都不需要），私有题库等于公开。
+ */
+function readableBank(user, id) {
+  const bank = get('SELECT * FROM banks WHERE id = ? AND deleted_at IS NULL', Number(id))
+  if (!bank) return null
+  if (!can(user, '*') && bank.owner_id !== user.id) return null
+  return bank
+}
+
 export default function register(r) {
   r.get('/api/banks', async (req, res) => {
     const user = requireUser(req)
@@ -109,7 +121,7 @@ export default function register(r) {
 
   r.get('/api/banks/:id/questions', async (req, res, { params }) => {
     const user = requireUser(req)
-    const bank = get('SELECT * FROM banks WHERE id = ? AND deleted_at IS NULL', Number(params.id))
+    const bank = readableBank(user, params.id)
     if (!bank) fail(404, '题库不存在')
     const url = new URL(req.url, 'http://x')
     const keyword = url.searchParams.get('keyword')
@@ -307,7 +319,7 @@ function cleanIds(raw, pool) {
   /** 刷题：拉取题目（不返回答案） */
   r.get('/api/banks/:id/practice', async (req, res, { params }) => {
     const user = requireUser(req)
-    const bank = get('SELECT * FROM banks WHERE id = ? AND deleted_at IS NULL', Number(params.id))
+    const bank = readableBank(user, params.id)
     if (!bank) fail(404, '题库不存在')
     const url = new URL(req.url, 'http://x')
     const mode = url.searchParams.get('mode') || 'sequence'
@@ -344,7 +356,7 @@ function cleanIds(raw, pool) {
   /** 刷题判题 + 记录进度 */
   r.post('/api/banks/:id/practice/answer', async (req, res, { params }) => {
     const user = requireUser(req)
-    const bank = get('SELECT * FROM banks WHERE id = ? AND deleted_at IS NULL', Number(params.id))
+    const bank = readableBank(user, params.id)
     if (!bank) fail(404, '题库不存在')
     const body = await readJson(req)
     const q = get('SELECT * FROM questions WHERE id = ? AND bank_id = ? AND deleted_at IS NULL', Number(body.questionId), bank.id)
@@ -409,6 +421,7 @@ function cleanIds(raw, pool) {
 
   r.get('/api/banks/:id/progress', async (req, res, { params }) => {
     const user = requireUser(req)
+    if (!readableBank(user, params.id)) fail(404, '题库不存在')
     const record = get('SELECT * FROM practice_records WHERE bank_id = ? AND user_id = ?', Number(params.id), user.id)
     if (!record) return sendJson(res, 200, { ok: true, data: null })
     const notes = safeJson(record.notes, {})

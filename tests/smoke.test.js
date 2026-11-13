@@ -6,6 +6,7 @@ import { spawn } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
+import { DatabaseSync } from 'node:sqlite'
 
 const PORT = 8199
 const BASE = `http://127.0.0.1:${PORT}`
@@ -936,6 +937,7 @@ try {
     await req('DELETE', `/api/forms/${fId}`)
     r = await req('GET', '/api/submissions?pageSize=200')
     assert(!r.json.data.some(x => x.form_id === fId), '表单进回收站后，其答卷不再出现在答卷列表')
+    assert(r.json.data.every(x => 'form_kind' in x), '答卷列表带上表单类型，前端才知道该不该出「批阅」')
     r = await req('GET', '/api/recycle/submissions')
     assert(r.json.data.byForm.some(x => x.id === subId), '表单在回收站时，其答卷归在「待恢复表单」下')
 
@@ -1007,7 +1009,112 @@ try {
     assert(!r.json.data.some(x => x.id === bId), '彻底删除后回收中心不再有它')
   }
 
-  console.log('\n[34] 前端静态资源')
+  console.log('\n[34] 文本导入：圈号选项、括号序号选项、判断题标签')
+  {
+    r = await req('POST', '/api/forms', { title: '导入选项写法探针', schema: [] })
+    const fId = r.json.id
+    // ① ② 是文档里写着的选项写法，但 NUM_PREFIX 也认它，导致整题被拆成两道填空
+    r = await req('POST', `/api/forms/${fId}/import-text`, {
+      text: ['1. 下面哪些属于水果 [多选]', '① 苹果', '② 香蕉', '答案：①'].join('\n')
+    })
+    let schema = r.json.schema || []
+    assert(schema.length === 1, '「① 苹果」被当成选项而不是新题', JSON.stringify(schema.map(f => f.label)))
+    assert(schema[0]?.type === 'checkbox' && schema[0].options.length === 2, '圈号选项全部落库', JSON.stringify(schema[0]?.options))
+    assert(JSON.stringify(schema[0]?.answer) === JSON.stringify(['苹果']), '「答案：①」落到第一个选项值上', JSON.stringify(schema[0]?.answer))
+
+    // 全角括号序号选项：和「(1) 新题」字面一样，只能靠「这题明说了要选项」判断
+    r = await req('POST', `/api/forms/${fId}/import-text`, {
+      text: ['2. 你的职业 [单选]', '（1）工程师', '（2）设计师', '答案：（2）'].join('\n')
+    })
+    schema = r.json.schema || []
+    const job = schema.find(f => String(f.label).includes('职业'))
+    assert(job && job.options.length === 2, '「（1）工程师」被当成选项', JSON.stringify(job?.options))
+    assert(JSON.stringify(job?.answer) === JSON.stringify(['设计师']), '「答案：（2）」落到第二个选项', JSON.stringify(job?.answer))
+
+    // 题干用 [判断] 标签声明题型，答案「正确」不能被当填空题提示丢掉
+    r = await req('POST', `/api/forms/${fId}/import-text`, {
+      text: ['3. 缓存能减少数据库压力 [判断]', '答案：正确'].join('\n')
+    })
+    schema = r.json.schema || []
+    const judge = schema.find(f => String(f.label).includes('缓存'))
+    assert(JSON.stringify(judge?.answer) === JSON.stringify(['正确']), '判断题「答案：正确」在有 [判断] 标签时也落库', JSON.stringify(judge?.answer))
+    await req('DELETE', `/api/forms/${fId}`)
+    await req('DELETE', `/api/forms/${fId}/purge`)
+  }
+
+  console.log('\n[35] 系统设置：脱敏后的密钥不能被保存动作抹掉')
+  {
+    // 直接读库确认落盘的是真密钥，而不是被回写的 ****
+    const stored = (key) => {
+      const db = new DatabaseSync(path.join(DATA_DIR, 'eqs.db'))
+      try {
+        const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(key)
+        return row ? JSON.parse(row.value) : null
+      } finally { db.close() }
+    }
+
+    r = await req('PUT', '/api/settings/oauth', { google: { clientId: 'gid.apps.googleusercontent.com', clientSecret: 'REAL_GOOGLE_SECRET' }, wechatMp: { appId: 'wx123', appSecret: 'REAL_WX_SECRET' } })
+    assert(r.status === 200, '保存第三方登录配置')
+    r = await req('GET', '/api/settings')
+    const shown = r.json.data.oauth
+    assert(!JSON.stringify(shown).includes('REAL_'), '嵌套层的密钥下发时也脱敏', JSON.stringify(shown))
+    // 前端点「保存」提交的就是这份脱敏对象，只改了 clientId
+    r = await req('PUT', '/api/settings/oauth', { ...shown, google: { ...shown.google, clientId: 'gid2.apps.googleusercontent.com' } })
+    assert(r.status === 200, '保存带脱敏串的配置')
+    const after = stored('oauth')
+    assert(after?.google?.clientSecret === 'REAL_GOOGLE_SECRET', '嵌套的 clientSecret 没被星号覆盖', JSON.stringify(after))
+    assert(after?.google?.clientId === 'gid2.apps.googleusercontent.com', '改动的字段照常生效', JSON.stringify(after?.google))
+    assert(after?.wechatMp?.appSecret === 'REAL_WX_SECRET', '同一份配置里另一层的密钥也保住了', JSON.stringify(after?.wechatMp))
+
+    r = await req('PUT', '/api/settings/mail', { host: 'smtp.example.com', user: 'a@b.com', pass: 'REAL_MAIL_PASS' })
+    r = await req('GET', '/api/settings')
+    assert(!String(r.json.data.mail.pass).includes('REAL'), '邮件密码不下发明文', JSON.stringify(r.json.data.mail.pass))
+    await req('PUT', '/api/settings/mail', { ...r.json.data.mail, from: 'noreply@example.com' })
+    const mail = stored('mail')
+    assert(mail?.pass === 'REAL_MAIL_PASS' && mail?.from === 'noreply@example.com', '保存邮件配置时密码原样保留', JSON.stringify(mail?.pass))
+  }
+
+  console.log('\n[36] 题库是私有资源：别人的题库连题都读不到')
+  {
+    r = await req('POST', '/api/banks', { name: '私有题库探针' })
+    const bId = r.json.id
+    await req('POST', `/api/banks/${bId}/questions`, { type: 'radio', title: '秘密题', options: ['A', 'B'], answer: ['A'], score: 5 })
+
+    // 普通用户
+    const adminCookie = cookie
+    cookie = ''
+    r = await req('POST', '/api/auth/register', { username: `probe${Date.now()}`, password: 'probe-pass-1' })
+    assert(r.status === 200 || r.status === 201, '注册普通用户')
+    r = await req('GET', `/api/banks/${bId}/questions`)
+    assert(r.status === 404, '读不到别人的题库题目（含标准答案）', String(r.status))
+    r = await req('GET', `/api/banks/${bId}/practice?mode=sequence`)
+    assert(r.status === 404, '不能刷别人的题库', String(r.status))
+    r = await req('GET', `/api/banks/${bId}/progress`)
+    assert(r.status === 404, '看不到别人题库的进度', String(r.status))
+    r = await req('GET', '/api/banks')
+    assert(!(r.json.data || []).some(b => b.id === bId), '别人的题库不出现在我的列表里')
+
+    cookie = adminCookie
+    await req('DELETE', `/api/banks/${bId}`)
+    await req('DELETE', `/api/banks/${bId}/purge`)
+  }
+
+  console.log('\n[37] WebHook 的签名密钥不下发给普通用户')
+  {
+    r = await req('POST', '/api/webhooks', { name: '探针钩子', url: 'https://hook.example.com/x', secret: 'HOOK-SECRET-VALUE' })
+    r = await req('GET', '/api/webhooks')
+    const hook = (r.json.data || [])[0]
+    assert(hook && !String(hook.secret).includes('SECRET'), '管理员看到的签名密钥已脱敏', JSON.stringify(hook?.secret))
+
+    const adminCookie = cookie
+    cookie = ''
+    r = await req('POST', '/api/auth/register', { username: `hook${Date.now()}`, password: 'probe-pass-1' })
+    r = await req('GET', '/api/webhooks')
+    assert(r.status === 200 && (r.json.data || []).length === 0, '普通用户拿不到 WebHook 列表', JSON.stringify(r.json.data))
+    cookie = adminCookie
+  }
+
+  console.log('\n[38] 前端静态资源')
   for (const p of ['/', '/js/main.js', '/css/app.css', '/assets/eqs-mark.svg', '/vendor/echarts.min.js']) {
     const res = await fetch(BASE + p)
     assert(res.ok, `静态资源可访问：${p}`)

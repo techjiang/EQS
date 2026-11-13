@@ -316,8 +316,8 @@ function classifyAsBlockStart(raw) {
   if (/^(?:答案|正确答案|分值|分数|解析|说明|题型|类型)\s*[:：]/.test(t)) return 'meta'
   if (inlineTypePrefix(t)) return 'stem'
   if (/^[一二三四五六七八九十]{1,3}\s*、\s*\S/.test(t)) return 'stem'
-  if (NUM_PREFIX.test(t) && t.replace(NUM_PREFIX, '').trim()) return 'stem'
-  if (/^[①-⑳]\s*\S/.test(t)) return 'stem'
+  // 圈号是选项序号，不是题号：这里不能把「① 苹果」判成一道新题的开头
+  if (!/^[①-⑳]/.test(t) && NUM_PREFIX.test(t) && t.replace(NUM_PREFIX, '').trim()) return 'stem'
   if (/^(?:单选|多选|判断|填空|简答|问答|下拉|评分|排序)题?$/.test(t)) return 'stem'
   if (/[?？]\s*$/.test(t)) return 'stem'
   return 'none'
@@ -333,19 +333,27 @@ function classify(line, state) {
   if (typeLine) return 'meta:type'
 
   const lead = LEAD_TAG.exec(t)
-  if (lead && line.slice(lead[0].length).trim()) return 'stem'
+  // 「（1）工程师」的括号里是序号不是题型：LEAD_TAG 只看形状，这里补一道内容判断，
+  // 否则序号选项会被当成「题干前加了题型标签」，整行起一道新题。
+  if (lead && lead[1].trim() && !/^\d{1,3}$/.test(lead[1].trim()) && line.slice(lead[0].length).trim()) return 'stem'
 
   // 「判断题：xxx」「多选题：xxx」：行首带题型的一定是新题的开头
   if (inlineTypePrefix(t)) return 'stem'
+  // 圈号必须排在 NUM_PREFIX 之前：NUM_PREFIX 把 ① 也算成题号，
+  // 于是一道多选题的「① 苹果 / ② 香蕉」永远走不到选项分支，被拆成两道填空题。
+  if (/^[①-⑳]\s*\S/.test(t)) {
+    // 「① 题目？」带问号 / 声明了题型 / 长句 → 新题；「① 选项」→ 选项
+    const body = t.replace(/^[①-⑳]\s*/, '')
+    return /[?？]\s*$/.test(t) || inlineTypePrefix(body) || body.length > 20 ? 'stem' : 'option'
+  }
+  /*
+   * 中文排版里序号选项常用全角括号：「（1）工程师」「（2）设计师」。
+   * 它和「(1) 新题目」字面上完全一样，只能看上下文：当前题已经有题干、
+   * 或者明说了是选择题，那就是选项；否则按新题处理。
+   */
+  if (/^[(（]\s*\d{1,3}\s*[)）]\s*\S/.test(t) && (state.hasStem || state.awaitChoice)) return 'option'
   // 「一、xxx」「2. xxx」「(3) xxx」：序号开头的都是新题，选项用的是字母或圈号
   if (NUM_PREFIX.test(t) && t.replace(NUM_PREFIX, '').trim()) return 'stem'
-
-  // 圈号开头：「① 题干」还是「① 选项」，看后面跟的是不是字母 / 数字选项
-  if (/^[①-⑳]\s*\S/.test(t)) {
-    // 「① 题目？」带问号 / 句子 / 声明了题型 → 新题；「① 选项」→ 选项
-    const body = t.replace(/^[①-⑳]\s*/, '')
-    return /[?？]$/.test(text) || inlineTypePrefix(body) || body.length > 20 ? 'stem' : 'option'
-  }
   if (optionLine(line)) return 'option'
   if (isBulletOption(line)) return 'option'
   // 「一、xxx」是中文小标题 / 题号，不是选项（「二. 选项」这种选项序号仍按选项处理）
@@ -533,14 +541,18 @@ function resolveAnswer(raw, field) {
   const isJudge = field.type === 'radio' && opts.length === 2 && opts[0].value === '正确' && opts[1].value === '错误'
   const out = []
   const dropped = []
+  const byIndex = (i, tok) => {
+    // 答案指向不存在的选项：存进去就是「这题谁答都错」，宁可丢掉并告诉调用方
+    if (opts[i]) out.push(opts[i].value)
+    else dropped.push(tok)
+  }
   for (const tok of raw) {
-    if (/^[A-Za-z]$/.test(tok)) {
-      const i = tok.toUpperCase().charCodeAt(0) - 65
-      // 答案指向不存在的选项：存进去就是「这题谁答都错」，宁可丢掉并告诉调用方
-      if (opts[i]) out.push(opts[i].value)
-      else dropped.push(tok)
-      continue
-    }
+    if (/^[A-Za-z]$/.test(tok)) { byIndex(tok.toUpperCase().charCodeAt(0) - 65, tok); continue }
+    // 圈号写法也要认：题干用「① 苹果」出选项，答案自然写成「答案：①」
+    if (/^[①-⑳]$/.test(tok)) { byIndex(tok.charCodeAt(0) - 0x2460, tok); continue }
+    // 「答案：（2）」——全角括号序号
+    const serial = /^[(（]\s*(\d{1,3})\s*[)）]$/.exec(tok)
+    if (serial) { byIndex(Number(serial[1]) - 1, tok); continue }
     const byLabel = opts.find(o => o.label === tok || o.value === tok)
     if (byLabel) { out.push(byLabel.value); continue }
     if (isJudge && /^(对|正确|是|yes|true|√|✓|t)$/i.test(tok)) { out.push('正确'); continue }
@@ -579,6 +591,13 @@ export function parseTextToFields(text, { defaultScore = 0 } = {}) {
     blocks.push(cur)
   }
 
+  /** 这一题是不是「明说了要选项」的题型：行首题型词、单独一行的声明、题干里的 [单选] 都算 */
+  const isChoiceDeclared = (block) => {
+    if (!block) return false
+    const declared = block.declType || matchType(block.typeWord || '') || pickTypeTag(block.stems.join(' '))?.type || null
+    return ['radio', 'checkbox', 'select', 'sort', 'carousel', 'cascader', 'matrix'].includes(declared)
+  }
+
   const currentHasOptions = () => !!cur && cur.options.length > 0 && !cur.stems.length
 
   const lastLineKind = () => {
@@ -592,6 +611,8 @@ export function parseTextToFields(text, { defaultScore = 0 } = {}) {
     if (isSectionHeading(raw)) { state = { mode: 'idle', hasOptions: cur?.options.length > 0 }; continue }
     const t = raw.trim()
     state.hasOptions = !!cur && cur.options.length > 0
+    state.hasStem = !!cur && cur.stems.length > 0
+    state.awaitChoice = !!cur && cur.stems.length > 0 && !cur.options.length && isChoiceDeclared(cur)
     const kind = classify(raw, state)
     const [head, rest] = kind.split(':')
 
@@ -606,9 +627,13 @@ export function parseTextToFields(text, { defaultScore = 0 } = {}) {
       }
       if (rest === 'answer') {
         const tokens = toList(t.replace(/^(?:答案|正确答案|参考答案)\s*[:：]\s*/, ''))
-        const type = cur.declType || matchType(cur.typeWord || '') || null
+        // 题型线索有三处：行首「判断题：」、单独一行的题型声明、以及题干里的 [判断] 标签。
+        // 之前漏了第三种，于是「1. 缓存能减少数据库压力 [判断] + 答案：正确」被当成填空题，
+        // 答案连同一个「这是填空提示」的分支一起丢掉——判断题全员无标准答案。
+        const type = cur.declType || matchType(cur.typeWord || '') || pickTypeTag(cur.stems.join(' '))?.type || null
+        const judgeLike = /^(对|错|正确|错误|是|否|true|false|√|✓|×|✗|t|f)$/i.test(tokens[0] || '')
         // 填空题没有选项，答案就是那个空的空格，随手写的「答案：Docker」是猜错题意，不能当标准答案
-        if (type === 'text' || (type == null && !cur.options.length && !/^[A-Za-z]$/.test(tokens[0] || ''))) {
+        if (type === 'text' || (type == null && !cur.options.length && !judgeLike && !/^[A-Za-z]$/.test(tokens[0] || ''))) {
           if (!cur.options.length) { cur.placeholderHint = tokens.join(' '); continue }
         }
         cur.answerTokens = tokens
@@ -657,7 +682,11 @@ export function parseTextToFields(text, { defaultScore = 0 } = {}) {
         continue
       }
       // 选项区里的裸文本（H2/SQLite、MySQL）被 classify 归到 option，这里再判一次它到底是不是题干
-      const askBlock = /^[-*+•·]\s/.test(t) ? 'none' : classifyAsBlockStart(raw)
+      // 已经声明是选择题、题干也写完了，那么「（1）工程师」这种序号行就是选项，不是下一道题
+      // 括号序号在「已声明是选择题」的题干下面就是选项，不管已经收了几个
+      const serialInChoice = /^\s*[(（]\s*\d{1,3}\s*[)）]\s*\S/.test(t) &&
+        (state.awaitChoice || (!!cur && cur.options.length > 0 && isChoiceDeclared(cur)))
+      const askBlock = /^[-*+•·]\s/.test(t) || serialInChoice ? 'none' : classifyAsBlockStart(raw)
       // 题干还没出现、选项已经开始：裸文本是在补选项
       const second = (cur && cur.options.length > 0 && !cur.stems.length) ? 'none' : askBlock
       if (second !== 'none') {
