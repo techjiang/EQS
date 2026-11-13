@@ -81,6 +81,12 @@ export function fieldVisible(field, data) {
 
 const flat = v => (Array.isArray(v) ? v.join(',') : v)
 
+/** 算式验证码的题面（与前端 renderer.js 中 captchaChallenge 保持一致） */
+export function captchaChallenge(id) {
+  const sum = String(id || '').split('').reduce((acc, c) => acc + c.charCodeAt(0), 0) || 1
+  return { a: (sum % 7) + 2, b: (sum % 5) + 2 }
+}
+
 export function validateSubmission(schema, data) {
   const errors = []
   for (const f of schema) {
@@ -94,6 +100,10 @@ export function validateSubmission(schema, data) {
     if (f.type === 'email' && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(v))) errors.push(`${f.label} 邮箱格式不正确`)
     if (f.type === 'idcard' && !/^\d{17}[\dXx]$/.test(String(v))) errors.push(`${f.label} 身份证号格式不正确`)
     if (f.type === 'number' && Number.isNaN(Number(v))) errors.push(`${f.label} 必须是数字`)
+    if (f.type === 'captcha') {
+      const { a, b } = captchaChallenge(f.id)
+      if (String(v).trim() !== String(a + b)) errors.push(`${f.label} 校验不通过，请重新计算`)
+    }
     const min = Number(f.props?.minLength)
     if (min && String(v).length < min) errors.push(`${f.label} 至少 ${min} 个字符`)
     const max = Number(f.props?.maxLength)
@@ -118,8 +128,17 @@ export function gradeSubmission(schema, data, settings = {}) {
     if (given.length === right.length && given.every((x, i) => x === right[i])) got += f.score
   }
   const score = Math.round(got * 100) / 100
-  const passLine = Number(settings.passScore ?? Math.ceil(total * 0.6))
-  return { score, total, passed: score >= passLine, graded: scored > 0 }
+  const passLine = passLineOf(settings, total)
+  return { score, total, passLine, passed: score >= passLine, graded: scored > 0 }
+}
+
+/** 及格线：优先按总分百分比（passPercent），否则回退到绝对分（passScore），默认 60% */
+export function passLineOf(settings = {}, total = 0) {
+  const percent = Number(settings.passPercent)
+  if (Number.isFinite(percent) && percent > 0) return Math.round(total * Math.min(percent, 100)) / 100
+  const abs = Number(settings.passScore)
+  if (Number.isFinite(abs) && abs > 0) return abs
+  return Math.ceil(total * 0.6 * 100) / 100
 }
 
 export function computeStats(form, submissions) {
@@ -137,7 +156,8 @@ export function computeStats(form, submissions) {
       let optionPairs = f.options.map(o => ({ name: o.label, value: counts[o.value] || 0 }))
       if (f.type === 'rate' || f.type === 'nps') {
         const max = Number(f.props?.max) || (f.type === 'nps' ? 10 : 5)
-        optionPairs = Array.from({ length: max }, (_, i) => ({ name: String(i + 1), value: counts[String(i + 1)] || 0 }))
+        const from = f.type === 'nps' ? 0 : 1
+        optionPairs = Array.from({ length: max - from + 1 }, (_, i) => ({ name: String(from + i), value: counts[String(from + i)] || 0 }))
       }
       item.series = optionPairs
       item.average = values.length ? Math.round((values.reduce((a, b) => a + (Number(flat(b)) || 0), 0) / values.length) * 100) / 100 : 0

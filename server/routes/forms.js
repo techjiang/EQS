@@ -172,51 +172,87 @@ export default function register(r) {
   })
 }
 
-/** 文本题干解析：支持 “1. 标题 [单选]”、“- 选项”、“答案: A” 等写法 */
+/** 文本题干解析：支持 “1. 标题 [单选]”、“[多选] 标题”、“A. 选项”、“- 选项”、“答案: A”、“分值: 5” 等写法 */
+const TYPE_WORDS = [
+  ['单选', 'radio'], ['多选', 'checkbox'], ['下拉', 'select'], ['判断', 'judge'],
+  ['填空', 'text'], ['单行', 'text'], ['简答', 'textarea'], ['问答', 'textarea'], ['多行', 'textarea'],
+  ['日期时间', 'datetime'], ['日期', 'date'], ['时间', 'time'], ['评分', 'rate'], ['量表', 'nps'],
+  ['上传', 'upload'], ['手机', 'phone'], ['邮箱', 'email'], ['身份证', 'idcard'], ['矩阵', 'matrix'],
+  ['排序', 'sort'], ['定位', 'location'], ['签名', 'signature'], ['级联', 'cascader'],
+  ['轮播', 'carousel'], ['开关', 'switch'], ['数字', 'number'],
+  ['single choice', 'radio'], ['multiple choice', 'checkbox'], ['choose one', 'radio'],
+  ['true/false', 'judge'], ['true or false', 'judge'], ['judge', 'judge'], ['dropdown', 'select'],
+  ['radio', 'radio'], ['checkbox', 'checkbox'], ['textarea', 'textarea'], ['text', 'text'],
+  ['number', 'number'], ['date', 'date'], ['rating', 'rate'], ['upload', 'upload']
+]
+
+const CHOICE_TYPES = ['radio', 'checkbox', 'select', 'sort', 'carousel', 'cascader']
+
+function matchType(word = '') {
+  const w = String(word).trim()
+  if (!w) return null
+  const lower = w.toLowerCase()
+  for (const [key, type] of TYPE_WORDS) {
+    if (w.includes(key) || (key.length > 2 && lower.includes(key))) return type
+  }
+  return null
+}
+
+const TAG_AT = /[\[【(（]\s*([^\]】)）]{1,20})\s*[\]】)）]/
+const TAG_START = /^\s*[\[【(（]\s*([^\]】)）]{1,20})\s*[\]】)）]\s*/
+
 export function parseTextToFields(text) {
   const lines = String(text).replace(/\r/g, '').split('\n')
   const fields = []
   let cur = null
-  const typeMap = {
-    '单选': 'radio', '多选': 'checkbox', '下拉': 'select', '填空': 'text', '单行': 'text',
-    '多行': 'textarea', '日期': 'date', '评分': 'rate', '量表': 'nps', '上传': 'upload',
-    '手机': 'phone', '邮箱': 'email', '矩阵': 'matrix', '排序': 'sort', '定位': 'location',
-    '签名': 'signature', '级联': 'cascader', '轮播': 'carousel'
+  let pendingType = null
+
+  const isJudge = (label, type) => type === 'judge' || (!type && /判断/.test(label))
+
+  const flush = () => {
+    if (cur && cur.label) {
+      if (isJudge(cur.label, cur.type)) {
+        cur.type = 'radio'
+        if (!cur.options.length) cur.options = [{ label: '正确', value: '正确' }, { label: '错误', value: '错误' }]
+      } else if (!cur.options.length && CHOICE_TYPES.includes(cur.type)) {
+        // 未显式声明题型且没有任何选项：按填空题处理，避免凭空造出选项
+        cur.type = cur.explicit ? 'radio' : 'text'
+        if (cur.explicit && cur.type === 'radio') cur.options = [{ label: '选项 1', value: '选项 1' }, { label: '选项 2', value: '选项 2' }]
+      }
+      delete cur.explicit
+      fields.push(cur)
+    }
+    cur = null
   }
-  const flush = () => { if (cur) { fields.push(cur); cur = null } }
+
+  const startField = (title, type, required) => {
+    flush()
+    cur = {
+      explicit: type !== 'radio' ? true : false,
+      id: 'f_' + Math.random().toString(36).slice(2, 9),
+      type, label: title, required,
+      options: [], placeholder: '', description: '', defaultValue: '', score: 0,
+      answer: [], analysis: '', logic: [], props: {}
+    }
+  }
+
+  const pushOption = (label) => {
+    const v = String(label).trim()
+    if (!v) return
+    cur.options.push({ label: v, value: v })
+  }
+
+  const canTakeOption = () => !!cur && (cur.options.length > 0 || CHOICE_TYPES.includes(cur.type) || isJudge(cur.label, cur.type))
+
   for (const raw of lines) {
     const line = raw.trim()
-    if (!line) continue
-    const qm = /^(?:\d+[.、)]|[-*])\s*(.+)$/.exec(line)
-    const optMatch = /^[A-Za-z][.、)]\s*(.+)$/.exec(line) || /^[-*]\s*(.+)$/.exec(line)
-    const isOption = /^[A-Za-z][.、)]/.test(line) || (/^[-*]\s/.test(line) && cur && cur.options.length > 0)
-    if (isOption && cur) {
-      cur.options.push({ label: (optMatch?.[1] || line).trim(), value: (optMatch?.[1] || line).trim() })
-      continue
-    }
-    if (qm || /^#{1,4}\s/.test(line) || /[?？]$/.test(line)) {
-      flush()
-      let title = line.replace(/^#{1,4}\s*/, '').replace(/^\d+[.、)]\s*/, '').replace(/^[-*]\s*/, '').trim()
-      let type = null
-      const tm = /[\[【(（]([^\]】)）]+)[\]】)）]/.exec(title)
-      if (tm) {
-        for (const [k, v] of Object.entries(typeMap)) if (tm[1].includes(k)) type = v
-        title = title.replace(tm[0], '').trim()
-      }
-      if (!type) type = 'radio'
-      const required = /[\*＊]\s*$/.test(title) || /必填/.test(tm?.[1] || '')
-      cur = {
-        id: 'f_' + Math.random().toString(36).slice(2, 9),
-        type, label: title.replace(/[\*＊]\s*$/, '').trim(), required,
-        options: [], placeholder: '', description: '', defaultValue: '', score: 0,
-        answer: [], analysis: '', logic: [], props: {}
-      }
-      continue
-    }
-    const answerMatch = /^答案[:：]\s*(.+)$/.exec(line)
+    if (!line) { pendingType = null; continue }
+
+    // 元信息行
+    const answerMatch = /^(?:答案|正确答案)[:：]\s*(.*)$/.exec(line)
     if (answerMatch && cur) {
       cur.answer = answerMatch[1]
-        .split(/[,，;；\s]+/)
+        .split(/[,，;；、\s]+/)
         .map(s => s.trim())
         .filter(Boolean)
         .map(tok => {
@@ -231,7 +267,84 @@ export function parseTextToFields(text) {
     if (scoreMatch && cur) { cur.score = Number(scoreMatch[1]); continue }
     const analysisMatch = /^(?:解析|说明)[:：]\s*(.+)$/.exec(line)
     if (analysisMatch && cur) { cur.analysis = analysisMatch[1]; continue }
-    if (cur) cur.options.push({ label: line.replace(/^[-*]\s*/, ''), value: line.replace(/^[-*]\s*/, '') })
+    const prefixType = /^(单选|多选|判断|填空|简答|问答|下拉|评分|排序|矩阵)(?:题)?\s*[:：]\s*(.+)$/.exec(line)
+    const typeLine = prefixType || /^(?:题型|类型)[:：]\s*(.+)$/.exec(line)
+    if (typeLine) {
+      if (prefixType) {
+        // 「判断题：xxx」这类前缀，题型与题干在同一行
+        const declared = matchType(prefixType[1])
+        startField(prefixType[2].trim(), declared || 'radio')
+        cur.explicit = !!declared
+        if (isJudge(cur.label, declared)) {
+          cur.type = 'radio'
+          cur.options = [{ label: '正确', value: '正确' }, { label: '错误', value: '错误' }]
+          cur.judgePreset = true
+        }
+      } else pendingType = matchType(typeLine[1]) || pendingType
+      continue
+    }
+
+    // 只有题型标签的独立行：声明下一题（或当前题）的题型
+    const bareTag = TAG_START.exec(line) && line.slice(TAG_START.exec(line)[0].length).trim() === ''
+    if (bareTag) {
+      const t = matchType(TAG_START.exec(line)[1])
+      if (t) {
+        if (cur) { cur.type = t === 'judge' ? 'radio' : t; cur.explicit = true }
+        else pendingType = t
+      }
+      continue
+    }
+
+    // 选项行
+    const letterOpt = /^[A-Za-z][.、)．]\s*(.+)$/.exec(line)
+    if (letterOpt && cur) {
+      if (cur.judgePreset) { cur.options = []; cur.judgePreset = false }
+      pushOption(letterOpt[1])
+      continue
+    }
+    const bulletOpt = /^[-*+]\s+(.+)$/.exec(line)
+    if (bulletOpt) {
+      if (canTakeOption()) pushOption(bulletOpt[1])
+      else { startField(bulletOpt[1], pendingType || 'radio'); pendingType = null }
+      continue
+    }
+
+    // 题目标题
+    const startTag = TAG_START.exec(line)
+    const endTag = !startTag ? TAG_AT.exec(line) : null
+    const tagged = startTag ? matchType(startTag[1]) : (endTag ? matchType(endTag[1]) : null)
+    let body = line
+    if (startTag && tagged) body = line.slice(startTag[0].length).trim()
+    else if (endTag && tagged) body = (line.slice(0, endTag.index) + line.slice(endTag.index + endTag[0].length)).trim()
+
+    let title = body.replace(/^#{1,4}\s*/, '').replace(/^(?:\d+[.、)．]|[（(]\d+[)）])\s*/, '').trim()
+    const numbered = /^(?:\d+[.、)．]|[（(]\d+[)）])\s*/.test(body)
+    const heading = /^#{1,4}\s/.test(body)
+    const asks = /[?？]\s*$/.test(title)
+    const hasTag = !!tagged
+
+    // Markdown 分节标题（无序号、无题型、非提问）当分节，不生成题目
+    if (heading && !numbered && !hasTag && !asks) continue
+
+    if (hasTag || numbered || asks || !cur) {
+      const required = /[\*＊]\s*$/.test(title) || /必填/.test(line)
+      title = title.replace(/[\*＊]\s*$/, '').trim()
+      const declared = tagged || pendingType
+      startField(title, declared || 'radio', required)
+      cur.explicit = !!declared
+      pendingType = null
+      // 判断题立刻补上对错选项，后续「答案：A」才能正确映射为「正确」
+      if (isJudge(title, declared)) {
+        cur.type = 'radio'
+        cur.options = [{ label: '正确', value: '正确' }, { label: '错误', value: '错误' }]
+        cur.judgePreset = true
+      }
+      continue
+    }
+
+    // 其余：有选项就当选项，否则续到题干
+    if (canTakeOption()) pushOption(line)
+    else cur.label = (cur.label + ' ' + line).trim()
   }
   flush()
   return normalizeSchema(fields.filter(f => f.label))

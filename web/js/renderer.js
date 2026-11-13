@@ -98,9 +98,10 @@ export function renderControl(field, model, opts = {}) {
       ])
     case 'rate': {
       const max = Number(field.props?.max) || 5
+      const cur = val === '' || val === null || val === undefined ? 0 : Number(val)
       return h('div', { class: 'flex', style: 'gap:4px;font-size:24px' }, Array.from({ length: max }, (_, i) =>
         h('span', {
-          key: i, style: `cursor:pointer;color:${Number(val) > i ? '#f59e0b' : 'var(--line)'};transition:.1s`,
+          key: i, style: `cursor:pointer;color:${cur > i ? '#f59e0b' : 'var(--line)'};transition:.1s`,
           onClick: () => !dis && set(i + 1)
         }, '★')))
     }
@@ -110,7 +111,7 @@ export function renderControl(field, model, opts = {}) {
         h('div', { class: 'flex wrap', style: 'gap:6px' }, Array.from({ length: max + 1 }, (_, i) =>
           h('button', {
             key: i, type: 'button',
-            class: ['btn', 'sm', Number(val) === i ? 'primary' : ''],
+            class: ['btn', 'sm', val !== '' && val !== null && val !== undefined && Number(val) === i ? 'primary' : ''],
             style: 'min-width:34px',
             onClick: () => !dis && set(i)
           }, String(i)))),
@@ -190,9 +191,11 @@ export function renderControl(field, model, opts = {}) {
           class: 'btn', type: 'button', disabled: dis,
           onClick: () => {
             if (!navigator.geolocation) return set('浏览器不支持定位')
+            if (!navigator.geolocation) return
             navigator.geolocation.getCurrentPosition(
               p => set(`${p.coords.latitude.toFixed(6)},${p.coords.longitude.toFixed(6)}`),
-              () => set('定位失败，请检查权限')
+              () => import('./ui.js').then(m => m.toast('定位失败，请检查浏览器定位权限', 'err')),
+              { enableHighAccuracy: true, timeout: 8000 }
             )
           }
         }, '📍 获取当前位置'),
@@ -263,11 +266,18 @@ export function renderControl(field, model, opts = {}) {
         }, '+ 添加一项') : null
       ])
     }
-    case 'captcha':
-      return h('div', { class: 'flex', style: 'gap:8px' }, [
-        h('input', { class: 'input', placeholder: '请输入验证码', value: val ?? '', onInput: e => set(e.target.value) }),
-        h('div', { class: 'tag brand', style: 'height:38px;font-size:15px;letter-spacing:4px;font-weight:700;padding:0 12px' }, '4 8 2 6')
+    case 'captcha': {
+      const { a, b } = captchaChallenge(field.id)
+      return h('div', {}, [
+        h('div', { class: 'flex', style: 'gap:8px' }, [
+          h('input', {
+            class: 'input', placeholder: '请输入计算结果', value: val ?? '', disabled: dis,
+            onInput: e => set(e.target.value)
+          }),
+          h('div', { class: 'tag brand', style: 'height:38px;font-size:14px;letter-spacing:1px;font-weight:600;padding:0 12px;flex:none' }, `${a} + ${b} = ?`)
+        ])
       ])
+    }
     case 'image':
       return h('div', { style: 'border-radius:12px;overflow:hidden' }, h('img', {
         src: field.props?.src || '/assets/eqs-logo.png', style: 'width:100%;max-height:240px;object-fit:cover'
@@ -288,6 +298,12 @@ export function renderControl(field, model, opts = {}) {
 
 function toastOnce() {
   import('./ui.js').then(m => m.toast('当前为预览模式，扫码需在浏览器中授权摄像头'))
+}
+
+/** 与服务端 lib/forms.js 中 captchaChallenge 完全一致的算式，答案由服务端校验 */
+export function captchaChallenge(id) {
+  const sum = String(id || '').split('').reduce((acc, c) => acc + c.charCodeAt(0), 0) || 1
+  return { a: (sum % 7) + 2, b: (sum % 5) + 2 }
 }
 
 function inputHint(type) {
@@ -323,13 +339,22 @@ function initSignature(canvas, onChange) {
 }
 
 /** 渲染整张表单（预览 / 公开填写） */
-export function FormRenderer({ schema, model, readonly = false, onChange, onUpload, brand }) {
+export function FormRenderer({ schema, model, readonly = false, onChange, onUpload, brand, errors = [] }) {
   const visible = schema.filter(f => fieldVisible(f, model))
-  return h('div', {}, visible.map(f => h('div', { class: 'q-block', key: f.id }, [
-    FieldLabel(f),
-    f.description ? h('div', { class: 'q-desc' }, f.description) : null,
-    renderControl(f, model, { readonly, onChange, onUpload })
-  ])))
+  const errOf = (f) => (errors || []).find(m => m && f.label && m.startsWith(f.label))
+  return h('div', {}, visible.map(f => {
+    const message = errOf(f)
+    return h('div', {
+      class: ['q-block', message ? 'has-err' : ''],
+      key: f.id,
+      'data-field': f.id
+    }, [
+      FieldLabel(f),
+      f.description ? h('div', { class: 'q-desc' }, f.description) : null,
+      renderControl(f, model, { readonly, onChange, onUpload }),
+      message ? h('div', { class: 'q-err' }, message) : null
+    ])
+  }))
 }
 
 export { findMeta, escapeHtml }

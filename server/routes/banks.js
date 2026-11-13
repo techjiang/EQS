@@ -128,10 +128,14 @@ export default function register(r) {
       analysis: q.analysis, score: q.score
     }))
     const ts = now()
+    const settings = {
+      passPercent: Number(body.passPercent) > 0 ? Number(body.passPercent) : 60,
+      duration: Number(body.duration) || 60
+    }
     const result = run('INSERT INTO forms(title, description, kind, schema, settings, status, created_by, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?)',
       body.title || `${bank.name} - 试卷`, body.description || '由题库智能组卷生成', 'exam', JSON.stringify(schema),
-      JSON.stringify({ passScore: Math.ceil(schema.reduce((a, b) => a + (b.score || 0), 0) * 0.6), duration: body.duration || 60 }), 'draft', user.id, ts, ts)
-    sendJson(res, 201, { ok: true, id: Number(result.lastInsertRowid), count: schema.length })
+      JSON.stringify(settings), 'draft', user.id, ts, ts)
+    sendJson(res, 201, { ok: true, id: Number(result.lastInsertRowid), count: schema.length, settings })
   })
 
   /** 刷题：拉取题目（不返回答案） */

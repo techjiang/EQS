@@ -58,7 +58,7 @@ export default {
               legend: { bottom: 0, textStyle: { color: axisColor, fontSize: 11 } },
               series: [{
                 type: 'pie', radius: ['42%', '68%'], center: ['50%', '44%'],
-                data: q.series.map((s, i) => ({ name: s.name, value: s.value, itemStyle: { color: PALETTE[i % PALETTE.length] } })),
+                data: q.series.filter(s2 => s2.value > 0).map(s2 => ({ name: s2.name, value: s2.value, itemStyle: { color: PALETTE[q.series.indexOf(s2) % PALETTE.length] } })),
                 label: { color: axisColor, fontSize: 11 }
               }]
             }

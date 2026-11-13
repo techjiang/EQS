@@ -277,9 +277,9 @@ export default {
     const settingsInspector = () => {
       const s = form.value.settings
       const row = (label, node, hint) => h('div', { class: 'field' }, [h('label', {}, label), node, hint ? h('div', { class: 'hint' }, hint) : null])
-      const sw = (key, label) => h('div', { class: 'field' }, h('label', { class: 'flex between' }, [
+      const sw = (key, label, dft = false) => h('div', { class: 'field' }, h('label', { class: 'flex between' }, [
         h('span', {}, label),
-        h('div', { class: ['switch', sget(key) ? 'on' : ''], onClick: () => set(key, !sget(key)) })
+        h('div', { class: ['switch', sget(key, dft) ? 'on' : ''], onClick: () => set(key, !sget(key, dft)) })
       ]))
       return h('div', {}, [
         h('h4', {}, [h('span', {}, '表单设置'), h('span', { class: 'tag', style: 'cursor:pointer', onClick: () => tab.value = 'field' }, '回属性')]),
@@ -294,6 +294,21 @@ export default {
           class: 'input', value: sget('redirectUrl', ''), placeholder: 'https://…（留空则不跳转）',
           onInput: e => set('redirectUrl', e.target.value)
         })),
+        form.value.kind === 'exam' ? h('div', {}, [
+          h('div', { style: 'border-top:1px solid var(--line);margin:14px 0' }),
+          h('h4', {}, '考试评分'),
+          h('div', { class: 'row' }, [
+            row('及格线（%）', h('input', {
+              class: 'input', type: 'number', min: 1, max: 100, value: sget('passPercent', 60),
+              onInput: e => set('passPercent', Number(e.target.value))
+            }), '按卷面总分百分比计算'),
+            row('限时（分钟）', h('input', {
+              class: 'input', type: 'number', min: 0, value: sget('duration', 0),
+              onInput: e => set('duration', Number(e.target.value))
+            }), '0 表示不限时')
+          ]),
+          sw('showResult', '交卷后显示逐题对错与解析', true)
+        ]) : null,
         h('div', { style: 'border-top:1px solid var(--line);margin:14px 0' }),
         h('h4', {}, '外观'),
         row('头图 URL', h('input', {

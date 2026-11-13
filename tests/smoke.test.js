@@ -259,7 +259,68 @@ try {
   const zipBuf = Buffer.from(await zip.arrayBuffer())
   assert(zip.ok && zipBuf.slice(0, 2).toString() === 'PK', '附件打包为合法 ZIP')
 
-  console.log('\n[12] 前端静态资源')
+  console.log('\n[12] 文本导入健壮性与交卷回顾')
+  r = await req('POST', `/api/banks/${bankId}/import-text`, {
+    text: [
+      '[单选] HTML 中表示段落的标签是？',
+      'A. <p>',
+      'B. <div>',
+      '答案：A',
+      '分值：5',
+      '',
+      '[多选] 下列属于 CSS 预处理器的是？',
+      'A. Sass',
+      'B. Less',
+      'C. jQuery',
+      '答案：A,B',
+      '分值：5',
+      '',
+      '[判断] HTTP 404 表示资源不存在。',
+      '答案：A',
+      ''
+    ].join('\n')
+  })
+  assert(r.json.imported === 3, '三题连续导入不串题（判断题不再被吞）', String(r.json.imported))
+  const bankQs = (await req('GET', `/api/banks/${bankId}/questions`)).json.data
+  const judge = bankQs.find(q => q.title.includes('404'))
+  assert(!!judge, '判断题被识别为独立题目')
+  assert(judge.options.length === 2 && judge.options[0].label === '正确', '判断题自动补全对错选项')
+  const multi = bankQs.find(q => q.type === 'checkbox' && q.title.includes('预处理器'))
+  assert(multi && multi.options.length === 3, '多选题选项未混入下一题内容', JSON.stringify(multi?.options))
+
+  r = await req('POST', '/api/forms', {
+    title: '及格线测试', kind: 'exam',
+    schema: [
+      { type: 'radio', label: 'A 题', options: ['对', '错'], answer: ['对'], score: 40 },
+      { type: 'radio', label: 'B 题', options: ['对', '错'], answer: ['对'], score: 60 }
+    ]
+  })
+  const pctId = r.json.id
+  const pctSchema = r.json.data.schema
+  await req('PUT', `/api/forms/${pctId}`, { status: 'published', settings: { passPercent: 60 } })
+  r = await req('POST', `/api/public/forms/${pctId}/submit`, { data: { [pctSchema[0].id]: '对', [pctSchema[1].id]: '错' } })
+  assert(r.json.score === 40, '按分值计分 40', String(r.json.score))
+  assert(r.json.passLine === 60, '及格线按总分百分比折算为 60', String(r.json.passLine))
+  assert(r.json.passed === false, '40 分未达 60 及格线')
+  assert(r.json.total === 100, '返回卷面总分')
+  assert(Array.isArray(r.json.review?.items) && r.json.review.items.length === 2, '交卷后返回逐题回顾')
+  assert(r.json.review.items[0].correct === true && r.json.review.items[1].correct === false, '逐题对错判定正确')
+
+  r = await req('POST', '/api/forms', {
+    title: '验证码测试', kind: 'survey',
+    schema: [{ type: 'captcha', label: '人机校验', required: true }]
+  })
+  const capId = r.json.id
+  const capField = r.json.data.schema[0]
+  await req('PUT', `/api/forms/${capId}`, { status: 'published' })
+  r = await req('POST', `/api/public/forms/${capId}/submit`, { data: { [capField.id]: '0' } })
+  assert(r.status === 422, '验证码错误被拒绝', JSON.stringify(r.json))
+  const sum = capField.id.split('').reduce((a, c) => a + c.charCodeAt(0), 0)
+  const expect = (sum % 7) + 2 + ((sum % 5) + 2)
+  r = await req('POST', `/api/public/forms/${capId}/submit`, { data: { [capField.id]: String(expect) } })
+  assert(r.status === 201, '验证码正确可通过（服务端真实校验）', JSON.stringify(r.json))
+
+  console.log('\n[13] 前端静态资源')
   for (const p of ['/', '/js/main.js', '/css/app.css', '/assets/eqs-mark.svg', '/vendor/echarts.min.js']) {
     const res = await fetch(BASE + p)
     assert(res.ok, `静态资源可访问：${p}`)

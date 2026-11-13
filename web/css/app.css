@@ -221,6 +221,8 @@ table.table{width:100%;border-collapse:collapse;font-size:13.5px}
 
 /* 表单预览渲染 */
 .q-block{margin-bottom:20px}
+.q-block.has-err{background:rgba(239,68,68,.045);border-left:3px solid var(--danger);border-radius:8px;padding:10px 12px;margin-left:-15px;padding-left:15px}
+.q-err{color:var(--danger);font-size:12.5px;margin-top:6px}
 .q-title{font-weight:600;font-size:14.5px;margin-bottom:8px;display:flex;gap:5px}
 .q-title .req{color:var(--danger)}
 .q-desc{font-size:12.5px;color:var(--text-3);margin:-4px 0 8px}

@@ -1,7 +1,10 @@
 import { get, all, run, now, log } from '../lib/db.js'
 import { readJson, fail, sendJson, clientIp } from '../lib/http.js'
 import { requireUser, requirePerm, currentUser, can } from '../lib/auth.js'
-import { pickForm, validateSubmission, gradeSubmission, computeStats, submissionData, paginate } from '../lib/forms.js'
+import { pickForm, validateSubmission, gradeSubmission, computeStats, submissionData, paginate, fieldVisible, passLineOf } from '../lib/forms.js'
+
+const flatAnswer = v => (Array.isArray(v) ? v.map(String) : v === undefined || v === null || v === '' ? [] : [String(v)])
+const sameSet = (a, b) => a.length === b.length && [...a].sort().every((x, i) => x === [...b].sort()[i])
 import { notifySubmission, dispatchWebhooks } from '../lib/notify.js'
 
 function fingerprint(req, extra = {}) {
@@ -97,11 +100,18 @@ export default function register(r) {
     const id = Number(result.lastInsertRowid)
     const submission = get('SELECT * FROM submissions WHERE id = ?', id)
 
+    const review = form.kind === 'exam' && form.settings?.showResult !== false
+      ? buildReview(form.schema, data, form.settings)
+      : null
+
     sendJson(res, 201, {
       ok: true,
       id,
       score,
+      total: form.kind === 'exam' ? review?.total ?? 0 : null,
+      passLine: form.kind === 'exam' ? review?.passLine ?? 0 : null,
       passed: passed === 1,
+      review,
       message: form.settings?.submitText || '提交成功，感谢您的参与！',
       redirect: form.settings?.redirectUrl || ''
     })
@@ -114,6 +124,31 @@ export default function register(r) {
       } catch {}
     })
   })
+
+  /** 交卷后逐题回顾：只返回对错、正确答案与解析，不回传用户原始作答之外的信息 */
+  function buildReview(schema, data, settings = {}) {
+    const items = []
+    for (const f of schema) {
+      if (['divider', 'richtext', 'html', 'image'].includes(f.type)) continue
+      if (!fieldVisible(f, data)) continue
+      const given = flatAnswer(data[f.id])
+      const right = (f.answer || []).map(String)
+      items.push({
+        id: f.id,
+        label: f.label,
+        type: f.type,
+        given,
+        answer: right,
+        judged: right.length > 0,
+        correct: right.length > 0 && sameSet(given, right),
+        score: Number(f.score) || 0,
+        got: right.length > 0 && sameSet(given, right) ? Number(f.score) || 0 : 0,
+        analysis: f.analysis || ''
+      })
+    }
+    const total = schema.reduce((a, f) => a + (Number(f.score) || 0), 0)
+    return { items, total, passLine: passLineOf(settings, total), graded: items.some(i => i.judged) }
+  }
 
   /** 公开：按编号查询自己的答卷 */
   r.get('/api/public/forms/:id/query', async (req, res, { params }) => {

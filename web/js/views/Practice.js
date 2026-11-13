@@ -15,7 +15,7 @@ export default {
     const loading = ref(true)
     const noteOpen = ref(false)
     const noteText = ref('')
-    const streakToClear = ref(0)
+    const streakToClear = ref(Number(localStorage.getItem('eqs-streak-clear') || 0))
 
     const load = async () => {
       loading.value = true
@@ -94,12 +94,22 @@ export default {
           h('div', {}, [
             h('h1', {}, data.value.bank.name),
             h('div', { class: 'sub' }, `${{ sequence: '顺序练习', random: '随机练习', wrong: '错题练习', favorite: '收藏练习' }[mode.value]} · 共 ${totalCount} 题`),
-            h('div', { class: 'flex', style: 'gap:6px;margin-top:10px' }, [
-              ['sequence', '顺序'], ['random', '随机'], ['wrong', '错题'], ['favorite', '收藏']
-            ].map(([v, l]) => h('button', {
-              class: ['btn', 'sm', mode.value === v ? 'primary' : ''],
-              onClick: () => { mode.value = v; load() }
-            }, l)))
+            h('div', { class: 'flex wrap', style: 'gap:6px;margin-top:10px;align-items:center' }, [
+              ...['sequence', 'random', 'wrong', 'favorite'].map((v, i) => h('button', {
+                class: ['btn', 'sm', mode.value === v ? 'primary' : ''],
+                onClick: () => { mode.value = v; load() }
+              }, ['顺序', '随机', '错题', '收藏'][i])),
+              h('span', { class: 'small muted', style: 'margin-left:6px' }, '错题连续答对'),
+              h('select', {
+                class: 'select', style: 'height:30px;width:auto;padding:0 8px',
+                value: streakToClear.value,
+                onChange: e => {
+                  streakToClear.value = Number(e.target.value)
+                  localStorage.setItem('eqs-streak-clear', String(streakToClear.value))
+                }
+              }, [0, 1, 2, 3, 5].map(n => h('option', { value: n }, n ? `${n} 次后移出` : '不自动移出'))),
+              h('span', { class: 'small muted' }, '(错题集)')
+            ])
           ]),
           h('button', { class: 'btn', onClick: () => navigate('/banks') }, '返回题库')
         ]),

@@ -43,7 +43,7 @@ const TPL = [
   {
     title: '在线考试模板（含答案）', category: '考试', kind: 'exam',
     description: '示例试卷，含单选、多选、判断与简答，可自动评分。',
-    settings: { submitText: '已提交，成绩已自动计算。', passScore: 60, duration: 30 },
+    settings: { submitText: '已提交，成绩已自动计算。', passPercent: 60, duration: 30 },
     schema: [
       { type: 'radio', label: 'EQS 默认内置的数据库是？', required: true, options: ['MySQL', 'PostgreSQL', 'H2/SQLite 内嵌', 'Oracle'], answer: ['H2/SQLite 内嵌'], score: 10, analysis: 'EQS 内置内嵌数据库，开箱即用。' },
       { type: 'checkbox', label: '以下哪些属于 EQS 的题型？（多选）', required: true, options: ['单选', '矩阵量表', '子表单', '二维码'], answer: ['单选', '矩阵量表', '子表单'], score: 20, analysis: '二维码题型用于跳转与扫码场景，均属内置题型。' },

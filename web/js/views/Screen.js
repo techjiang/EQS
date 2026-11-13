@@ -1,4 +1,4 @@
-import { h, ref, onMounted, onBeforeUnmount, nextTick } from '/vendor/vue.esm.js'
+import { h, ref, onMounted, onBeforeUnmount, nextTick, watch } from '/vendor/vue.esm.js'
 import { api } from '../api.js'
 import { route, navigate } from '../router.js'
 import { err } from '../ui.js'
@@ -76,12 +76,21 @@ export default {
           xAxis: isPie ? undefined : { type: 'category', data: q.series.map(s => s.name), axisLabel: { color: '#7fa6d0', interval: 0 }, axisLine: { lineStyle: { color: '#1d3a5f' } } },
           yAxis: isPie ? undefined : { type: 'value', minInterval: 1, splitLine: { lineStyle: { color: '#12304d' } }, axisLabel: { color: '#7fa6d0' } },
           series: [isPie
-            ? { type: 'pie', radius: ['40%', '62%'], center: ['50%', '45%'], data: q.series.map((s, k) => ({ name: s.name, value: s.value, itemStyle: { color: PALETTE[k % PALETTE.length] } })), label: { color: '#bcd7f0', fontSize: 11, formatter: '{b} {c}' }, labelLine: { length: 8, length2: 8 } }
+            ? { type: 'pie', radius: ['40%', '62%'], center: ['50%', '45%'], data: q.series.filter(s2 => s2.value > 0).map((s2) => ({ name: s2.name, value: s2.value, itemStyle: { color: PALETTE[q.series.indexOf(s2) % PALETTE.length] } })), label: { color: '#bcd7f0', fontSize: 11, formatter: '{b} {c}' }, labelLine: { length: 8, length2: 8 } }
             : { type: 'bar', barMaxWidth: 30, data: q.series.map(s => s.value), itemStyle: { borderRadius: [6, 6, 0, 0], color: new window.echarts.graphic.LinearGradient(0, 0, 0, 1, [{ offset: 0, color: '#38e0ff' }, { offset: 1, color: 'rgba(56,224,255,.18)' }]) } }
           ]
         })
       })
     }
+
+    // 同一页面内切换 query.formId 时组件不会重建，这里手动跟随
+    watch(() => route.value.query.formId, (v) => {
+      const next = Number(v) || 0
+      if (next && next !== formId.value) {
+        formId.value = next
+        load()
+      }
+    })
 
     let timer = null
     onMounted(() => {
@@ -95,6 +104,30 @@ export default {
       window.removeEventListener('resize', render)
       charts.forEach(c => c.dispose())
     })
+
+    /** 大屏关键指标：考试看分数，问卷看回收 */
+    const metricCards = () => {
+      const d = data.value || {}
+      const trend = d.trend || []
+      const today = trend.length ? trend[trend.length - 1].count : 0
+      const answered = (d.questions || []).reduce((a, q) => a + (q.count || 0), 0)
+      if (d.form?.kind === 'exam') {
+        return [
+          ['总答卷', d.total ?? 0],
+          ['题目数', d.questions?.length ?? 0],
+          ['平均分', d.avgScore ?? '—'],
+          ['通过人数', d.passRate ?? 0]
+        ]
+      }
+      const peak = trend.reduce((a, t) => Math.max(a, t.count), 0)
+      return [
+        ['总答卷', d.total ?? 0],
+        ['题目数', d.questions?.length ?? 0],
+        ['今日新增', today],
+        ['单日峰值', peak],
+        ['累计作答', answered]
+      ]
+    }
 
     const switchForm = async (e) => {
       formId.value = Number(e.target.value)
@@ -131,10 +164,7 @@ export default {
         ])
       ]),
       h('div', { style: 'display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:14px;margin-bottom:16px' }, [
-        ['总答卷', data.value?.total ?? 0],
-        ['题目数', data.value?.questions?.length ?? 0],
-        ['平均分', data.value?.avgScore ?? '—'],
-        ['通过数', data.value?.passRate ?? 0]
+        ...metricCards()
       ].map(([k, v]) => h('div', {
         style: 'background:linear-gradient(160deg,rgba(56,224,255,.1),rgba(8,24,42,.6));border:1px solid #17405f;border-radius:14px;padding:16px'
       }, [

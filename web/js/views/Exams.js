@@ -10,7 +10,7 @@ export default {
     const showNew = ref(false)
     const creating = ref(false)
     const banks = ref([])
-    const newExam = ref({ title: '', bankId: 0, count: 10, duration: 60, passScore: 60 })
+    const newExam = ref({ title: '', bankId: 0, count: 10, duration: 60, passPercent: 60 })
     const aiPrompt = ref('')
 
     const load = async () => {
@@ -44,7 +44,10 @@ export default {
         const r = await api.post(`/api/banks/${newExam.value.bankId}/paper`, {
           title: newExam.value.title || '新建考试', count: newExam.value.count, duration: newExam.value.duration
         })
-        await api.put(`/api/forms/${r.id}`, { status: 'published', settings: { passScore: newExam.value.passScore, duration: newExam.value.duration } })
+        await api.put(`/api/forms/${r.id}`, {
+          status: 'published',
+          settings: { ...(r.data?.settings || {}), passPercent: newExam.value.passPercent, duration: newExam.value.duration }
+        })
         ok(`已生成 ${r.count} 题并发布`)
         showNew.value = false
         navigate(`/forms/${r.id}/design`)
@@ -112,8 +115,9 @@ export default {
             h('div', { class: 'field' }, [h('label', {}, '时长（分钟）'), h('input', {
               class: 'input', type: 'number', value: newExam.value.duration, onInput: e => newExam.value.duration = Number(e.target.value)
             })]),
-            h('div', { class: 'field' }, [h('label', {}, '及格分'), h('input', {
-              class: 'input', type: 'number', value: newExam.value.passScore, onInput: e => newExam.value.passScore = Number(e.target.value)
+            h('div', { class: 'field' }, [h('label', {}, '及格线（%）'), h('input', {
+              class: 'input', type: 'number', min: 1, max: 100, value: newExam.value.passPercent,
+              onInput: e => newExam.value.passPercent = Number(e.target.value)
             })])
           ]),
           h('div', { style: 'border-top:1px solid var(--line);margin:8px 0 14px' }),
