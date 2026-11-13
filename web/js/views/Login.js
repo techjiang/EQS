@@ -44,7 +44,7 @@ export default {
         class: 'input', type, placeholder,
         value: form.value[key],
         onInput: e => form.value[key] = e.target.value,
-        onKeydown: e => { if (e.key === 'Enter' && key !== 'email') {} }
+        onKeydown: e => { if (e.key === 'Enter') submit() }
       })
     ])
 

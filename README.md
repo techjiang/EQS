@@ -161,7 +161,7 @@ bash scripts/start.sh                        # 启动即完成迁移
 
 ## API
 
-请求头带 `Cookie: eqs_token=…`（登录会话）或 `X-API-Key: eqs_…`。
+请求头带 `Cookie: eqs_token=…`（登录会话）或 `X-API-Key: eqs_…`（在系统设置 → API Key 创建，等同管理员权限，停用后立即失效）。
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |

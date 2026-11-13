@@ -198,8 +198,24 @@ function matchType(word = '') {
   return null
 }
 
-const TAG_AT = /[\[【(（]\s*([^\]】)）]{1,20})\s*[\]】)）]/
 const TAG_START = /^\s*[\[【(（]\s*([^\]】)）]{1,20})\s*[\]】)）]\s*/
+
+const BRACKET_TAGS = /[\[【]\s*([^\]】]{1,20})\s*[\]】]/g
+const PAREN_TAGS = /[（(]\s*([^()（）]{1,20})\s*[)）]/g
+
+/** 在一行里找出真正的题型标签：方括号优先，其次圆括号；同类取最后一个 */
+function pickTypeTag(line) {
+  for (const rx of [BRACKET_TAGS, PAREN_TAGS]) {
+    let hit = null
+    rx.lastIndex = 0
+    for (const m of String(line).matchAll(rx)) {
+      const type = matchType(m[1])
+      if (type) hit = { index: m.index, 0: m[0], type }
+    }
+    if (hit) return hit
+  }
+  return null
+}
 
 export function parseTextToFields(text) {
   const lines = String(text).replace(/\r/g, '').split('\n')
@@ -309,15 +325,21 @@ export function parseTextToFields(text) {
       continue
     }
 
-    // 题目标题
-    const startTag = TAG_START.exec(line)
-    const endTag = !startTag ? TAG_AT.exec(line) : null
-    const tagged = startTag ? matchType(startTag[1]) : (endTag ? matchType(endTag[1]) : null)
+    // 题目标题。一行里可能有多组括号（「打分（1-5）[评分]」「邮箱（工作邮箱）[邮箱]」），
+    // 只有内容能识别成题型的那组才是标签；方括号优先于圆括号，且取最后一个（标签惯例写在行尾）。
+    const tagPick = pickTypeTag(line)
     let body = line
-    if (startTag && tagged) body = line.slice(startTag[0].length).trim()
-    else if (endTag && tagged) body = (line.slice(0, endTag.index) + line.slice(endTag.index + endTag[0].length)).trim()
+    if (tagPick) body = (line.slice(0, tagPick.index) + line.slice(tagPick.index + tagPick[0].length)).trim()
+    const tagged = tagPick?.type || null
 
     let title = body.replace(/^#{1,4}\s*/, '').replace(/^(?:\d+[.、)．]|[（(]\d+[)）])\s*/, '').trim()
+    // 「判断题：xxx」这类前缀只用来标题型，不该留在题干里
+    let inlineType = null
+    const prefixM = /^([\u4e00-\u9fa5]{1,4}题)\s*[:：]\s*/.exec(title)
+    if (prefixM) {
+      const t = matchType(prefixM[1])
+      if (t) { inlineType = t; title = title.slice(prefixM[0].length).trim() }
+    }
     const numbered = /^(?:\d+[.、)．]|[（(]\d+[)）])\s*/.test(body)
     const heading = /^#{1,4}\s/.test(body)
     const asks = /[?？]\s*$/.test(title)
@@ -329,7 +351,7 @@ export function parseTextToFields(text) {
     if (hasTag || numbered || asks || !cur) {
       const required = /[\*＊]\s*$/.test(title) || /必填/.test(line)
       title = title.replace(/[\*＊]\s*$/, '').trim()
-      const declared = tagged || pendingType
+      const declared = tagged || inlineType || pendingType
       startField(title, declared || 'radio', required)
       cur.explicit = !!declared
       pendingType = null

@@ -16,6 +16,20 @@ function fingerprint(req, extra = {}) {
   }
 }
 
+/** 从答卷数据里收集附件 id（upload/file 组件的值是 {id,name,url} 数组或单个对象） */
+function collectFileIds(data) {
+  const ids = new Set()
+  const visit = (v) => {
+    if (Array.isArray(v)) return v.forEach(visit)
+    if (v && typeof v === 'object') {
+      if (Number(v.id) > 0 && v.url) ids.add(Number(v.id))
+      for (const x of Object.values(v)) visit(x)
+    }
+  }
+  visit(data)
+  return [...ids]
+}
+
 /** 校验答题限制：微信/账号/IP/设备/次数/时间窗口 */
 export function checkLimit(form, req, extra = {}) {
   const s = form.settings || {}
@@ -65,7 +79,7 @@ export default function register(r) {
       ok: true,
       data: {
         id: form.id, title: form.title, description: form.description, kind: form.kind,
-        schema, settings: form.settings
+        schema, settings: publicSettings(form.settings)
       }
     })
   })
@@ -98,6 +112,11 @@ export default function register(r) {
       form.id, JSON.stringify(data), score, passed, Number(body.duration) || 0, user?.id || 0,
       fp.ip, fp.device, body.openid || '', body.wxNickname || '', body.wxAvatar || '', ts, ts)
     const id = Number(result.lastInsertRowid)
+    // 附件是先上传后交卷的，交卷时把本次作答里引用到的文件认领到这份答卷上，
+    // 否则「打包下载附件」会把它们漏掉。
+    for (const fileId of collectFileIds(data)) {
+      run('UPDATE files SET submission_id = ? WHERE id = ? AND submission_id = 0', id, fileId)
+    }
     const submission = get('SELECT * FROM submissions WHERE id = ?', id)
 
     const review = form.kind === 'exam' && form.settings?.showResult !== false
@@ -169,6 +188,12 @@ export default function register(r) {
     if (!row) fail(404, '答卷不存在')
     const form = pickForm(params.id)
     if (!form?.settings?.allowQuery) fail(403, '该问卷未开放查询')
+    // 编号是连续自增的，任何人都能猜。只放行「本设备 / 本账号 / 同 IP」提交的答卷
+    const me = currentUser(req)
+    const sameDevice = row.device && row.device === String(req.headers['user-agent'] || '').slice(0, 200)
+    const sameUser = me?.id && row.user_id && Number(row.user_id) === Number(me.id)
+    const sameIp = row.ip && row.ip === clientIp(req)
+    if (!sameDevice && !sameUser && !sameIp) fail(403, '只能查询本设备提交过的答卷')
     sendJson(res, 200, { ok: true, data: { id: row.id, data: JSON.parse(row.data), score: row.score, createdAt: row.created_at } })
   })
 
@@ -299,4 +324,16 @@ export default function register(r) {
     }
     sendJson(res, 200, { ok: true, imported: ok, skipped })
   })
+}
+
+/** 公开填写页只需要外观与开关，访问密码、白名单、通知邮箱一律不下发 */
+const PUBLIC_SETTING_KEYS = [
+  'submitText', 'buttonText', 'redirectUrl', 'headerImage', 'bgImage', 'bgColor', 'buttonColor',
+  'allowQuery', 'onlyWechat', 'recordWechat', 'needPassword', 'passPercent', 'showResult', 'duration'
+]
+
+export function publicSettings(settings = {}) {
+  const out = {}
+  for (const k of PUBLIC_SETTING_KEYS) if (settings[k] !== undefined) out[k] = settings[k]
+  return out
 }

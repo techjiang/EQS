@@ -39,13 +39,31 @@
 | --- | --- | --- |
 | GET | `/api/public/forms/:id` | 读取已发布表单（不含答案） |
 | POST | `/api/public/forms/:id/submit` | 提交 `{data, password?, openid?, wxNickname?, wxAvatar?, duration?}` |
-| GET | `/api/public/forms/:id/query?submissionId=` | 按编号查询答卷 |
+| GET | `/api/public/forms/:id/query?submissionId=` | 按编号查询答卷（需开启 `allowQuery`，且只能查本设备 / 本账号 / 同 IP 提交的答卷） |
 
 提交响应：
 
 ```json
-{ "ok": true, "id": 12, "score": 85, "passed": true, "message": "提交成功", "redirect": "" }
+{ "ok": true, "id": 12, "score": 85, "total": 100, "paperTotal": 100, "ungraded": 0, "graded": true, "passed": true, "message": "提交成功", "redirect": "" }
 ```
+
+`GET /api/public/forms/:id` 返回的 `settings` 已按白名单裁剪：只含外观与开关
+（`submitText`、`buttonText`、`redirectUrl`、`headerImage`、`bgImage`、`bgColor`、`buttonColor`、
+`allowQuery`、`onlyWechat`、`recordWechat`、`needPassword`、`passPercent`、`showResult`、`duration`），
+访问密码、白名单、通知邮箱等敏感字段不会下发到浏览器。
+
+## 附件上传
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/api/upload` | `multipart/form-data`，可带 `formId`、`submissionId` |
+| GET | `/api/files/raw/*` | 读取本地存储的文件 |
+
+登录用户可直接上传；未登录时**必须**带 `formId`，且该表单需为已发布状态——公开填写页的附件
+依赖这条路径，其他场景一律要求登录，避免被当成公共图床。
+
+交卷时服务端会把答卷数据里引用到的文件（`{id,url,...}`）认领到该答卷，
+`GET /api/forms/:id/attachments.zip` 才能打全。
 
 ## 答卷
 

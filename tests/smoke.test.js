@@ -369,7 +369,51 @@ try {
   r = await req('GET', `/api/public/forms/${formId}/query?submissionId=${sub1}`)
   assert(r.status === 403, '未开放查询时拒绝访问')
 
-  console.log('\n[16] 前端静态资源')
+  console.log('\n[16] API Key 鉴权与公开页信息边界')
+  r = await req('POST', '/api/api-keys', { name: '集成测试' })
+  const apiKey = r.json.key
+  assert(!!apiKey, 'API Key 创建成功')
+  let kres = await fetch(BASE + '/api/submissions', { headers: { 'X-API-Key': apiKey } })
+  assert(kres.ok, 'X-API-Key 可调用受保护接口（文档承诺与实际一致）', 'status=' + kres.status)
+  kres = await fetch(BASE + '/api/submissions', { headers: { 'X-API-Key': 'eqs_bogus' } })
+  assert(kres.status === 401, '错误的 API Key 被拒绝')
+  const keyList = (await req('GET', '/api/api-keys')).json.data
+  await req('DELETE', `/api/api-keys/${keyList[0].id}`)
+  kres = await fetch(BASE + '/api/submissions', { headers: { 'X-API-Key': apiKey } })
+  assert(kres.status === 401, '停用后 API Key 立即失效')
+
+  await req('PUT', `/api/forms/${formId}`, { settings: { needPassword: true, password: 'p@ss', whitelist: ['1.2.3.4'], notifyEmail: 'a@b.com', allowQuery: true } })
+  const pub = await (await fetch(BASE + `/api/public/forms/${formId}`)).json()
+  assert(pub.data.settings.password === undefined, '公开表单不下发访问密码')
+  assert(pub.data.settings.whitelist === undefined, '公开表单不下发白名单')
+  assert(pub.data.settings.notifyEmail === undefined, '公开表单不下发通知邮箱')
+  assert(pub.data.settings.needPassword === true, '公开表单仍保留「需要密码」开关')
+  await req('PUT', `/api/forms/${formId}`, { settings: { allowQuery: true } })
+
+  let anonUp = await fetch(BASE + '/api/upload?name=x.txt', { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: 'xx' })
+  assert(anonUp.status === 401, '匿名无表单上下文时不能上传（不做公共图床）')
+  anonUp = await fetch(BASE + `/api/upload?name=x.txt&formId=${formId}`, { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: 'xx' })
+  assert(anonUp.status === 201, '已发布表单的匿名作答可上传附件', 'status=' + anonUp.status)
+
+  console.log('\n[17] 文本导入括号题型识别')
+  r = await req('POST', '/api/forms', { title: '括号题型', schema: [] })
+  const bracketId = r.json.id
+  r = await req('POST', `/api/forms/${bracketId}/import-text`, {
+    text: [
+      '1. 简述事件循环（Event Loop）的作用 [简答]',
+      '2. 打分（1-5）[评分]',
+      '3. 请填写你的邮箱（工作邮箱）[邮箱]',
+      '4. 请写下你的建议（可选）[多行]'
+    ].join('\n')
+  })
+  const bs = r.json.schema
+  assert(bs.length === 4, '括号内含括号的题干不会被拆错', String(bs.length))
+  assert(bs[0].type === 'textarea' && bs[0].label === '简述事件循环（Event Loop）的作用', '题干内括号不干扰题型识别', JSON.stringify(bs[0]))
+  assert(bs[1].type === 'rate' && bs[1].label === '打分（1-5）', '题干尾部括号保留、题型正确', JSON.stringify(bs[1]))
+  assert(bs[2].type === 'email', '邮箱题型识别正确', bs[2].type)
+  assert(bs[3].type === 'textarea', '多行题型识别正确', bs[3].type)
+
+  console.log('\n[18] 前端静态资源')
   for (const p of ['/', '/js/main.js', '/css/app.css', '/assets/eqs-mark.svg', '/vendor/echarts.min.js']) {
     const res = await fetch(BASE + p)
     assert(res.ok, `静态资源可访问：${p}`)

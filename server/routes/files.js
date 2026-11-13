@@ -2,7 +2,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { get, all, run, now, DATA_DIR } from '../lib/db.js'
 import { readBody, sendJson, fail, send, clientIp } from '../lib/http.js'
-import { requireUser, requirePerm } from '../lib/auth.js'
+import { requireUser, requirePerm, currentUser } from '../lib/auth.js'
 import { upload, localPath, storageConfig, DRIVERS } from '../lib/storage.js'
 import { safeJson } from '../lib/forms.js'
 
@@ -39,7 +39,6 @@ export function parseMultipart(buf, boundary) {
 
 export default function register(r) {
   r.post('/api/upload', async (req, res) => {
-    const user = requireUser(req)
     const ct = String(req.headers['content-type'] || '')
     const buf = await readBody(req)
     let name = 'file'
@@ -65,6 +64,14 @@ export default function register(r) {
       name = url.searchParams.get('name') || 'file'
       mime = ct || mime
       formId = Number(url.searchParams.get('formId')) || 0
+    }
+    // 登录用户随意传；匿名只允许「已发布表单」的答卷附件，避免变成公共图床
+    const user = currentUser(req)
+    if (!user) {
+      if (!formId) fail(401, '请先登录')
+      const form = get('SELECT id, status FROM forms WHERE id = ? AND deleted_at IS NULL', formId)
+      if (!form) fail(404, '表单不存在')
+      if (form.status !== 'published') fail(403, '表单未发布，无法上传附件')
     }
     const maxMb = 100
     if (data.length > maxMb * 1024 * 1024) fail(413, `文件超过 ${maxMb}MB`)

@@ -49,9 +49,22 @@ export const ROLE_PERMS = {
   user: ['form:create', 'form:read', 'form:update', 'form:delete', 'data:read', 'data:write', 'bank:read', 'bank:write', 'report:read']
 }
 
+/** API Key 身份：文档承诺 X-API-Key 可调接口，这里真正兑现 */
+function apiKeyUser(req) {
+  const raw = req.headers['x-api-key'] || parseCookies(req).eqs_apikey || ''
+  const key = String(raw).trim()
+  if (!key) return null
+  const row = get('SELECT * FROM api_keys WHERE key = ? AND enabled = 1', key)
+  if (!row) return null
+  return {
+    id: 0, username: `apikey:${row.name}`, nickname: row.name || 'API Key',
+    role: 'admin', roleName: 'API Key', perms: ['*'], viaApiKey: true
+  }
+}
+
 export function currentUser(req) {
   const session = readSession(req)
-  if (!session?.uid) return null
+  if (!session?.uid) return apiKeyUser(req)
   const user = get('SELECT id, username, nickname, email, phone, avatar, role_id, dept_id, status FROM users WHERE id = ?', session.uid)
   if (!user || user.status !== 1) return null
   const role = get('SELECT * FROM roles WHERE id = ?', user.role_id)

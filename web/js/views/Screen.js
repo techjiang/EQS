@@ -24,7 +24,7 @@ export default {
       try {
         const r = await api.get('/api/forms?pageSize=200')
         forms.value = r.data
-        if (!formId.value && forms.value.length) formId.value = forms.value[0].id
+        if (!formId.value && forms.value.length) formId.value = (forms.value.find(f => (f.submission_count || 0) > 0) || forms.value[0]).id
         if (!formId.value) return
         const rep = await api.get(`/api/forms/${formId.value}/report`)
         data.value = rep.data

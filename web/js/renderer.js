@@ -82,7 +82,10 @@ export function renderControl(field, model, opts = {}) {
           h('input', {
             type: 'checkbox', checked, disabled: dis,
             onChange: e => {
-              const next = new Set(arr.map(String))
+              // 从 model 取当前值，而不是闭包里渲染时的快照：
+              // 连点几下时快照是旧的，会把前几项的选择覆盖掉
+              const cur = Array.isArray(model[field.id]) ? model[field.id] : []
+              const next = new Set(cur.map(String))
               if (e.target.checked) next.add(String(o.value)); else next.delete(String(o.value))
               set([...next])
             }
