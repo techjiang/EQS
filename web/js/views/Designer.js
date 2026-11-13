@@ -31,6 +31,7 @@ export default {
     const aiBusy = ref(false)
     const importOpen = ref(false)
     const importText = ref('')
+    const importTab = ref('text')
 
     const load = async () => {
       try {
@@ -157,6 +158,19 @@ export default {
         importOpen.value = false
         importText.value = ''
         ok(`已导入 ${r.added} 道题` + (r.droppedAnswers?.length ? `；${r.droppedAnswers.length} 道题的答案不在选项里，已清空待修正` : ''))
+      } catch (e) { err(e.message) }
+    }
+
+    /** Excel 导入：解析放在后端，前端只负责把文件递过去 */
+    const importXlsx = async (file) => {
+      if (!file) return
+      try {
+        const r = await api.uploadFile(`/api/forms/${id}/import-xlsx`, file)
+        form.value.schema = r.schema
+        importOpen.value = false
+        const skipped = r.skipped?.length ? `，跳过 ${r.skipped.length} 行` : ''
+        const unknown = r.unknownColumns?.length ? `；未识别的列已忽略：${r.unknownColumns.join('、')}` : ''
+        ok(`已从 Excel 导入 ${r.added} 道题${skipped}${unknown}` + (r.droppedAnswers?.length ? `；${r.droppedAnswers.length} 道题的答案不在选项里，已清空` : ''))
       } catch (e) { err(e.message) }
     }
 
@@ -446,7 +460,7 @@ export default {
           ]),
           h('div', { class: 'flex', style: 'gap:6px;margin-bottom:10px' }, [
             h('button', { class: 'btn sm', style: 'flex:1', onClick: () => aiOpen.value = true }, '🤖 AI'),
-            h('button', { class: 'btn sm', style: 'flex:1', onClick: () => importOpen.value = true }, '📥 导入')
+            h('button', { class: 'btn sm', style: 'flex:1', onClick: () => { importTab.value = 'text'; importOpen.value = true } }, '📥 导入')
           ]),
           FIELD_GROUPS.map(g => [
             h('h4', {}, g.name),
@@ -542,22 +556,39 @@ export default {
               h('button', { class: 'btn primary', disabled: aiBusy.value, onClick: doAi }, aiBusy.value ? '生成中…' : '生成题目')
             ])
           ])) : null,
-        // 文本导入弹窗
+        // 导入弹窗（文本 / Excel）
         importOpen.value ? h('div', { class: 'modal-mask', onClick: e => { if (e.target.classList.contains('modal-mask')) importOpen.value = false } },
           h('div', { class: 'modal wide' }, [
-            h('div', { class: 'modal-h' }, [h('h3', {}, '批量文本导入'), h('button', { class: 'btn ghost sm', onClick: () => importOpen.value = false }, '关闭')]),
+            h('div', { class: 'modal-h' }, [h('h3', {}, '批量导入题目'), h('button', { class: 'btn ghost sm', onClick: () => importOpen.value = false }, '关闭')]),
             h('div', { class: 'modal-b' }, [
-              h('div', { class: 'hint mb' }, '格式：每题以「1.」「一、」或「- 」开头，方括号内写题型（单选/多选/填空/日期/评分…），选项以「A.」「①」开头，可写「答案：A」「分值：5」「解析：…」；行首写「!」表示必答。'),
-              h('textarea', {
-                class: 'textarea mono', style: 'min-height:240px', value: importText.value,
-                placeholder: '1. 你的性别 [单选]\nA. 男\nB. 女\n答案：A\n\n2. 请描述你的建议 [多行]',
-                onInput: e => importText.value = e.target.value
-              })
+              h('div', { class: 'flex', style: 'gap:6px;margin-bottom:12px' }, [
+                h('button', { class: ['btn', 'sm', importTab.value === 'text' ? 'primary' : ''], onClick: () => importTab.value = 'text' }, '文本粘贴'),
+                h('button', { class: ['btn', 'sm', importTab.value === 'excel' ? 'primary' : ''], onClick: () => importTab.value = 'excel' }, 'Excel 表格')
+              ]),
+              importTab.value === 'text' ? [
+                h('div', { class: 'hint mb' }, '格式：每题以「1.」「一、」或「- 」开头，方括号内写题型（单选/多选/填空/日期/评分…），选项以「A.」「①」开头，可写「答案：A」「分值：5」「解析：…」；行首写「!」表示必答。'),
+                h('textarea', {
+                  class: 'textarea mono', style: 'min-height:240px', value: importText.value,
+                  placeholder: '1. 你的性别 [单选]\nA. 男\nB. 女\n答案：A\n\n2. 请描述你的建议 [多行]',
+                  onInput: e => importText.value = e.target.value
+                })
+              ] : [
+                h('div', { class: 'hint mb' }, '表格列依次是「题型 / 题干 / 选项 / 答案 / 分值 / 解析」，有表头就按列名认，顺序无所谓。选项在单元格内一行一个，答案写 A、A,C 或 正确。'),
+                h('div', { class: 'flex', style: 'gap:8px;align-items:center;flex-wrap:wrap' }, [
+                  h('label', { class: 'btn primary' }, [
+                    '选择 .xlsx 文件',
+                    h('input', { type: 'file', accept: '.xlsx', class: 'hide', onChange: e => { importXlsx(e.target.files?.[0]); e.target.value = '' } })
+                  ]),
+                  h('button', { class: 'btn', onClick: () => api.download('/api/banks/template.xlsx', 'EQS 题库导入模板.xlsx').then(() => ok('模板已下载')).catch(e => err(e.message)) }, '下载导入模板')
+                ])
+              ]
             ]),
-            h('div', { class: 'modal-f' }, [
-              h('button', { class: 'btn', onClick: () => importOpen.value = false }, '取消'),
-              h('button', { class: 'btn primary', onClick: doImport }, '导入')
-            ])
+            h('div', { class: 'modal-f' }, importTab.value === 'text'
+              ? [
+                  h('button', { class: 'btn', onClick: () => importOpen.value = false }, '取消'),
+                  h('button', { class: 'btn primary', onClick: doImport }, '导入')
+                ]
+              : [h('button', { class: 'btn', onClick: () => importOpen.value = false }, '关闭')])
           ])) : null
       ])
     }

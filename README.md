@@ -30,7 +30,7 @@
 ## 功能特点
 
 **问卷与表单**
-- 27+ 自定义组件，拖拽式可视化设计，支持文本批量导入题目
+- 27+ 自定义组件，拖拽式可视化设计，支持文本 / Excel 批量导入题目
 - 单行/多行文本、日期、下拉、单选、多选、文件上传、排序、级联、轮播、一键定位、手机号校验、矩阵量表、子表单、手写签名、评分、NPS、滑动条、分割线、富文本等
 - 题目显隐逻辑（等于/不等于/包含/大小比较/为空），支持多条件组合
 - 表单外观配置：头图、背景图、背景色、按钮文字与颜色
@@ -42,12 +42,12 @@
 - 记录微信昵称与头像（公众号网页授权）
 
 **数据管理**
-- 答卷新增、编辑、批量删除、筛选、标记、导入、导出（CSV / JSON）、打印
+- 答卷新增、编辑、批量删除、筛选、标记、导入、导出（Excel / CSV / JSON）、打印
 - 附件打包下载（内置 ZIP 打包，无需外部工具）
 - 实时统计报表：柱状图 / 折线图 / 饼图，一键导出 PNG
 
 **考试与刷题**
-- 题库管理、批量导入、智能组卷、随机抽题、题目复用
+- 题库管理、Excel 导入导出（下载模板 → 填表 → 导回，形成闭环）、智能组卷、随机抽题、题目复用
 - 多题库混合组卷：跨题库轮转抽题，一张卷子覆盖多个知识域，比例自动均摊
 - 正确答案、分值、答案解析、自动评分、及格判定
 - 主观题人工批阅：逐题给分、满分/0 分快捷操作、批阅备注，保存即重算总分与及格状态
@@ -176,6 +176,9 @@ bash scripts/start.sh                        # 启动即完成迁移
 | `POST` | `/api/forms` | 创建表单 |
 | `PUT` | `/api/forms/:id` | 更新表单 |
 | `POST` | `/api/forms/:id/import-text` | 文本批量导入题目，返回 `{added, droppedAnswers}` |
+| `POST` | `/api/forms/:id/import-xlsx` | Excel 批量导入题目（multipart，字段 `file`） |
+| `GET` | `/api/banks/:id/export.xlsx` | 题库导出 Excel；`/api/banks/template.xlsx` 取导入模板 |
+| `GET` | `/api/forms/:id/submissions.xlsx` | 导出全部答卷（按筛选条件，不受分页影响） |
 | `GET` | `/api/public/forms/:id` | 公开读取表单（不含答案） |
 | `POST` | `/api/public/forms/:id/submit` | 提交答卷 |
 | `GET` | `/api/forms/:id/report` | 报表统计 |
@@ -204,7 +207,7 @@ bash scripts/start.sh                        # 启动即完成迁移
 
 ```bash
 node --watch server/index.js   # 热重启
-node tests/smoke.test.js       # 冒烟测试（147 项）
+node tests/smoke.test.js       # 冒烟测试（275 项）
 ```
 
 ## 项目结构

@@ -29,6 +29,7 @@
 | DELETE | `/api/forms/:id/purge` | 彻底删除（须先移入回收中心，连带清理答卷与附件文件） |
 | POST | `/api/forms/:id/duplicate` | 复制 |
 | POST | `/api/forms/:id/import-text` | `{text}` 文本批量导入题目，返回 `{added, schema}` |
+| POST | `/api/forms/:id/import-xlsx` | multipart 上传 `file`（.xlsx）批量导入题目，返回 `{added, skipped, droppedAnswers, unknownColumns, schema}` |
 | GET | `/api/forms/:id/report` | 报表统计数据 |
 
 ## 回收中心
@@ -153,6 +154,7 @@ POST /api/banks/paper
 | POST | `/api/submissions/batch-delete` | `{ids: []}` |
 | POST | `/api/forms/:id/import` | 导入 `{items: [...]}` |
 | GET | `/api/forms/:id/attachments.zip` | 打包下载附件 |
+| GET | `/api/forms/:id/submissions.xlsx?keyword=&marked=` | 导出当前筛选条件下的全部答卷为 Excel（不受分页影响） |
 
 ## 题库与刷题
 
@@ -163,6 +165,9 @@ POST /api/banks/paper
 | GET/POST | `/api/banks/:id/questions` | 题目列表 / 新增 |
 | PUT/DELETE | `/api/questions/:id` | 更新 / 删除题目 |
 | POST | `/api/banks/:id/import-text` | 文本批量导入，返回 `{imported, droppedAnswers}`（答案指向不存在的选项会被剔除并列在这里） |
+| GET | `/api/banks/template.xlsx` | 下载题库导入模板（1 行表头 + 4 行示例） |
+| GET | `/api/banks/:id/export.xlsx` | 题库导出为 Excel，改完可直接再导回来 |
+| POST | `/api/banks/:id/import-xlsx` | multipart 上传 `file`（.xlsx）批量导入，返回 `{imported, skipped, droppedAnswers, unknownColumns}` |
 | POST | `/api/banks/:id/paper` | 智能组卷 `{title, count, duration}` |
 | GET | `/api/banks/:id/practice?mode=sequence\|random\|wrong\|favorite` | 拉取练习题目（不含答案） |
 | POST | `/api/banks/:id/practice/answer` | 提交作答 `{questionId, value, progress?, note?, favorite?}` |
@@ -228,3 +233,22 @@ POST /api/banks/paper
 ```
 
 校验签名：`sha256=` + `HMAC_SHA256(secret, rawBody)`，放在 `X-EQS-Signature` 头。
+
+## Excel 表格格式
+
+导入 / 导出共用一张表，列可以按表头名认（顺序无所谓），也可以不带表头按下面的顺序读：
+
+| 列 | 表头别名 | 说明 |
+| --- | --- | --- |
+| 题型 | 类型 / type | 单选、多选、判断、填空、简答、评分、量表、日期、数字…不写则按内容推断 |
+| 题干 | 题目 / title | 必填，为空的行会被跳过 |
+| 选项 | options | 单元格内一行一个（`A.苹果` 换行 `B.香蕉`），也可用 `\|` 分隔；序号前缀会被去掉 |
+| 答案 | 正确答案 / answer | `A`、`A,C`、`正确`；越界字母会被剔除并在 `droppedAnswers` 里回报 |
+| 分值 | 分数 / score | 不填按 0，0 分表示不计分（不是「没填」） |
+| 解析 | analysis | 判题后的解析文案 |
+
+`skipped` 会逐行给出跳过原因（题干为空、选择题选项不足两个）；`unknownColumns` 列出表头里
+既不是已知字段又有内容的列——静默忽略会让人以为那列导进去了。
+
+导出的 xlsx 是标准 OOXML（store 打包，Excel / WPS / Numbers / LibreOffice 均可打开），
+读取端同时支持 sharedStrings 与 inlineStr、以及 store / deflate 两种压缩方式。

@@ -3,6 +3,8 @@ import { readJson, fail, sendJson } from '../lib/http.js'
 import { requireUser, requirePerm, can } from '../lib/auth.js'
 import { normalizeField, paginate, safeJson, gradeSubmission, coerceAnswerToField } from '../lib/forms.js'
 import { parseTextToFields } from './forms.js'
+import { readXlsxUpload } from './files.js'
+import { parseXlsx, rowsToFields, questionsXlsx, templateXlsx } from '../lib/sheet.js'
 
 const parseQ = q => ({ ...q, options: safeJson(q.options, []), answer: safeJson(q.answer, []) })
 
@@ -199,6 +201,58 @@ export default function register(r) {
         bank.id, f.type, f.label, JSON.stringify(f.options), JSON.stringify(f.answer), f.analysis, f.score ?? 5, now())
     }
     sendJson(res, 200, { ok: true, imported: fields.length, droppedAnswers: dropped })
+  })
+
+  /** 题库导入模板：给用户一张照着改的表，比让人对着文档猜列名现实得多 */
+  r.get('/api/banks/template.xlsx', async (req, res) => {
+    requireUser(req)
+    const buf = templateXlsx()
+    res.writeHead(200, {
+      'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      'Content-Disposition': `attachment; filename="eqs-bank-template.xlsx"; filename*=UTF-8''${encodeURIComponent('EQS 题库导入模板.xlsx')}`,
+      'Content-Length': buf.length
+    })
+    res.end(buf)
+  })
+
+  /** 题库导出为 xlsx：改完可以直接再导回来，形成「导出→批量改→导入」的闭环 */
+  r.get('/api/banks/:id/export.xlsx', async (req, res, { params }) => {
+    const user = requireUser(req)
+    const bank = readableBank(user, params.id)
+    if (!bank) fail(404, '题库不存在')
+    const questions = all('SELECT * FROM questions WHERE bank_id = ? AND deleted_at IS NULL ORDER BY id ASC', bank.id).map(parseQ)
+    const buf = questionsXlsx(questions, bank.name)
+    res.writeHead(200, {
+      'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      'Content-Disposition': `attachment; filename="bank-${bank.id}.xlsx"; filename*=UTF-8''${encodeURIComponent(bank.name + '.xlsx')}`,
+      'Content-Length': buf.length
+    })
+    res.end(buf)
+  })
+
+  /** Excel 批量导入题目 */
+  r.post('/api/banks/:id/import-xlsx', async (req, res, { params }) => {
+    const user = requirePerm(req, 'bank:write')
+    const bank = get('SELECT * FROM banks WHERE id = ? AND deleted_at IS NULL', Number(params.id))
+    if (!bank) fail(404, '题库不存在')
+    const buf = await readXlsxUpload(req)
+    if (!buf?.length) fail(400, '请上传 xlsx 文件')
+    const rows = parseXlsx(buf)
+    if (!rows) fail(400, '无法读取该文件，请上传 .xlsx 格式的表格（.xls / .csv 请先另存为 xlsx）')
+    if (!rows.length) fail(400, '表格是空的')
+    const { fields, skipped, unknownColumns } = rowsToFields(rows)
+    if (!fields.length) fail(400, '未识别到题目：表格需要有「题干」列，或按 题型/题干/选项/答案/分值/解析 的顺序排')
+    let imported = 0
+    const droppedAnswers = []
+    for (const f of fields) {
+      if (f.dropped?.length) droppedAnswers.push(`${f.label}（${f.dropped.join('、')}）`)
+      delete f.dropped
+      run('INSERT INTO questions(bank_id, type, title, options, answer, analysis, score, created_at) VALUES(?,?,?,?,?,?,?,?)',
+        bank.id, f.type, f.label, JSON.stringify(f.options), JSON.stringify(f.answer), f.analysis, f.score ?? 0, now())
+      imported++
+    }
+    log(user, 'Excel 导入题目', `${bank.name} #${bank.id} → ${imported} 道`)
+    sendJson(res, 200, { ok: true, imported, skipped, droppedAnswers, unknownColumns })
   })
 
   /** 组卷：按题库随机抽题生成考试 */

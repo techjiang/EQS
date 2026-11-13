@@ -28,6 +28,7 @@ function findSubmission(formId, raw) {
 const flatAnswer = v => (Array.isArray(v) ? v.map(String) : v === undefined || v === null || v === '' ? [] : [String(v)])
 const sameSet = (a, b) => a.length === b.length && [...a].sort().every((x, i) => x === [...b].sort()[i])
 import { notifySubmission, dispatchWebhooks } from '../lib/notify.js'
+import { submissionsXlsx } from '../lib/sheet.js'
 
 function fingerprint(req, extra = {}) {
   return {
@@ -502,6 +503,31 @@ export default function register(r) {
     const rows = all('SELECT * FROM submissions WHERE form_id = ? AND deleted_at IS NULL ORDER BY id DESC', form.id)
     const stats = computeStats(form, rows.map(submissionData))
     sendJson(res, 200, { ok: true, data: { form: { id: form.id, title: form.title, kind: form.kind }, ...stats } })
+  })
+
+  /**
+   * 导出答卷为 xlsx（当前筛选条件下的全部，不只是当前页）。
+   * 之前只有前端拿当前页拼 CSV：翻到第 2 页再导出，导出的还是第 1 页。
+   */
+  r.get('/api/forms/:id/submissions.xlsx', async (req, res, { params }) => {
+    const user = requirePerm(req, 'data:read')
+    const form = pickForm(params.id)
+    if (!form) fail(404, '表单不存在')
+    if (!can(user, '*') && form.created_by !== user.id) fail(403, '无权导出')
+    const url = new URL(req.url, 'http://x')
+    const where = ['form_id = ?', 'deleted_at IS NULL']
+    const args = [form.id]
+    if (url.searchParams.get('keyword')) { where.push('data LIKE ?'); args.push(`%${url.searchParams.get('keyword')}%`) }
+    if (url.searchParams.get('marked') === '1') where.push('marked = 1')
+    const rows = all(`SELECT * FROM submissions WHERE ${where.join(' AND ')} ORDER BY id DESC`, ...args).map(submissionData)
+    const buf = submissionsXlsx(form, rows)
+    log(user, '导出答卷 Excel', `${form.title} #${form.id} → ${rows.length} 份`)
+    res.writeHead(200, {
+      'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      'Content-Disposition': `attachment; filename="submissions-${form.id}.xlsx"; filename*=UTF-8''${encodeURIComponent((form.title || '答卷') + '-答卷.xlsx')}`,
+      'Content-Length': buf.length
+    })
+    res.end(buf)
   })
 
   /** 导入答卷（JSON 数组） */

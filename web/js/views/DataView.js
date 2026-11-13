@@ -143,6 +143,18 @@ export default {
       return false
     }
 
+    /** 服务端导出：当前筛选条件下的全部答卷，不受分页影响 */
+    const exportXlsx = async () => {
+      if (!needForm()) return
+      try {
+        const qs = new URLSearchParams()
+        if (keyword.value) qs.set('keyword', keyword.value)
+        if (marked.value) qs.set('marked', '1')
+        await api.download(`/api/forms/${formId.value}/submissions.xlsx?${qs}`, `${form.value.title}-答卷.xlsx`)
+        ok('已导出 Excel（当前筛选条件下的全部答卷）')
+      } catch (e) { err(e.message) }
+    }
+
     const exportCsv = () => {
       if (!needForm()) return
       const schema = form.value.schema.filter(f => !['divider', 'richtext', 'html', 'image'].includes(f.type))
@@ -286,7 +298,8 @@ export default {
         h('div', {}, [h('h1', {}, '答卷数据'), h('div', { class: 'sub' }, '新增、编辑、筛选、导入导出、打印与附件打包')]),
         h('div', { class: 'flex wrap' }, [
           h('button', { class: 'btn sm', onClick: printRows }, [Icon('printer', { style: 'width:14px;height:14px' }), '打印']),
-          h('button', { class: 'btn sm', onClick: exportCsv }, [Icon('download', { style: 'width:14px;height:14px' }), 'CSV']),
+          h('button', { class: 'btn sm', onClick: exportXlsx }, [Icon('download', { style: 'width:14px;height:14px' }), 'Excel']),
+          h('button', { class: 'btn sm', onClick: exportCsv }, 'CSV（当前页）'),
           h('button', { class: 'btn sm', onClick: exportJson }, 'JSON'),
           h('label', { class: 'btn sm' }, ['导入', h('input', {
             type: 'file', accept: '.json', class: 'hide',

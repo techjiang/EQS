@@ -5,6 +5,7 @@ import { readBody, sendJson, fail, send, clientIp } from '../lib/http.js'
 import { requireUser, requirePerm, currentUser } from '../lib/auth.js'
 import { upload, localPath, storageConfig, DRIVERS } from '../lib/storage.js'
 import { safeJson } from '../lib/forms.js'
+import { buildZip, extractZip } from '../lib/zip.js'
 
 /** multipart/form-data 解析（够用即可） */
 /**
@@ -48,6 +49,24 @@ export function parseMultipart(buf, boundary) {
   void marker
   return parts
 }
+
+/**
+ * 读取上传的 xlsx（multipart 或裸二进制）。
+ * 表格类导入都走这里：文件字段名不固定，多段里挑第一个有文件名的。
+ */
+export async function readXlsxUpload(req) {
+  const ct = String(req.headers['content-type'] || '')
+  const buf = await readBody(req)
+  if (!ct.includes('multipart/form-data')) return buf
+  const boundary = /boundary=(?:"([^"]+)"|([^;]+))/.exec(ct)
+  if (!boundary) fail(400, '缺少 boundary')
+  const parts = parseMultipart(buf, boundary[1] || boundary[2])
+  const file = parts.find(p => p.filename)
+  if (!file) fail(400, '未找到上传文件')
+  return file.data
+}
+
+export { buildZip, extractZip }
 
 export default function register(r) {
   r.post('/api/upload', async (req, res) => {
@@ -177,92 +196,6 @@ export default function register(r) {
     })
     res.end(zip)
   })
-}
-
-/** 极简 ZIP 打包（deflate store），单文件上限内可用 */
-export function buildZip(entries) {
-  const chunks = []
-  const central = []
-  let offset = 0
-  const crcTable = (() => {
-    const t = new Uint32Array(256)
-    for (let i = 0; i < 256; i++) {
-      let c = i
-      for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1
-      t[i] = c >>> 0
-    }
-    return t
-  })()
-  const crc32 = buf => {
-    let c = 0xffffffff
-    for (let i = 0; i < buf.length; i++) c = crcTable[(c ^ buf[i]) & 0xff] ^ (c >>> 8)
-    return (c ^ 0xffffffff) >>> 0
-  }
-  for (const e of entries) {
-    const nameBuf = Buffer.from(e.name, 'utf8')
-    const data = Buffer.isBuffer(e.data) ? e.data : Buffer.from(String(e.data))
-    const crc = crc32(data)
-    const local = Buffer.alloc(30)
-    local.writeUInt32LE(0x04034b50, 0)
-    local.writeUInt16LE(20, 4)
-    local.writeUInt16LE(0x0800, 6)
-    local.writeUInt16LE(0, 8)
-    local.writeUInt16LE(0, 10)
-    local.writeUInt16LE(0, 12)
-    local.writeUInt32LE(crc, 14)
-    local.writeUInt32LE(data.length, 18)
-    local.writeUInt32LE(data.length, 22)
-    local.writeUInt16LE(nameBuf.length, 26)
-    local.writeUInt16LE(0, 28)
-    chunks.push(local, nameBuf, data)
-    const cd = Buffer.alloc(46)
-    cd.writeUInt32LE(0x02014b50, 0)
-    cd.writeUInt16LE(20, 4)
-    cd.writeUInt16LE(20, 6)
-    cd.writeUInt16LE(0x0800, 8)
-    cd.writeUInt32LE(crc, 16)
-    cd.writeUInt32LE(data.length, 20)
-    cd.writeUInt32LE(data.length, 24)
-    cd.writeUInt16LE(nameBuf.length, 28)
-    cd.writeUInt32LE(offset, 42)
-    central.push(cd, nameBuf)
-    offset += local.length + nameBuf.length + data.length
-  }
-  const centralBuf = Buffer.concat(central)
-  const end = Buffer.alloc(22)
-  end.writeUInt32LE(0x06054b50, 0)
-  end.writeUInt16LE(entries.length, 8)
-  end.writeUInt16LE(entries.length, 10)
-  end.writeUInt32LE(centralBuf.length, 12)
-  end.writeUInt32LE(offset, 16)
-  return Buffer.concat([...chunks, centralBuf, end])
-}
-
-/** 极简 zip 解包（仅 store 模式，配合自带备份包） */
-export function extractZip(buf, destDir) {
-  let off = 0
-  const base = path.resolve(destDir)
-  while (off < buf.length - 4) {
-    if (buf.readUInt32LE(off) !== 0x04034b50) break
-    const method = buf.readUInt16LE(off + 8)
-    const flags = buf.readUInt16LE(off + 6)
-    const size = buf.readUInt32LE(off + 18)
-    const nameLen = buf.readUInt16LE(off + 26)
-    const extraLen = buf.readUInt16LE(off + 28)
-    const name = buf.slice(off + 30, off + 30 + nameLen).toString('utf8')
-    const start = off + 30 + nameLen + extraLen
-    const data = buf.slice(start, start + size)
-    const target = path.resolve(base, name)
-    if (target.startsWith(base) && method === 0) {
-      fs.mkdirSync(path.dirname(target), { recursive: true })
-      // ZIP 的 general purpose bit 3：大小写在数据之后的描述符里，这里 local header 的长度是 0，
-      // 直接按 0 长度写会把文件内容吞掉。备份包由我们自己生成（不置该位），遇到外部包直接拒绝并说明。
-      if (flags & 0x0008) return { ok: false, reason: '备份包使用了流式压缩格式，请用 EQS 导出的备份文件' }
-      fs.writeFileSync(target, data)
-    }
-    off = start + size
-  }
-  return { ok: true }
 }
 
 /**

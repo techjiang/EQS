@@ -1114,7 +1114,166 @@ try {
     cookie = adminCookie
   }
 
-  console.log('\n[38] 前端静态资源')
+  console.log('\n[38] Excel 导入导出')
+  {
+    // 模板能下下来，且能被自己的解析器读回——这是「导出→改→导入」闭环的前提
+    let res = await fetch(BASE + '/api/banks/template.xlsx', { headers: { Cookie: cookie } })
+    const tplBuf = Buffer.from(await res.arrayBuffer())
+    assert(res.ok && tplBuf.length > 1000, '题库导入模板可下载')
+    const [readXlsx, sheet, zip] = await Promise.all([
+      import('../server/lib/xlsx.js'), import('../server/lib/sheet.js'), import('../server/lib/zip.js')
+    ])
+    const tplRows = readXlsx.readXlsx(tplBuf)
+    assert(Array.isArray(tplRows) && tplRows[0]?.[0] === '题型', '模板的表头是「题型」开头的六列', JSON.stringify(tplRows?.[0]))
+    assert(tplRows.length === 5, '模板含 1 行表头 + 4 行示例', String(tplRows.length))
+
+    // 导入：模板原样传回题库
+    r = await req('POST', '/api/banks', { name: 'Excel 导入题库' })
+    const bankId = r.json.id
+    const fd = new FormData()
+    fd.append('file', new Blob([tplBuf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }), 'tpl.xlsx')
+    res = await fetch(BASE + `/api/banks/${bankId}/import-xlsx`, { method: 'POST', headers: { Cookie: cookie }, body: fd })
+    const imported = await res.json()
+    assert(res.ok && imported.imported === 4, 'Excel 导入 4 道题', JSON.stringify(imported))
+    r = await req('GET', `/api/banks/${bankId}/questions`)
+    const qs = r.json.data
+    assert(qs[0].type === 'radio' && qs[0].answer[0] === 'SQLite 内嵌', '单选的字母答案映射成选项值', JSON.stringify([qs[0].type, qs[0].answer]))
+    assert(qs[1].type === 'checkbox' && qs[1].answer.length === 3, '多选的 A,B,C 落成三个选项值', JSON.stringify(qs[1].answer))
+    assert(qs[2].options.map(o => o.value).join('/') === '正确/错误', '判断题自动补上正确/错误两个选项')
+    assert(qs[2].answer[0] === '正确', '判断题的「正确」落成选项值', JSON.stringify(qs[2].answer))
+    assert(qs[3].type === 'textarea' && qs[3].answer.length === 0, '简答题没有标准答案（进人工批阅）', JSON.stringify([qs[3].type, qs[3].answer]))
+    assert(qs[0].score === 5 && qs[3].score === 10, '分值按行落库', JSON.stringify([qs[0].score, qs[3].score]))
+
+    // 题干里没有「判断」二字时，「答案：对」同样要落到「正确」选项上
+    {
+      const xlsxMod = await import('../server/lib/xlsx.js')
+      const judgeXlsx = xlsxMod.buildXlsx('题目', [
+        ['题型', '题干', '选项', '答案', '分值'],
+        ['判断', 'WebSocket 是建立在 TCP 之上的。', '', '对', 5],
+        ['判断', '浏览器里 localStorage 没有容量上限。', '', '错误', 5]
+      ])
+      const fdj = new FormData()
+      fdj.append('file', new Blob([judgeXlsx]), 'judge.xlsx')
+      const rj = await fetch(BASE + `/api/banks/${bankId}/import-xlsx`, { method: 'POST', headers: { Cookie: cookie }, body: fdj })
+      const rjJson = await rj.json()
+      assert(rj.ok && !rjJson.droppedAnswers?.length, '题干不含「判断」时答案不被剔除', JSON.stringify(rjJson))
+      const back = await req('GET', `/api/banks/${bankId}/questions?keyword=WebSocket`)
+      assert(back.json.data?.[0]?.answer?.[0] === '正确', '「答案：对」映射成「正确」选项值', JSON.stringify(back.json.data?.[0]?.answer))
+      const back2 = await req('GET', `/api/banks/${bankId}/questions?keyword=localStorage`)
+      assert(back2.json.data?.[0]?.answer?.[0] === '错误', '「答案：错误」映射成「错误」选项值', JSON.stringify(back2.json.data?.[0]?.answer))
+    }
+
+    // 导出后能读回同样的题目
+    res = await fetch(BASE + `/api/banks/${bankId}/export.xlsx`, { headers: { Cookie: cookie } })
+    const exportBuf = Buffer.from(await res.arrayBuffer())
+    assert(res.ok && exportBuf.length > 1000, '题库可导出 xlsx')
+    const exported = readXlsx.readXlsx(exportBuf)
+    // 导出时题库里已经有了后面补的判断题，所以拿当前题目数比，而不是导入那一刻的份数
+    const nowCount = (await req('GET', `/api/banks/${bankId}/questions`)).json.data.length
+    assert(exported[0][1] === '题干' && exported.length === nowCount + 1, '导出的行数等于题库题目数 + 1 行表头', JSON.stringify([exported.length, nowCount]))
+    assert(exported[1][1] === qs[0].title, '导出的第一道题就是题库第一题', JSON.stringify(exported?.[1]?.slice(0, 2)))
+
+    // 表头顺序打乱 / 用别名，也要认得出来
+    const xlsx = (await import('../server/lib/xlsx.js')).buildXlsx
+    const odd = xlsx('题目', [
+      ['答案', '题目', '分', '选项', '类型'],
+      ['B', '下列哪个是 HTTP 状态码？', 5, 'A.404\nB.OK\nC.GET', '单选']
+    ])
+    const fd2 = new FormData()
+    fd2.append('file', new Blob([odd]), 'odd.xlsx')
+    res = await fetch(BASE + `/api/banks/${bankId}/import-xlsx`, { method: 'POST', headers: { Cookie: cookie }, body: fd2 })
+    const oddRes = await res.json()
+    assert(res.ok && oddRes.imported === 1, '列顺序打乱 + 别名表头也能导入', JSON.stringify(oddRes))
+
+    // 坏行要报出来，而不是静默少几道题
+    const bad = xlsx('题目', [
+      ['题型', '题干', '选项', '答案', '分值', '备注'],
+      ['单选', '', 'A.x\nB.y', 'A', 5, '空题干'],
+      ['单选', '只有一个选项的题', 'A.x', 'A', 5, ''],
+      ['单选', '答案越界的题', 'A.x\nB.y', 'D', 5, ''],
+      ['单选题', '备注列不该进题目', 'A.x\nB.y', 'A', 5, '忽略我']
+    ])
+    const fd3 = new FormData()
+    fd3.append('file', new Blob([bad]), 'bad.xlsx')
+    res = await fetch(BASE + `/api/banks/${bankId}/import-xlsx`, { method: 'POST', headers: { Cookie: cookie }, body: fd3 })
+    const badRes = await res.json()
+    // 4 行里 2 行是坏的（空题干 / 选项不足），剩下 2 行要照常落库
+    assert(res.ok && badRes.imported === 2, '坏行被跳过，好行照常导入', JSON.stringify([badRes.imported, badRes.skipped]))
+    assert((badRes.skipped || []).length === 2, '两道坏行各自给出原因', JSON.stringify(badRes.skipped))
+    assert((badRes.droppedAnswers || []).length === 1, '越界答案被剔除并回报', JSON.stringify(badRes.droppedAnswers))
+    assert((badRes.unknownColumns || []).includes('备注'), '未识别的列被明确告知而不是静默忽略', JSON.stringify(badRes.unknownColumns))
+
+    // 非 xlsx 文件：给人话，不要静默 500
+    const fd4 = new FormData()
+    fd4.append('file', new Blob([Buffer.from('这不是表格')]), 'x.txt')
+    res = await fetch(BASE + `/api/banks/${bankId}/import-xlsx`, { method: 'POST', headers: { Cookie: cookie }, body: fd4 })
+    assert(res.status === 400 && /xlsx/.test((await res.json()).message), '上传非 xlsx 文件时提示改用 xlsx', String(res.status))
+
+    await req('DELETE', `/api/banks/${bankId}`)
+    await req('DELETE', `/api/banks/${bankId}/purge`)
+  }
+
+  console.log('\n[39] 答卷导出 Excel')
+  {
+    r = await req('POST', '/api/forms', {
+      title: 'Excel 导出探针', kind: 'exam', status: 'published',
+      schema: [
+        { type: 'radio', label: '单选题', options: ['甲', '乙'], answer: ['甲'], score: 5 },
+        { type: 'checkbox', label: '多选题', options: ['A', 'B'], answer: ['A'], score: 5 },
+        { type: 'textarea', label: '简答题', score: 10 }
+      ],
+      settings: { passPercent: 60 }
+    })
+    const formId = r.json.id
+    const sch = r.json.data.schema
+    const publicForm = await (await fetch(BASE + `/api/public/forms/${formId}`)).json()
+    await fetch(BASE + `/api/public/forms/${formId}/submit`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ data: { [sch[0].id]: '甲', [sch[1].id]: ['A'], [sch[2].id]: '我的答案' } })
+    })
+    const res = await fetch(BASE + `/api/forms/${formId}/submissions.xlsx`, { headers: { Cookie: cookie } })
+    const buf = Buffer.from(await res.arrayBuffer())
+    assert(res.ok && buf.length > 1000, '答卷可导出 xlsx')
+    assert(/filename\*=UTF-8''/.test(res.headers.get('content-disposition') || ''), '中文文件名按 RFC 5987 编码')
+    const { readXlsx } = await import('../server/lib/xlsx.js')
+    const rows = readXlsx(buf)
+    assert(rows[0][0] === '答卷编号' && rows[0].includes('单选题'), '表头含答卷编号与题目标题', JSON.stringify(rows[0]))
+    assert(rows.length === 2 && String(rows[1][1]).length >= 10, '数据行带提交时间与作答', JSON.stringify(rows[1]?.slice(0, 3)))
+    assert(rows[1].includes('我的答案'), '文本作答原样导出')
+    assert(rows[1].includes('待批阅'), '主观题未批阅时标注待批阅', String(rows[1][rows[1].length - 1]))
+  }
+
+  console.log('\n[40] ZIP 读写：deflate 包也能解')
+  {
+    const { buildZip, readZipEntries } = await import('../server/lib/zip.js')
+    const plain = buildZip([{ name: 'a.txt', data: 'hello' }])
+    assert(readZipEntries(plain)?.[0]?.data?.toString() === 'hello', 'store 模式的包可读回')
+    // Python 产出的 deflate 包（模拟外部工具打的备份）
+    const zlib = await import('node:zlib')
+    const payload = Buffer.from('deflated-content')
+    const comp = zlib.deflateRawSync(payload)
+    // 手工拼一个 method=8 的条目，验证解包不限 store
+    const crc = 0
+    const name = Buffer.from('d.txt')
+    const local = Buffer.alloc(30)
+    local.writeUInt32LE(0x04034b50, 0); local.writeUInt16LE(20, 4); local.writeUInt16LE(8, 8)
+    local.writeUInt32LE(crc, 14); local.writeUInt32LE(comp.length, 18); local.writeUInt32LE(payload.length, 22)
+    local.writeUInt16LE(name.length, 26)
+    const cd = Buffer.alloc(46)
+    cd.writeUInt32LE(0x02014b50, 0); cd.writeUInt16LE(20, 4); cd.writeUInt16LE(20, 6); cd.writeUInt16LE(8, 10)
+    cd.writeUInt32LE(comp.length, 20); cd.writeUInt32LE(payload.length, 24)
+    cd.writeUInt16LE(name.length, 28)
+    const body = Buffer.concat([local, name, comp])
+    cd.writeUInt32LE(0, 42)
+    const end = Buffer.alloc(22)
+    end.writeUInt32LE(0x06054b50, 0); end.writeUInt16LE(1, 8); end.writeUInt16LE(1, 10)
+    end.writeUInt32LE(46 + name.length, 12); end.writeUInt32LE(body.length, 16)
+    const zipBuf = Buffer.concat([body, cd, name, end])
+    const entries = readZipEntries(zipBuf)
+    assert(entries?.[0]?.data?.toString() === 'deflated-content', 'deflate 压缩的条目能解开', entries?.[0]?.data?.toString())
+  }
+
+  console.log('\n[41] 前端静态资源')
   for (const p of ['/', '/js/main.js', '/css/app.css', '/assets/eqs-mark.svg', '/vendor/echarts.min.js']) {
     const res = await fetch(BASE + p)
     assert(res.ok, `静态资源可访问：${p}`)

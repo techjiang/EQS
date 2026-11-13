@@ -3,6 +3,8 @@ import { readJson, fail, sendJson } from '../lib/http.js'
 import { requireUser, requirePerm, currentUser, can } from '../lib/auth.js'
 import { normalizeSchema, parseForm, pickForm, paginate, safeJson, judgeOptions } from '../lib/forms.js'
 import { localPath } from '../lib/storage.js'
+import { readXlsxUpload } from './files.js'
+import { parseXlsx, rowsToFields } from '../lib/sheet.js'
 import fs from 'node:fs'
 import { log } from '../lib/db.js'
 
@@ -152,6 +154,25 @@ export default function register(r) {
     const schema = [...form.schema, ...fields.map(f => { const c = { ...f }; delete c.dropped; return c })]
     run('UPDATE forms SET schema = ?, updated_at = ? WHERE id = ?', JSON.stringify(schema), now(), form.id)
     sendJson(res, 200, { ok: true, added: fields.length, schema, droppedAnswers })
+  })
+
+  /** Excel 批量导入题目到表单（与文本导入同一套落库口径） */
+  r.post('/api/forms/:id/import-xlsx', async (req, res, { params }) => {
+    const user = requirePerm(req, 'form:update')
+    const form = pickForm(params.id)
+    if (!form) fail(404, '表单不存在')
+    const buf = await readXlsxUpload(req)
+    if (!buf?.length) fail(400, '请上传 xlsx 文件')
+    const rows = parseXlsx(buf)
+    if (!rows) fail(400, '无法读取该文件，请上传 .xlsx 格式的表格（.xls / .csv 请先另存为 xlsx）')
+    const { fields, skipped, unknownColumns } = rowsToFields(rows)
+    if (!fields.length) fail(400, '未识别到题目：表格需要有「题干」列，或按 题型/题干/选项/答案/分值/解析 的顺序排')
+    const droppedAnswers = fields.filter(f => f.dropped?.length).map(f => f.label)
+    const clean = fields.map(f => { const c = { ...f }; delete c.dropped; return c })
+    const schema = [...form.schema, ...clean]
+    run('UPDATE forms SET schema = ?, updated_at = ? WHERE id = ?', JSON.stringify(schema), now(), form.id)
+    log(user, 'Excel 导入题目', `${form.title} #${form.id} → ${clean.length} 道`)
+    sendJson(res, 200, { ok: true, added: clean.length, skipped, droppedAnswers, unknownColumns, schema })
   })
 
   /** 模板中心 */

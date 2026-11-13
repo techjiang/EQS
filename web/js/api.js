@@ -17,6 +17,12 @@ export const api = {
   post: (url, body) => request(url, { method: 'POST', headers: jsonHeaders, body: JSON.stringify(body || {}) }),
   put: (url, body) => request(url, { method: 'PUT', headers: jsonHeaders, body: JSON.stringify(body || {}) }),
   del: (url) => request(url, { method: 'DELETE' }),
+  /** 往任意接口传一个文件（Excel 导入这类），字段名固定 file */
+  uploadFile: (url, file) => request(url, { method: 'POST', body: (() => {
+    const fd = new FormData()
+    fd.append('file', file)
+    return fd
+  })() }),
   upload: (file, extra = {}) => {
     const fd = new FormData()
     fd.append('file', file)

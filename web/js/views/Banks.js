@@ -15,6 +15,7 @@ export default {
     const newBank = ref({ name: '', description: '' })
     const importOpen = ref(false)
     const importText = ref('')
+    const importTab = ref('text')
     const editQ = ref(null)
     const paperOpen = ref(false)
     const paper = ref({ title: '', count: 10, duration: 60 })
@@ -83,6 +84,24 @@ export default {
       } catch (e) { err(e.message) }
     }
 
+    /** Excel 导入：文件直接进后端解析，前端不做表格解析（同一份逻辑只维护一处） */
+    const importXlsx = async (file) => {
+      if (!file) return
+      try {
+        const r = await api.uploadFile(`/api/banks/${active.value.id}/import-xlsx`, file)
+        const skipped = r.skipped?.length ? `，跳过 ${r.skipped.length} 行（${r.skipped.slice(0, 2).map(x => `第 ${x.row} 行${x.reason}`).join('、')}）` : ''
+        const unknown = r.unknownColumns?.length ? `；未识别的列已忽略：${r.unknownColumns.join('、')}` : ''
+        ok(`已从 Excel 导入 ${r.imported} 道题${skipped}${unknown}` + (r.droppedAnswers?.length ? `；${r.droppedAnswers.length} 道题的答案不在选项里，已清空待修正` : ''))
+        importOpen.value = false
+        select(active.value)
+        load()
+      } catch (e) { err(e.message) }
+    }
+
+    const downloadTemplate = () => api.download('/api/banks/template.xlsx', 'EQS 题库导入模板.xlsx')
+      .then(() => ok('模板已下载，填好后用「Excel 导入」上传'))
+      .catch(e => err(e.message))
+
     const makePaper = async () => {
       try {
         const r = await api.post(`/api/banks/${active.value.id}/paper`, paper.value)
@@ -129,7 +148,12 @@ export default {
                 h('div', { class: 'small muted' }, active.value.description || '暂无描述')
               ]),
               h('div', { class: 'flex wrap', style: 'gap:6px' }, [
-                h('button', { class: 'btn sm', onClick: () => importOpen.value = true }, '文本导入'),
+                h('button', { class: 'btn sm', onClick: () => { importTab.value = 'text'; importOpen.value = true } }, '导入题目'),
+                h('button', {
+                  class: 'btn sm',
+                  onClick: () => api.download(`/api/banks/${active.value.id}/export.xlsx`, `${active.value.name}.xlsx`)
+                    .then(() => ok('已导出 Excel')).catch(e => err(e.message))
+                }, '导出 Excel'),
                 h('button', { class: 'btn sm', onClick: addQuestion }, '+ 添加题目'),
                 h('button', { class: 'btn sm', onClick: () => paperOpen.value = true }, '智能组卷'),
                 h('button', { class: 'btn sm primary', onClick: () => practice('sequence') }, '开始刷题')
@@ -182,16 +206,43 @@ export default {
       }) : null,
 
       importOpen.value ? Modal({
-        title: '文本批量导入题目', modelValue: true, onClose: () => importOpen.value = false, wide: true,
+        title: '导入题目', modelValue: true, onClose: () => importOpen.value = false, wide: true,
         children: [
-          h('div', { class: 'hint mb' }, '格式：每题以「1.」「一、」开头，方括号写题型，选项以「A.」「①」开头，可写「答案：A」「分值：5」「解析：…」；判断题答案写「对 / 错」即可。'),
-          h('textarea', {
-            class: 'textarea mono', style: 'min-height:260px', value: importText.value,
-            placeholder: '1. 下列哪个是关系型数据库？ [单选]\nA. Redis\nB. MySQL\nC. MongoDB\n答案：B\n分值：5\n解析：MySQL 是关系型数据库。',
-            onInput: e => importText.value = e.target.value
-          })
+          h('div', { class: 'flex', style: 'gap:6px;margin-bottom:12px' }, [
+            h('button', {
+              class: ['btn', 'sm', importTab.value === 'text' ? 'primary' : ''],
+              onClick: () => importTab.value = 'text'
+            }, '文本粘贴'),
+            h('button', {
+              class: ['btn', 'sm', importTab.value === 'excel' ? 'primary' : ''],
+              onClick: () => importTab.value = 'excel'
+            }, 'Excel 表格')
+          ]),
+          importTab.value === 'text' ? [
+            h('div', { class: 'hint mb' }, '格式：每题以「1.」「一、」开头，方括号写题型，选项以「A.」「①」开头，可写「答案：A」「分值：5」「解析：…」；判断题答案写「对 / 错」即可。'),
+            h('textarea', {
+              class: 'textarea mono', style: 'min-height:260px', value: importText.value,
+              placeholder: '1. 下列哪个是关系型数据库？ [单选]\nA. Redis\nB. MySQL\nC. MongoDB\n答案：B\n分值：5\n解析：MySQL 是关系型数据库。',
+              onInput: e => importText.value = e.target.value
+            })
+          ] : [
+            h('div', { class: 'hint mb' }, '表格列依次是「题型 / 题干 / 选项 / 答案 / 分值 / 解析」，顺序无所谓——有表头就按列名认。选项在单元格里一行一个（A.苹果 换行 B.香蕉），答案写 A、A,C 或 正确。'),
+            h('div', { class: 'flex', style: 'gap:8px;align-items:center;flex-wrap:wrap' }, [
+              h('label', { class: 'btn primary' }, [
+                '选择 .xlsx 文件',
+                h('input', {
+                  type: 'file', accept: '.xlsx', class: 'hide',
+                  onChange: e => { importXlsx(e.target.files?.[0]); e.target.value = '' }
+                })
+              ]),
+              h('button', { class: 'btn', onClick: downloadTemplate }, '下载导入模板'),
+              h('span', { class: 'small muted' }, '.xls / .csv 请先用 Excel 另存为 .xlsx')
+            ])
+          ]
         ],
-        footer: [h('button', { class: 'btn', onClick: () => importOpen.value = false }, '取消'), h('button', { class: 'btn primary', onClick: doImport }, '导入')]
+        footer: importTab.value === 'text'
+          ? [h('button', { class: 'btn', onClick: () => importOpen.value = false }, '取消'), h('button', { class: 'btn primary', onClick: doImport }, '导入')]
+          : [h('button', { class: 'btn', onClick: () => importOpen.value = false }, '关闭')]
       }) : null,
 
       paperOpen.value ? Modal({

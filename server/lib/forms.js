@@ -79,8 +79,10 @@ export function coerceAnswerToField(field) {
   const opts = Array.isArray(field.options) ? field.options : []
   const values = new Set(opts.map(o => String(o.value)))
   const labels = new Map(opts.map(o => [String(o.label), String(o.value)]))
-  const isJudge = /判断/.test(String(field.label || '')) &&
-    opts.length === 2 && values.has('正确') && values.has('错误')
+  // 判据只看选项本身：「正确/错误」两个选项就是判断题，与题干里有没有写「判断」两字无关。
+  // 之前要求题干含「判断」，于是「WebSocket 是建立在 TCP 之上的。」这种题干干净的判断题
+  // 写了「答案：对」也映射不到选项上，标准答案被剔除，谁答都算错。
+  const isJudge = opts.length === 2 && values.has('正确') && values.has('错误')
 
   const mapped = []
   for (const raw of field.answer) {
