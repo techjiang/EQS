@@ -113,6 +113,9 @@ export default function register(r) {
     if (!fields.length) fail(400, '未识别到题目')
     const dropped = []
     for (const f of fields) {
+      // 解析阶段就已经剔除掉的越界答案（「答案：D」但只有 A/B/C）要带出来，
+      // 否则接口一脸成功，用户以为答案写进去了
+      if (f.dropped?.length) dropped.push(`${f.label}（${f.dropped.join('、')} 不存在）`)
       // 选择题的答案必须是已有选项，否则会变成永远答不对的题
       if (f.answer.length && f.options.length) {
         const values = new Set(f.options.map(o => String(o.value)))

@@ -75,7 +75,7 @@ export default {
     const doImport = async () => {
       try {
         const r = await api.post(`/api/banks/${active.value.id}/import-text`, { text: importText.value })
-        ok(`已导入 ${r.imported} 道题`)
+        ok(`已导入 ${r.imported} 道题` + (r.droppedAnswers?.length ? `；${r.droppedAnswers.length} 道题的答案不在选项里，已清空待修正：${r.droppedAnswers.slice(0, 2).join('、')}` : ''))
         importOpen.value = false
         importText.value = ''
         select(active.value)
@@ -184,7 +184,7 @@ export default {
       importOpen.value ? Modal({
         title: '文本批量导入题目', modelValue: true, onClose: () => importOpen.value = false, wide: true,
         children: [
-          h('div', { class: 'hint mb' }, '格式：每题以「1.」开头，方括号写题型，选项以「A.」开头，可写「答案：A」「分值：5」「解析：…」。'),
+          h('div', { class: 'hint mb' }, '格式：每题以「1.」「一、」开头，方括号写题型，选项以「A.」「①」开头，可写「答案：A」「分值：5」「解析：…」；判断题答案写「对 / 错」即可。'),
           h('textarea', {
             class: 'textarea mono', style: 'min-height:260px', value: importText.value,
             placeholder: '1. 下列哪个是关系型数据库？ [单选]\nA. Redis\nB. MySQL\nC. MongoDB\n答案：B\n分值：5\n解析：MySQL 是关系型数据库。',

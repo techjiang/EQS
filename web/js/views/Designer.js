@@ -547,7 +547,7 @@ export default {
           h('div', { class: 'modal wide' }, [
             h('div', { class: 'modal-h' }, [h('h3', {}, '批量文本导入'), h('button', { class: 'btn ghost sm', onClick: () => importOpen.value = false }, '关闭')]),
             h('div', { class: 'modal-b' }, [
-              h('div', { class: 'hint mb' }, '格式：每题以「1.」或「- 」开头，方括号内写题型（单选/多选/填空/日期/评分…），选项以「A.」开头，可写「答案：A」「分值：5」「解析：…」。'),
+              h('div', { class: 'hint mb' }, '格式：每题以「1.」「一、」或「- 」开头，方括号内写题型（单选/多选/填空/日期/评分…），选项以「A.」「①」开头，可写「答案：A」「分值：5」「解析：…」；行首写「!」表示必答。'),
               h('textarea', {
                 class: 'textarea mono', style: 'min-height:240px', value: importText.value,
                 placeholder: '1. 你的性别 [单选]\nA. 男\nB. 女\n答案：A\n\n2. 请描述你的建议 [多行]',

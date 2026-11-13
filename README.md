@@ -175,7 +175,7 @@ bash scripts/start.sh                        # 启动即完成迁移
 | `GET` | `/api/forms` | 表单列表 |
 | `POST` | `/api/forms` | 创建表单 |
 | `PUT` | `/api/forms/:id` | 更新表单 |
-| `POST` | `/api/forms/:id/import-text` | 文本批量导入题目 |
+| `POST` | `/api/forms/:id/import-text` | 文本批量导入题目，返回 `{added, droppedAnswers}` |
 | `GET` | `/api/public/forms/:id` | 公开读取表单（不含答案） |
 | `POST` | `/api/public/forms/:id/submit` | 提交答卷 |
 | `GET` | `/api/forms/:id/report` | 报表统计 |

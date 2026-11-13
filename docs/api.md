@@ -28,7 +28,7 @@
 | POST | `/api/forms/:id/restore` | 恢复 |
 | DELETE | `/api/forms/:id/purge` | 彻底删除 |
 | POST | `/api/forms/:id/duplicate` | 复制 |
-| POST | `/api/forms/:id/import-text` | `{text}` 文本批量导入题目 |
+| POST | `/api/forms/:id/import-text` | `{text}` 文本批量导入题目，返回 `{added, schema}` |
 | GET | `/api/forms/:id/report` | 报表统计数据 |
 
 `kind` 取值：`survey`（问卷）、`exam`（考试）、`form`（通用表单）。
@@ -145,7 +145,7 @@ POST /api/banks/paper
 | PUT/DELETE | `/api/banks/:id` | 更新 / 删除 |
 | GET/POST | `/api/banks/:id/questions` | 题目列表 / 新增 |
 | PUT/DELETE | `/api/questions/:id` | 更新 / 删除题目 |
-| POST | `/api/banks/:id/import-text` | 文本批量导入 |
+| POST | `/api/banks/:id/import-text` | 文本批量导入，返回 `{imported, droppedAnswers}`（答案指向不存在的选项会被剔除并列在这里） |
 | POST | `/api/banks/:id/paper` | 智能组卷 `{title, count, duration}` |
 | GET | `/api/banks/:id/practice?mode=sequence\|random\|wrong\|favorite` | 拉取练习题目（不含答案） |
 | POST | `/api/banks/:id/practice/answer` | 提交作答 `{questionId, value, progress?, note?, favorite?}` |

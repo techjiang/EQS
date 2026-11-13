@@ -827,7 +827,78 @@ try {
     assert(!r.json.data.questions.some(q => q.type === 'captcha'), '验证码不进统计报表', JSON.stringify(r.json.data.questions.map(q => q.type)))
   }
 
-  console.log('\n[29] 前端静态资源')
+  console.log('\n[29] 文本导入：题干说明不被吞成选项、圈号选项、跨题声明')
+  {
+    r = await req('POST', '/api/forms', { title: '导入口径探针', schema: [] })
+    const tId = r.json.id
+    r = await req('POST', `/api/forms/${tId}/import-text`, {
+      text: [
+        '一、以下哪些是数据库？（多选）',
+        'A. MySQL',
+        'B. Redis',
+        '答案：A、B',
+        '二、部署时需要执行 npm install 吗？',
+        'A. 需要',
+        'B. 不需要',
+        '答案：B'
+      ].join('\n')
+    })
+    const two = r.json.schema || []
+    assert(two.length === 2, '「一、」「二、」起新题，不并进上一题的选项', JSON.stringify(two.map(f => f.label)))
+    assert(two[0]?.type === 'checkbox' && two[0].options.length === 2, '多选答案不越界、选项只有两项', JSON.stringify(two[0]))
+    assert(JSON.stringify(two[0]?.answer) === JSON.stringify(['MySQL', 'Redis']), '多选答案按选项值落库', JSON.stringify(two[0]?.answer))
+    assert(two[1]?.type === 'radio' && JSON.stringify(two[1]?.answer) === JSON.stringify(['不需要']), '第二题的答案归第二题', JSON.stringify(two[1]))
+
+    r = await req('POST', '/api/forms', { title: '导入口径探针二', schema: [] })
+    const t2Id = r.json.id
+    r = await req('POST', `/api/forms/${t2Id}/import-text`, {
+      text: [
+        '1. 你最常用的通勤方式是？',
+        '请只选最主要的那个。',
+        'A. 步行',
+        'B. 自驾',
+        '答案：B',
+        '2. 判断题：EQS 内置数据库，开箱即用。',
+        '答案：对',
+        '3. 请上传一张截图 [上传]',
+        '① 上传失败的截图可以先跳过',
+        '答案：D'
+      ].join('\n')
+    })
+    const three = r.json.schema || []
+    const first = three.find(f => String(f.label).includes('通勤'))
+    assert(first && first.options.length === 2, '题干下的说明不被当成选项', JSON.stringify(first?.options))
+    const judge = three.find(f => String(f.label).includes('内置数据库'))
+    assert(judge?.type === 'radio' && JSON.stringify(judge.answer) === JSON.stringify(['正确']), '判断题「答案：对」映射到「正确」', JSON.stringify(judge))
+    const last = three.find(f => String(f.label).includes('截图'))
+    assert(last && last.type === 'upload', '「[上传]」题型识别正确', JSON.stringify(last?.type))
+
+    // 「一、」「五、」+ 题型声明要落到对应题型上；「!」是必答标记
+    r = await req('POST', '/api/forms', { title: '导入口径探针三', schema: [] })
+    const t3Id = r.json.id
+    r = await req('POST', `/api/forms/${t3Id}/import-text`, {
+      text: [
+        '一、你最常用的通勤方式是？',
+        '请只选最主要的那个。',
+        'A. 步行',
+        'B. 自驾',
+        '答案：B',
+        '二、多选题：哪些因素影响通勤？',
+        'A. 距离',
+        'B. 天气',
+        '答案：A、B',
+        '三、! 请填写你的工号 [单行]'
+      ].join('\n')
+    })
+    const four = r.json.schema || []
+    assert(four.length === 3, '题干下的说明不粘连到下一题，也不新增题目', String(four.length))
+    assert(four[0]?.type === 'radio' && four[0].options.length === 2, '第一题只有两项、题型为单选', JSON.stringify(four[0]))
+    assert(four[1]?.type === 'checkbox', '「二、多选题：」声明落成多选', JSON.stringify(four[1]?.type))
+    assert(JSON.stringify(four[1]?.answer) === JSON.stringify(['距离', '天气']), '多选答案按选项值落库（第二题）', JSON.stringify(four[1]?.answer))
+    assert(four[2]?.required === true && four[2]?.type === 'text', '「!」标记落成必填，感叹号不留在题干里', JSON.stringify(four[2]))
+  }
+
+  console.log('\n[30] 前端静态资源')
   for (const p of ['/', '/js/main.js', '/css/app.css', '/assets/eqs-mark.svg', '/vendor/echarts.min.js']) {
     const res = await fetch(BASE + p)
     assert(res.ok, `静态资源可访问：${p}`)
