@@ -187,6 +187,20 @@ CREATE TABLE IF NOT EXISTS bank_members (
   PRIMARY KEY (bank_id, user_id)
 );
 CREATE INDEX IF NOT EXISTS idx_bank_members_user ON bank_members(user_id);
+/*
+ * 表单协作：一份问卷 / 考试可以有多个维护人。
+ * 与 bank_members 同形，理由也一样——「两个人一起做一份问卷」以前没有表达方式。
+ * role: editor 可改内容与发布、看数据、批阅；viewer 只能看跟报表，不改不导明细。
+ */
+CREATE TABLE IF NOT EXISTS form_members (
+  form_id INTEGER NOT NULL,
+  user_id INTEGER NOT NULL,
+  role TEXT NOT NULL DEFAULT 'editor',
+  created_by INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (form_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_form_members_user ON form_members(user_id);
 /* 组织架构：职位挂在部门下（0 = 直属公司），用户带一个 position_id */
 CREATE TABLE IF NOT EXISTS positions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,

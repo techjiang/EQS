@@ -2545,6 +2545,135 @@ try {
     assert(r.json.data.total === 2, '两份答卷都进了报表', String(r.json.data.total))
   }
 
+  console.log('\n[60] 表单协作：所有者 / 可编辑 / 只读')
+  {
+    const adminCookie = cookie
+    // 建一张问卷 + 建一个普通账号
+    let r = await req('POST', '/api/forms', {
+      title: '协作验收表单', kind: 'survey',
+      schema: [{ id: 'c1', type: 'radio', label: '满意吗', options: [{ label: '满意', value: '满意' }, { label: '一般', value: '一般' }] }],
+      status: 'published'
+    })
+    const cfid = r.json.id
+    const sub = await fetch(BASE + `/api/public/forms/${cfid}/submit`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ data: { c1: '满意' } })
+    }).then(x => x.json())
+    assert(sub.ok, '协作用表单已有一份答卷')
+
+    await req('POST', '/api/auth/register', { username: 'collab', password: 'collab-123', nickname: '协作同事' })
+    const ck = await asUser('collab', 'collab-123')
+    assert(!!ck, '协作账号登录成功')
+
+    // 一、加入协作之前：列表里没有、详情 403
+    let p = await call(ck, 'GET', '/api/forms?pageSize=200')
+    assert(!p.json.data.some(f => f.id === cfid), '未协作者在列表里看不到别人的表单')
+    p = await call(ck, 'GET', `/api/forms/${cfid}`)
+    assert(p.status === 403, '未协作者直接访问表单详情被拒')
+
+    // 二、只有所有者能管成员：自己拉自己不行
+    p = await call(ck, 'POST', `/api/forms/${cfid}/members`, { username: 'collab', role: 'editor' })
+    assert(p.status === 403, '非所有者不能添加协作者')
+
+    // 所有者加入 editor
+    p = await call(adminCookie, 'POST', `/api/forms/${cfid}/members`, { username: 'collab', role: 'editor' })
+    assert(p.status === 201, '所有者把同事加为「可编辑」', JSON.stringify(p.json))
+    p = await call(adminCookie, 'POST', `/api/forms/${cfid}/members`, { username: 'admin', role: 'editor' })
+    assert(p.status === 400, '创建者本人不需要加入协作者')
+
+    // 三、可编辑：列表看得见、能改、能看数据与报表、能导出
+    p = await call(ck, 'GET', '/api/forms?pageSize=200')
+    const mine = p.json.data.find(f => f.id === cfid)
+    assert(!!mine && mine.my_role === 'editor', '协作者在列表里看到表单并带 my_role', JSON.stringify(mine && mine.my_role))
+    p = await call(ck, 'PUT', `/api/forms/${cfid}`, { description: '同事改的描述' })
+    assert(p.status === 200, '可编辑协作者能改表单内容')
+    p = await call(ck, 'GET', `/api/submissions?formId=${cfid}`)
+    assert(p.status === 200 && p.json.data.length === 1, '可编辑协作者能看到答卷', JSON.stringify(p.json.total))
+    p = await call(ck, 'GET', `/api/submissions/${(await call(adminCookie, 'GET', `/api/submissions?formId=${cfid}`)).json.data[0].id}`)
+    assert(p.status === 200, '可编辑协作者能打开单份答卷')
+    p = await call(ck, 'GET', `/api/forms/${cfid}/report`)
+    assert(p.status === 200 && p.json.data.total === 1, '可编辑协作者能看报表')
+    p = await call(ck, 'GET', `/api/forms/${cfid}/members`)
+    assert(p.status === 200 && p.json.data.candidates.length === 0, '协作者能看见成员名单，但拿不到可邀请名单')
+    p = await call(ck, 'DELETE', `/api/forms/${cfid}`)
+    assert(p.status === 403, '可编辑协作者不能删除表单（只有所有者能）')
+
+    // 四、降为只读：能看，不能改、不能导明细
+    p = await call(adminCookie, 'POST', `/api/forms/${cfid}/members`, { username: 'collab', role: 'viewer' })
+    assert(p.status === 200 && p.json.updated === true, '再传一次即改为「只读」')
+    p = await call(ck, 'PUT', `/api/forms/${cfid}`, { description: '只读还想改' })
+    assert(p.status === 403, '只读协作者改不了表单')
+    p = await call(ck, 'GET', `/api/forms/${cfid}/report`)
+    assert(p.status === 200, '只读协作者仍能看报表')
+    // 只读 = 看汇总不看明细：能逐行读答卷、只是不能点下载按钮，那不叫只读
+    p = await call(ck, 'GET', `/api/submissions?formId=${cfid}`)
+    assert(p.status === 403, '只读协作者打开答卷明细被明确拒绝（而不是显示「还没有答卷」）')
+    p = await call(ck, 'GET', `/api/submissions/${(await call(adminCookie, 'GET', `/api/submissions?formId=${cfid}`)).json.data[0].id}`)
+    assert(p.status === 403, '只读协作者打不开单份答卷详情')
+    p = await call(ck, 'GET', `/api/forms/${cfid}/submissions.xlsx`)
+    assert(p.status === 403, '只读协作者导不出答卷明细（只读不等于能把整库带走）')
+    p = await call(ck, 'POST', `/api/forms/${cfid}/import-text`, { text: '[单选] 新题\nA. 甲\nB. 乙' })
+    assert(p.status === 403, '只读协作者导不进题目')
+
+    // 五、移出协作：立刻回到什么都看不见
+    p = await call(adminCookie, 'DELETE', `/api/forms/${cfid}/members/${(await call(adminCookie, 'GET', '/api/users')).json.data.find(u => u.username === 'collab').id}`)
+    assert(p.status === 200, '所有者移除协作者')
+    p = await call(ck, 'GET', `/api/forms/${cfid}`)
+    assert(p.status === 403, '移出后立刻失去访问权')
+
+    // 六、账号删除时协作关系一并清掉（否则 id 被复用会继承权限）
+    const collabId = (await call(adminCookie, 'GET', '/api/users')).json.data.find(u => u.username === 'collab').id
+    await call(adminCookie, 'POST', `/api/forms/${cfid}/members`, { userId: collabId, role: 'editor' })
+    await call(adminCookie, 'DELETE', `/api/users/${collabId}`)
+    p = await call(adminCookie, 'GET', `/api/forms/${cfid}/members`)
+    assert(p.json.data.members.length === 0, '删除账号时协作关系一起清掉')
+  }
+
+  console.log('\n[61] 仅限登录用户填写')
+  {
+    cookie = await asUser('admin', 'test-pass-123')
+    let r = await req('POST', '/api/forms', {
+      title: '仅登录可填', kind: 'survey', status: 'published',
+      schema: [{ id: 'l1', type: 'text', label: '姓名' }],
+      settings: { needLogin: true }
+    })
+    const lfid = r.json.id
+    assert(!!lfid, '建出仅登录表单', JSON.stringify(r.json).slice(0, 200))
+    r = await req('GET', `/api/public/forms/${lfid}`)
+    assert(r.json.data.settings.needLogin === true, 'needLogin 下发到公开页（前端才能先提示登录）')
+
+    const anon = await fetch(BASE + `/api/public/forms/${lfid}/submit`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ data: { l1: '匿名' } })
+    })
+    assert(anon.status === 401, '匿名提交被拒（以前这个开关根本不存在）')
+    const anonMsgs = await anon.json()
+    assert(/登录/.test(anonMsgs.message || ''), '拒绝理由说清楚要登录', anonMsgs.message)
+
+    // 匿名也不能传附件：否则「仅登录可填」只在答题那一步成立
+    const fd = new FormData()
+    fd.append('file', new Blob([Buffer.from('x')], { type: 'text/plain' }), 'x.txt')
+    fd.append('formId', String(lfid))
+    const up = await fetch(BASE + '/api/upload', { method: 'POST', body: fd })
+    assert(up.status === 401, '仅登录表单匿名上传附件也被拒')
+
+    const logged = await fetch(BASE + `/api/public/forms/${lfid}/submit`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie },
+      body: JSON.stringify({ data: { l1: '登录用户' } })
+    })
+    assert(logged.status === 201, '登录用户能正常提交')
+    const lj = await logged.json()
+    assert(lj.ok === true, '提交结果正常', JSON.stringify(lj).slice(0, 120))
+
+    // 关掉开关后匿名又能填：不能因为一次实验把表单永久锁死
+    await req('PUT', `/api/forms/${lfid}`, { settings: { needLogin: false } })
+    const anon2 = await fetch(BASE + `/api/public/forms/${lfid}/submit`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ data: { l1: '匿名2' } })
+    })
+    assert(anon2.status === 201, '关掉开关后匿名可以填')
+  }
+
   console.log('\n[44] 前端静态资源')
 
   for (const p of ['/', '/js/main.js', '/css/app.css', '/js/views/Logs.js', '/assets/eqs-mark.svg', '/vendor/echarts.min.js']) {

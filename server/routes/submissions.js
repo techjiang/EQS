@@ -29,6 +29,7 @@ function findSubmission(formId, raw) {
 }
 
 import { notifySubmission, dispatchWebhooks } from '../lib/notify.js'
+import { formRole, submissionVisibleScope, requireFormRole } from '../lib/formMembers.js'
 import { rankingTop, rankOf, publicRanking, distributionOf } from '../lib/ranking.js'
 import { submissionsXlsx, submissionsHead, submissionRow } from '../lib/sheet.js'
 import { writeXlsxStream } from '../lib/xlsx.js'
@@ -103,6 +104,13 @@ export function checkLimit(form, req, extra = {}) {
     const ua = String(req.headers['user-agent'] || '')
     if (!/MicroMessenger/i.test(ua)) fail(403, '请在微信中打开此问卷')
   }
+  /*
+   * 「仅登录用户可填」。Issue 原文「白名单、密码、登录、微信填写…」里的「登录」一直在
+   * 设计器里没有开关、在服务端也没有校验：问卷是公开入口，任何人拿到链接就能填。
+   * 现在它是真的：查不到会话就 403，并且这条判据在提交时也走同一处。
+   * 注意它和「按账号限次」不是一回事——限次只是记 userId，匿名照样能填。
+   */
+  if (s.needLogin && !extra.userId) fail(401, '该表单仅限登录用户填写，请先登录')
   return fp
 }
 
@@ -342,7 +350,8 @@ export default function register(r) {
    */
   r.get('/api/recycle/submissions', async (req, res) => {
     const user = requirePerm(req, 'data:read')
-    const own = can(user, '*') ? '' : ` AND f.created_by = ${user.id}`
+    const scope = submissionVisibleScope(user)
+    const own = scope.sql === '1 = 1' ? '' : ` AND ${scope.sql}`
     const self = all(`SELECT s.id, s.form_id, s.created_at, s.deleted_at, f.title AS form_title, f.deleted_at AS form_deleted_at
       FROM submissions s JOIN forms f ON f.id = s.form_id
       WHERE s.deleted_at IS NOT NULL AND f.deleted_at IS NULL${own} ORDER BY s.id DESC LIMIT 200`)
@@ -365,8 +374,23 @@ export default function register(r) {
       .filter(f => safeJson(f.schema, []).some(isSubjective))
       .map(f => f.id)
     const formId = url.searchParams.get('formId')
-    if (formId) { where.push('s.form_id = ?'); args.push(Number(formId)) }
-    if (!can(user, '*')) { where.push('f.created_by = ?'); args.push(user.id) }
+    if (formId) {
+      /*
+       * 指定了表单就先把身份判清楚。只读协作者不该看到「该表单还没有答卷」——
+       * 那句话的意思是「没人填过」，而真实情况是「你没权限看明细」。
+       * 列表默认按 editor 及以上过滤（见 submissionVisibleScope），会静默少掉一批行，
+       * 静默才是最坏的结果：用户会照着这个数字做判断。
+       */
+      const scoped = pickForm(formId)
+      if (!scoped) fail(404, '表单不存在')
+      const role = requireFormRole(user, scoped, 'view')
+      if (role === 'viewer') fail(403, '你在该表单中是「只读」协作者，只能看统计分析，看不到答卷明细')
+      where.push('s.form_id = ?'); args.push(Number(formId))
+    }
+    // 协作者也能看答卷：他要批阅、要导出、要看报表。只按 created_by 过滤的话，
+    // 协作在列表里成立、点进数据页就 403，等于没有协作。
+    const scope = submissionVisibleScope(user)
+    if (scope.sql !== '1 = 1') { where.push(scope.sql); args.push(...scope.args) }
     const keyword = url.searchParams.get('keyword')
     if (keyword) { where.push('s.data LIKE ?'); args.push(`%${keyword}%`) }
     if (url.searchParams.get('marked') === '1') where.push('s.marked = 1')
@@ -415,7 +439,8 @@ export default function register(r) {
     const row = get('SELECT * FROM submissions WHERE id = ?', Number(params.id))
     if (!row) fail(404, '答卷不存在')
     const form = pickForm(row.form_id, { withDeleted: true })
-    if (!can(user, '*') && form?.created_by !== user.id) fail(403, '无权查看')
+    // 单份答卷是明细，不是汇总：只读协作者看报表就够了
+    if (form) requireFormRole(user, form, 'edit')
     sendJson(res, 200, { ok: true, data: { ...withManual(row), form } })
   })
 
@@ -424,8 +449,8 @@ export default function register(r) {
     const body = await readJson(req)
     const form = pickForm(body.formId)
     if (!form) fail(404, '表单不存在')
-    // 后台「新增答卷」是给表单主人补录的，不是给任何人往别人问卷里灌数据的入口
-    if (!can(user, '*') && form.created_by !== user.id) fail(403, '无权向该表单添加答卷')
+    // 后台「新增答卷」是给表单维护人补录的，不是给任何人往别人问卷里灌数据的入口
+    requireFormRole(user, form, 'edit')
     const data = body.data || {}
     const errors = validateSubmission(form.schema, data)
     if (errors.length) fail(422, errors.join('；'))
@@ -445,7 +470,7 @@ export default function register(r) {
     if (!row) fail(404, '答卷不存在')
     const form = pickForm(row.form_id)
     if (!form) fail(404, '表单不存在')
-    if (!can(user, '*') && form.created_by !== user.id) fail(403, '无权修改')
+    requireFormRole(user, form, 'edit')
     const body = await readJson(req)
     const data = body.data ?? JSON.parse(row.data)
     const errors = validateSubmission(form.schema, data)
@@ -471,7 +496,7 @@ export default function register(r) {
     const form = pickForm(row.form_id)
     if (!form) fail(404, '表单不存在')
     if (form.kind !== 'exam') fail(400, '只有考试答卷需要批阅')
-    if (!can(user, '*') && form.created_by !== user.id) fail(403, '无权批阅')
+    requireFormRole(user, form, 'edit')
     const body = await readJson(req)
     const data = JSON.parse(row.data)
     // 只认这份卷子里真有、且确实没有标准答案的题，防止给选择题凭空加分
@@ -501,7 +526,7 @@ export default function register(r) {
     const row = get('SELECT * FROM submissions WHERE id = ?', Number(params.id))
     if (!row) fail(404, '答卷不存在')
     const form = pickForm(row.form_id, { withDeleted: true })
-    if (!can(user, '*') && form?.created_by !== user.id) fail(403, '无权恢复')
+    if (form) requireFormRole(user, form, 'edit')
     if (form?.deleted_at) fail(400, '该答卷所属的表单还在回收站里，请先恢复表单')
     run('UPDATE submissions SET deleted_at = NULL, updated_at = ? WHERE id = ?', now(), row.id)
     log(user, '恢复答卷', `#${row.id}`)
@@ -513,7 +538,7 @@ export default function register(r) {
     const row = get('SELECT * FROM submissions WHERE id = ?', Number(params.id))
     if (!row) fail(404, '答卷不存在')
     const form = pickForm(row.form_id, { withDeleted: true })
-    if (!can(user, '*') && form?.created_by !== user.id) fail(403, '无权删除')
+    if (form) requireFormRole(user, form, 'edit')
     run('UPDATE submissions SET deleted_at = ? WHERE id = ?', now(), row.id)
     log(user, '删除答卷', `#${row.id}`)
     dispatchWebhooks('delete', { formId: row.form_id, submission: { id: row.id } }).catch(() => {})
@@ -531,8 +556,8 @@ export default function register(r) {
       const row = get('SELECT * FROM submissions WHERE id = ? AND deleted_at IS NULL', Number(id))
       if (!row) { skipped++; continue }
       const form = pickForm(row.form_id, { withDeleted: true })
-      // 表单记录都没了（被彻底删除）时 form 是 null，`form?.created_by !== user.id` 恒真，得单独判
-      if (!can(user, '*') && (!form || form.created_by !== user.id)) { skipped++; continue }
+      // 表单记录都没了（被彻底删除）时 form 是 null，得单独判：默默跳过而不是 500
+      if (!form || !formRole(user, form) || formRole(user, form) === 'viewer') { skipped++; continue }
       run('UPDATE submissions SET deleted_at = ? WHERE id = ?', ts, row.id)
       count++
     }
@@ -553,7 +578,7 @@ export default function register(r) {
     const user = requirePerm(req, 'report:read')
     const form = pickForm(params.id)
     if (!form) fail(404, '表单不存在')
-    if (!can(user, '*') && form.created_by !== user.id) fail(403, '无权查看报表')
+    requireFormRole(user, form, 'view')
     const stats = cachedReport(form)
     sendJson(res, 200, { ok: true, data: { form: { id: form.id, title: form.title, kind: form.kind }, ...stats } })
   })
@@ -566,7 +591,7 @@ export default function register(r) {
     const user = requirePerm(req, 'report:read')
     const form = pickForm(params.id)
     if (!form) fail(404, '表单不存在')
-    if (!can(user, '*') && form.created_by !== user.id) fail(403, '无权查看排名')
+    requireFormRole(user, form, 'view')
     const url = new URL(req.url, 'http://x')
     const limit = Number(url.searchParams.get('limit')) || 20
     const top = rankingTop(form.id, limit, form)
@@ -601,7 +626,8 @@ export default function register(r) {
     const user = requirePerm(req, 'data:read')
     const form = pickForm(params.id)
     if (!form) fail(404, '表单不存在')
-    if (!can(user, '*') && form.created_by !== user.id) fail(403, '无权导出')
+    // 明细导出给「可编辑」及以上：只读协作者的权限是「看报表」，不是把整库答卷带走
+    requireFormRole(user, form, 'edit')
     const url = new URL(req.url, 'http://x')
     const where = ['form_id = ?', 'deleted_at IS NULL']
     const args = [form.id]
@@ -654,7 +680,7 @@ export default function register(r) {
     const user = requirePerm(req, 'data:write')
     const form = pickForm(params.id)
     if (!form) fail(404, '表单不存在')
-    if (!can(user, '*') && form.created_by !== user.id) fail(403, '无权向该表单导入答卷')
+    requireFormRole(user, form, 'edit')
     const body = await readJson(req)
     const list = Array.isArray(body.items) ? body.items : []
     if (!list.length) fail(400, '没有可导入的数据')
@@ -676,7 +702,9 @@ export default function register(r) {
 const PUBLIC_SETTING_KEYS = [
   'submitText', 'buttonText', 'redirectUrl', 'headerImage', 'bgImage', 'bgColor', 'buttonColor',
   'allowQuery', 'onlyWechat', 'recordWechat', 'needPassword', 'passPercent', 'showResult', 'duration',
-  'showRank', 'showRanking'
+  'showRank', 'showRanking',
+  // needLogin 必须下发：浏览器要据此提示「先登录再填」，而不是让人填完整份才吃一句 401
+  'needLogin'
 ]
 
 /** 作答需要的 props 白名单；标准答案常藏在自定义属性里，一律不下发 */

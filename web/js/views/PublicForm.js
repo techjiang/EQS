@@ -5,6 +5,7 @@ import { ok, err, fmtDate } from '../ui.js'
 import { FormRenderer } from '../renderer.js'
 import { defaultData } from '../fields.js'
 import { renderText } from '../flow.js'
+import { state } from '../store.js'
 
 export default {
   setup() {
@@ -150,6 +151,28 @@ export default {
 
       const s = settings.value
       const style = [s.bgColor ? `background:${s.bgColor}` : '', s.bgImage ? `background-image:url(${s.bgImage});background-size:cover;background-attachment:fixed` : ''].join(';')
+
+      /*
+       * 「仅登录用户填写」必须在第一屏说清楚。
+       * 服务端在提交时已经拦了（401），但如果让人认真填完二十道题最后吃一句「请先登录」，
+       * 那份作答就白填了——所以这里在渲染表单之前就把入口换成登录按钮。
+       */
+      const needLogin = !!s.needLogin && !state.user
+      const gate = h('div', { class: 'fill-page', style }, [
+        h('div', { class: 'fill-hero', style: [s.headerImage ? `background-image:linear-gradient(rgba(0,0,0,.35),rgba(0,0,0,.35)),url(${s.headerImage})` : '', 'background-size:cover;background-position:center'].join(';') },
+          h('div', {}, h('h1', {}, form.value.title))),
+        h('div', { class: 'fill-card' }, h('div', { class: 'center', style: 'padding:32px 12px' }, [
+          h('img', { src: '/assets/eqs-mark.svg', style: 'width:56px;opacity:.85' }),
+          h('h2', { style: 'margin:14px 0 6px;font-size:19px' }, '该表单仅限登录用户填写'),
+          h('p', { class: 'small muted', style: 'margin-bottom:18px' }, '登录后回到这一页继续填写，作答会记在你的账号下。'),
+          h('button', {
+            class: 'btn primary', style: s.buttonColor ? `background:${s.buttonColor}` : '',
+            onClick: () => { location.href = '/login?next=' + encodeURIComponent('/f/' + id) }
+          }, '去登录')
+        ]))
+      ])
+
+      if (needLogin) return gate
 
       return h('div', { class: 'fill-page', style }, [
         h('div', {

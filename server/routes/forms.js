@@ -3,6 +3,7 @@ import { readJson, fail, sendJson } from '../lib/http.js'
 import { requireUser, requirePerm, currentUser, can } from '../lib/auth.js'
 import { normalizeSchema, parseForm, pickForm, paginate, safeJson, judgeOptions } from '../lib/forms.js'
 import { localPath } from '../lib/storage.js'
+import { formRole, formVisibleScope, submissionVisibleScope, requireFormRole, memberCandidates, listMembers, addMember, FORM_MEMBER_ROLES, ROLE_LABEL } from '../lib/formMembers.js'
 import { readXlsxUpload } from './files.js'
 import { parseXlsx, rowsToFields } from '../lib/sheet.js'
 import fs from 'node:fs'
@@ -21,16 +22,26 @@ export default function register(r) {
     const status = url.searchParams.get('status')
     const recycle = url.searchParams.get('recycle') === '1'
     const where = [recycle ? 'f.deleted_at IS NOT NULL' : 'f.deleted_at IS NULL']
+    /*
+     * 「我能看到的表单」= 我建的 + 邀请我协作的。
+     * 这里以前只有 created_by = ?，于是成员表加了也没用：协作者在列表里看不到表单，
+     * 只能靠人肉发链接进来，进来之后每一页又各自 403。
+     */
     const args = []
-    if (!can(user, '*')) { where.push('f.created_by = ?'); args.push(user.id) }
+    const scope = formVisibleScope(user)
+    if (scope.sql !== '1 = 1') { where.push(scope.sql); args.push(...scope.args) }
     if (kind) { where.push('f.kind = ?'); args.push(kind) }
     if (status) { where.push('f.status = ?'); args.push(status) }
     if (isTemplate === '1' || isTemplate === '0') { where.push('f.is_template = ?'); args.push(Number(isTemplate)) }
     else where.push('f.is_template = 0')
     if (category) { where.push('f.category = ?'); args.push(category) }
     if (keyword) { where.push('(f.title LIKE ? OR f.description LIKE ?)'); args.push(`%${keyword}%`, `%${keyword}%`) }
-    const sql = `SELECT f.*, (SELECT COUNT(*) FROM submissions s WHERE s.form_id = f.id AND s.deleted_at IS NULL) AS submission_count FROM forms f WHERE ${where.join(' AND ')} ORDER BY f.updated_at DESC`
-    const rows = all(sql, ...args).map(parseForm)
+    const sql = `SELECT f.*,
+        (SELECT COUNT(*) FROM submissions s WHERE s.form_id = f.id AND s.deleted_at IS NULL) AS submission_count,
+        (SELECT COUNT(*) FROM form_members m WHERE m.form_id = f.id) AS member_count
+      FROM forms f WHERE ${where.join(' AND ')} ORDER BY f.updated_at DESC`
+    // my_role 决定前端露出哪些按钮：只读协作者不该看见「发布」「编辑」，点了才弹 403 更恼人
+    const rows = all(sql, ...args).map(r => ({ ...parseForm(r), my_role: formRole(user, r) }))
     const p = paginate(req, rows.length)
     sendJson(res, 200, { ok: true, data: rows.slice(p.offset, p.offset + p.pageSize), page: p.page, pageSize: p.pageSize, total: p.total, totalPages: p.totalPages })
   })
@@ -39,8 +50,8 @@ export default function register(r) {
     const user = requirePerm(req, 'form:read')
     const form = pickForm(params.id, { withDeleted: true })
     if (!form) fail(404, '表单不存在')
-    if (!can(user, '*') && form.created_by !== user.id && !form.is_template) fail(403, '无权访问该表单')
-    sendJson(res, 200, { ok: true, data: form })
+    if (!form.is_template) requireFormRole(user, form, 'view')
+    sendJson(res, 200, { ok: true, data: { ...form, my_role: formRole(user, form) } })
   })
 
   r.post('/api/forms', async (req, res) => {
@@ -68,7 +79,7 @@ export default function register(r) {
     const user = requirePerm(req, 'form:update')
     const form = pickForm(params.id)
     if (!form) fail(404, '表单不存在')
-    if (!can(user, '*') && form.created_by !== user.id) fail(403, '无权修改该表单')
+    requireFormRole(user, form, 'edit')
     const body = await readJson(req)
     const sets = []
     const args = []
@@ -94,7 +105,7 @@ export default function register(r) {
     const user = requirePerm(req, 'form:delete')
     const form = pickForm(params.id)
     if (!form) fail(404, '表单不存在')
-    if (!can(user, '*') && form.created_by !== user.id) fail(403, '无权删除该表单')
+    requireFormRole(user, form, 'own')
     run('UPDATE forms SET deleted_at = ? WHERE id = ?', now(), form.id)
     log(user, '删除表单（移入回收站）', `${form.title} #${form.id}`)
     sendJson(res, 200, { ok: true })
@@ -106,7 +117,7 @@ export default function register(r) {
     if (!form) fail(404, '表单不存在')
     // 恢复也是「改」：删/改都有归属校验，唯独恢复漏了。
     // 别人在回收站里的问卷，换个 id 就能捞回自己的列表里。
-    if (!can(user, '*') && form.created_by !== user.id) fail(403, '无权恢复该表单')
+    requireFormRole(user, form, 'own')
     run('UPDATE forms SET deleted_at = NULL, updated_at = ? WHERE id = ?', now(), form.id)
     log(user, '恢复表单', `${form.title} #${form.id}`)
     sendJson(res, 200, { ok: true })
@@ -116,7 +127,7 @@ export default function register(r) {
     const user = requirePerm(req, 'form:delete')
     const form = pickForm(params.id, { withDeleted: true })
     if (!form) fail(404, '表单不存在')
-    if (!can(user, '*') && form.created_by !== user.id) fail(403, '无权删除该表单')
+    requireFormRole(user, form, 'own')
     // 只有已经进了回收站的表单才允许彻底删除：直接对在用表单调 purge 的话，
     // 一次误点就是「问卷连同全部答卷消失」，而回收中心根本没机会接住它。
     if (!form.deleted_at) fail(400, '请先把表单移入回收中心，再彻底删除')
@@ -141,8 +152,9 @@ export default function register(r) {
     const user = requirePerm(req, 'form:create')
     const form = pickForm(params.id, { withDeleted: true })
     if (!form) fail(404, '表单不存在')
-    // 复制等于「把这张卷子的题目连答案抄一份」，读都读不到的表单不能被复制
-    if (!can(user, '*') && form.created_by !== user.id && !form.is_template) fail(403, '无权复制该表单')
+    // 复制等于「把这张卷子的题目连答案抄一份」，读都读不到的表单不能被复制。
+    // 能看到的（含协作者）都能复制成自己的一份——复制出来的归属是自己，不影响原表单。
+    if (!form.is_template) requireFormRole(user, form, 'view')
     const ts = now()
     const result = run(
       'INSERT INTO forms(title, description, kind, schema, settings, status, is_template, category, created_by, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
@@ -159,7 +171,7 @@ export default function register(r) {
     const user = requirePerm(req, 'form:update')
     const form = pickForm(params.id)
     if (!form) fail(404, '表单不存在')
-    if (!can(user, '*') && form.created_by !== user.id) fail(403, '无权修改该表单')
+    requireFormRole(user, form, 'edit')
     const { text } = await readJson(req)
     if (!text) fail(400, '请粘贴题目文本')
     const fields = parseTextToFields(String(text))
@@ -176,7 +188,7 @@ export default function register(r) {
     const user = requirePerm(req, 'form:update')
     const form = pickForm(params.id)
     if (!form) fail(404, '表单不存在')
-    if (!can(user, '*') && form.created_by !== user.id) fail(403, '无权修改该表单')
+    requireFormRole(user, form, 'edit')
     const buf = await readXlsxUpload(req)
     if (!buf?.length) fail(400, '请上传 xlsx 文件')
     const rows = parseXlsx(buf)
@@ -189,6 +201,70 @@ export default function register(r) {
     run('UPDATE forms SET schema = ?, updated_at = ? WHERE id = ?', JSON.stringify(schema), now(), form.id)
     log(user, 'Excel 导入题目', `${form.title} #${form.id} → ${clean.length} 道`)
     sendJson(res, 200, { ok: true, added: clean.length, skipped, droppedAnswers, unknownColumns, schema })
+  })
+
+  /* ---------------- 表单协作 ---------------- */
+  /*
+   * 与题库协作同一套形状，但成员管理只给所有者：能拉人的人一多，协作关系就自己长腿跑掉了。
+   * 协作者列表对「能看见这个表单的人」开放（要看见谁在改同一份问卷），
+   * 可邀请名单只给所有者 —— 那份名单等于「全站还有哪些账号」，属于管理员信息。
+   */
+  r.get('/api/forms/:id/members', async (req, res, { params }) => {
+    const user = requireUser(req)
+    const form = pickForm(params.id)
+    if (!form) fail(404, '表单不存在')
+    const myRole = requireFormRole(user, form, 'view')
+    const owner = get('SELECT id, username, nickname, avatar FROM users WHERE id = ?', form.created_by)
+    sendJson(res, 200, {
+      ok: true,
+      data: {
+        form: { id: form.id, title: form.title, created_by: form.created_by },
+        my_role: myRole,
+        owner: owner || null,
+        members: listMembers(form),
+        candidates: myRole === 'owner' ? memberCandidates(form) : []
+      }
+    })
+  })
+
+  r.post('/api/forms/:id/members', async (req, res, { params }) => {
+    const user = requirePerm(req, 'form:update')
+    const form = pickForm(params.id)
+    if (!form) fail(404, '表单不存在')
+    requireFormRole(user, form, 'own')
+    const body = await readJson(req)
+    const role = FORM_MEMBER_ROLES.includes(body.role) ? body.role : 'editor'
+    const target = body.userId
+      ? get('SELECT id, username, nickname, status FROM users WHERE id = ?', Number(body.userId))
+      : get('SELECT id, username, nickname, status FROM users WHERE username = ?', String(body.username || '').trim())
+    if (!target) fail(404, '用户不存在')
+    if (Number(target.id) === Number(form.created_by)) fail(400, '所有者本人不需要加入协作者')
+    // 停用账号拉进来等于给了一个「登录不上的人」的权限位，等它被启用那天自动生效
+    if (target.status !== 1) fail(400, '该账号已被停用，无法加入协作')
+    const exist = get('SELECT role FROM form_members WHERE form_id = ? AND user_id = ?', form.id, target.id)
+    if (exist) {
+      if (exist.role === role) fail(400, `${target.nickname || target.username} 已经是该表单的协作者（${ROLE_LABEL[role]}）`)
+      run('UPDATE form_members SET role = ? WHERE form_id = ? AND user_id = ?', role, form.id, target.id)
+      log(user, '调整表单协作者', `${form.title} #${form.id} → ${target.username} ${role}`)
+      return sendJson(res, 200, { ok: true, updated: true, user_id: target.id, role })
+    }
+    addMember(form, target, role, user)
+    log(user, '新增表单协作者', `${form.title} #${form.id} → ${target.username} ${role}`)
+    sendJson(res, 201, { ok: true, user_id: target.id, role })
+  })
+
+  r.delete('/api/forms/:id/members/:userId', async (req, res, { params }) => {
+    const user = requirePerm(req, 'form:update')
+    const form = pickForm(params.id)
+    if (!form) fail(404, '表单不存在')
+    requireFormRole(user, form, 'own')
+    const targetId = Number(params.userId)
+    const row = get('SELECT * FROM form_members WHERE form_id = ? AND user_id = ?', form.id, targetId)
+    if (!row) fail(404, '该用户不是这个表单的协作者')
+    run('DELETE FROM form_members WHERE form_id = ? AND user_id = ?', form.id, targetId)
+    const t = get('SELECT username FROM users WHERE id = ?', targetId)
+    log(user, '移除表单协作者', `${form.title} #${form.id} → ${t?.username || targetId}`)
+    sendJson(res, 200, { ok: true })
   })
 
   /** 模板中心 */
@@ -219,17 +295,20 @@ export default function register(r) {
     const user = requireUser(req)
     // 模板也躺在 forms 表里。之前没排除，工作台一进来就报「表单总数 6 / 已发布 6」，
     // 而用户其实一张问卷都没建——数字全来自内置模板，第一眼就在骗人。
-    const own = `f.is_template = 0 AND f.deleted_at IS NULL` + (can(user, '*') ? '' : ` AND f.created_by = ${user.id}`)
-    const forms = get(`SELECT COUNT(*) c FROM forms f WHERE ${own}`).c
-    const published = get(`SELECT COUNT(*) c FROM forms f WHERE ${own} AND f.status = 'published'`).c
+    const scope = formVisibleScope(user)
+    const own = `f.is_template = 0 AND f.deleted_at IS NULL AND (${scope.sql})`
+    const scopeArgs = scope.args
+    // 协作者的表单也算「我的工作台」：他确实每天在这上面干活，数字里不出现才是错的
+    const forms = get(`SELECT COUNT(*) c FROM forms f WHERE ${own}`, ...scopeArgs).c
+    const published = get(`SELECT COUNT(*) c FROM forms f WHERE ${own} AND f.status = 'published'`, ...scopeArgs).c
     // 答卷要跟着表单一起算：表单进了回收站，它的答卷就不该还在工作台上冒出来。
     // 之前只过滤 s.deleted_at，删掉的问卷答卷照样躺在趋势图和「最近提交」里。
-    const visible = `s.deleted_at IS NULL AND f.deleted_at IS NULL AND f.is_template = 0` + (can(user, '*') ? '' : ` AND f.created_by = ${user.id}`)
+    const visible = `s.deleted_at IS NULL AND f.deleted_at IS NULL AND f.is_template = 0 AND (${scope.sql})`
     const subsFrom = `FROM submissions s JOIN forms f ON f.id = s.form_id WHERE ${visible}`
-    const submissions = get(`SELECT COUNT(*) c ${subsFrom}`).c
-    const today = get(`SELECT COUNT(*) c ${subsFrom} AND s.created_at >= ?`, new Date().toISOString().slice(0, 10)).c
-    const trend = all(`SELECT substr(s.created_at,1,10) AS date, COUNT(*) AS count ${subsFrom} GROUP BY date ORDER BY date DESC LIMIT 14`).reverse()
-    const recent = all(`SELECT s.id, s.form_id, s.created_at, f.title ${subsFrom} ORDER BY s.id DESC LIMIT 8`)
+    const submissions = get(`SELECT COUNT(*) c ${subsFrom}`, ...scopeArgs).c
+    const today = get(`SELECT COUNT(*) c ${subsFrom} AND s.created_at >= ?`, ...scopeArgs, new Date().toISOString().slice(0, 10)).c
+    const trend = all(`SELECT substr(s.created_at,1,10) AS date, COUNT(*) AS count ${subsFrom} GROUP BY date ORDER BY date DESC LIMIT 14`, ...scopeArgs).reverse()
+    const recent = all(`SELECT s.id, s.form_id, s.created_at, f.title ${subsFrom} ORDER BY s.id DESC LIMIT 8`, ...scopeArgs)
     const users = get('SELECT COUNT(*) c FROM users').c
     sendJson(res, 200, { ok: true, data: { forms, published, submissions, today, users, trend, recent } })
   })

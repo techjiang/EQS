@@ -24,6 +24,10 @@ export default {
     const selected = ref([])
     const importing = ref(false)
     const review = ref(null)
+    // 只读协作者打开明细会被服务端 403。以前这里只弹一句 toast，页面照样显示
+    // 「该表单还没有答卷」——那句话的意思是「没人填过」，跟真实原因完全不是一回事。
+    // 所以把拒绝理由留在页面上，而不是让它随 toast 一起消失。
+    const denied = ref('')
 
     // 与服务端同一份实现（flow.js）：这里曾经自己抄了一遍 fieldVisible 的分支，
     // 于是「条件跳转跳过的题」在这一页仍然算「答过」，批阅清单和报表对不上
@@ -49,6 +53,7 @@ export default {
 
     const load = async () => {
       loading.value = true
+      denied.value = ''
       try {
         const qs = new URLSearchParams({ page: page.value, pageSize: 20 })
         if (formId.value) qs.set('formId', formId.value)
@@ -59,7 +64,11 @@ export default {
         rows.value = r.data
         total.value = r.total
         totalPages.value = r.totalPages
-      } catch (e) { err(e.message) } finally { loading.value = false }
+      } catch (e) {
+        // 403 与「没有数据」必须区分开：一个是没权限，一个是真没有
+        if (/只读|无权/.test(e.message || '')) denied.value = e.message
+        else err(e.message)
+      } finally { loading.value = false }
     }
 
     /**
@@ -291,6 +300,20 @@ export default {
     const cols = computed(() => (form.value?.schema || []).filter(f => !['divider', 'richtext', 'html', 'image'].includes(f.type)).slice(0, 4))
 
     return () => h('div', {}, [
+      // 被拒绝时整页只留说明：工具条上一排「导出 / 导入 / 批量删除」点了全是 403，
+      // 摆在那里等于把人往错误上引
+      denied.value ? h('div', {}, [
+        h('div', { class: 'page-head' }, h('div', {}, [
+          h('h1', {}, '答卷数据'),
+          h('div', { class: 'sub' }, '只读协作者看不到逐份答卷，请查看统计分析')
+        ])),
+        h('div', { class: 'card pad' }, h('div', { class: 'center', style: 'padding:56px 20px' }, [
+          h('div', { style: 'font-size:38px;opacity:.3;margin-bottom:10px' }, '🔒'),
+          h('h3', { style: 'margin-bottom:6px' }, '这份表单的答卷明细对你不可见'),
+          h('div', { class: 'small muted', style: 'margin-bottom:16px;max-width:430px' }, denied.value + '。需要看逐份作答的话，请表单所有者把你改成「可编辑」。'),
+          h('a', { class: 'btn primary', href: '/report?formId=' + formId.value, 'data-link': true }, '去看统计分析')
+        ]))
+      ]) : h('div', {}, [
       h('div', { class: 'page-head' }, [
         h('div', {}, [h('h1', {}, '答卷数据'), h('div', { class: 'sub' }, '新增、编辑、筛选、导入导出、打印与附件打包')]),
         h('div', { class: 'flex wrap' }, [
@@ -490,6 +513,7 @@ export default {
           }, '保存')
         ]
       }) : null
+      ])
     ])
   }
 }

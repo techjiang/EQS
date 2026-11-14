@@ -23,7 +23,10 @@ export default {
         const me = await api.get('/api/auth/me')
         state.user = me.user
         toast('欢迎回来，' + (me.user.nickname || me.user.username), 'ok')
-        navigate('/')
+        // 从「仅限登录用户填写」的表单过来时回原页：登录完绕到工作台再找回来，
+        // 那份问卷多半已经找不到了
+        const next = new URLSearchParams(location.search).get('next')
+        navigate(next && next.startsWith('/') ? next : '/')
       } catch (e) {
         err(e.message)
       } finally {

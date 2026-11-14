@@ -21,6 +21,47 @@ export default {
     const aiMode = ref(false)
     const aiPrompt = ref('')
     const aiLoading = ref(false)
+    /* ---------------- 表单协作 ---------------- */
+    const memberOpen = ref(false)
+    const memberForm = ref(null)
+    const memberData = ref(null)
+
+    const openMembers = async (f) => {
+      memberForm.value = f
+      memberData.value = null
+      memberOpen.value = true
+      try {
+        const r = await api.get(`/api/forms/${f.id}/members`)
+        memberData.value = r.data
+      } catch (e) { err(e.message) }
+    }
+    const reloadMembers = async () => {
+      const r = await api.get(`/api/forms/${memberForm.value.id}/members`)
+      memberData.value = r.data
+      load()
+    }
+    const inviteMember = async (userId, role) => {
+      try {
+        await api.post(`/api/forms/${memberForm.value.id}/members`, { userId, role })
+        ok(`已加入协作（${role === 'editor' ? '可编辑' : '只读'}）`)
+        reloadMembers()
+      } catch (e) { err(e.message) }
+    }
+    const setMemberRole = async (m, role) => {
+      try {
+        await api.post(`/api/forms/${memberForm.value.id}/members`, { userId: m.user_id, role })
+        ok('已改为' + (role === 'editor' ? '可编辑' : '只读'))
+        reloadMembers()
+      } catch (e) { err(e.message) }
+    }
+    const removeMember = async (m) => {
+      if (!await confirmBox(`把 ${m.nickname || m.username} 移出这份表单的协作？`)) return
+      try {
+        await api.del(`/api/forms/${memberForm.value.id}/members/${m.user_id}`)
+        ok('已移除')
+        reloadMembers()
+      } catch (e) { err(e.message) }
+    }
 
     const load = async () => {
       loading.value = true
@@ -101,16 +142,23 @@ export default {
       ]),
       h('div', { style: 'padding:14px 16px' }, [
         h('div', { class: 'flex between', style: 'margin-bottom:10px' }, [
-          h('span', { class: ['tag', f.status === 'published' ? 'ok' : 'warn'] }, f.status === 'published' ? '已发布' : '草稿'),
-          h('span', { class: 'small muted' }, `${f.submission_count || 0} 份答卷`)
+          h('div', { class: 'flex', style: 'gap:6px;align-items:center' }, [
+            h('span', { class: ['tag', f.status === 'published' ? 'ok' : 'warn'] }, f.status === 'published' ? '已发布' : '草稿'),
+            // 协作身份标在卡片上：否则协作者会疑惑「这张表为什么不在我建的列表里」
+            f.my_role && f.my_role !== 'owner' ? h('span', { class: 'tag brand' }, f.my_role === 'editor' ? '可编辑' : '只读') : null
+          ]),
+          h('span', { class: 'small muted' }, `${f.submission_count || 0} 份答卷${f.member_count ? ` · ${f.member_count} 人协作` : ''}`)
         ]),
         h('div', { class: 'small muted', style: 'margin-bottom:12px' }, '更新于 ' + fmtDate(f.updated_at)),
         h('div', { class: 'flex wrap', style: 'gap:6px' }, [
-          h('button', { class: 'btn sm', onClick: () => navigate(`/forms/${f.id}/design`) }, '编辑'),
-          h('button', { class: 'btn sm', onClick: () => publish(f) }, f.status === 'published' ? '取消发布' : '发布'),
+          // 只读协作者不该看见「编辑」「发布」：点了才弹 403 比没有按钮更恼人
+          f.my_role === 'viewer' ? null : h('button', { class: 'btn sm', onClick: () => navigate(`/forms/${f.id}/design`) }, '编辑'),
+          f.my_role === 'viewer' ? null : h('button', { class: 'btn sm', onClick: () => publish(f) }, f.status === 'published' ? '取消发布' : '发布'),
           h('button', { class: 'btn sm', onClick: () => copyLink(f) }, '链接'),
-          h('button', { class: 'btn sm', onClick: () => navigate(`/data?formId=${f.id}`) }, '数据'),
+          // 只读协作者看不到答卷明细（服务端 403），入口也就别摆出来
+          f.my_role === 'viewer' ? null : h('button', { class: 'btn sm', onClick: () => navigate(`/data?formId=${f.id}`) }, '数据'),
           h('button', { class: 'btn sm', onClick: () => navigate(`/report?formId=${f.id}`) }, '报表'),
+          f.my_role === 'owner' ? h('button', { class: 'btn sm', onClick: () => openMembers(f) }, `协作${f.member_count ? ' · ' + f.member_count : ''}`) : null,
           h('button', { class: 'btn sm ghost', title: '更多', onClick: () => moreMenu(f) }, '···')
         ])
       ])
@@ -119,11 +167,13 @@ export default {
     const moreMenu = (f) => {
       const overlay = document.createElement('div')
       overlay.className = 'modal-mask'
+      // 只读协作者不该看见「保存为模板 / 移入回收中心」：这两件事都要所有者权限，
+      // 摆出来等于让人白点一次再吃 403
+      const ro = f.my_role === 'viewer'
       const actions = [
         ['预览填写', () => navigate(`/f/${f.id}?preview=1`)],
         ['复制表单', () => duplicate(f)],
-        ['保存为模板', () => saveTemplate(f)],
-        ['移入回收中心', () => remove(f)]
+        ...(ro ? [] : [['保存为模板', () => saveTemplate(f)], ['移入回收中心', () => remove(f)]])
       ]
       overlay.innerHTML = `<div class="modal" style="max-width:340px"><div class="modal-h"><h3>${f.title}</h3></div><div class="modal-b" style="padding:8px"></div></div>`
       const body = overlay.querySelector('.modal-b')
@@ -198,6 +248,54 @@ export default {
           h('button', { class: 'btn', onClick: () => showNew.value = false }, '取消'),
           h('button', { class: 'btn primary', disabled: aiLoading.value, onClick: create }, aiLoading.value ? '生成中…' : '创建并设计')
         ]
+      }) : null,
+
+      memberOpen.value ? Modal({
+        title: '表单协作 · ' + (memberForm.value?.title || ''), modelValue: true,
+        onClose: () => memberOpen.value = false, wide: true,
+        children: memberData.value ? [
+          h('div', { class: 'hint mb' }, '协作者一起维护这份表单：可编辑能改题目、发布、看数据与批阅；只读只能看表单与报表。只有所有者能管理协作者、删除表单。'),
+          h('div', { class: 'field' }, [
+            h('label', {}, '所有者'),
+            h('div', { class: 'flex', style: 'gap:8px;align-items:center' }, [
+              h('img', { src: memberData.value.owner?.avatar || '/assets/eqs-mark.svg', style: 'width:26px;height:26px;border-radius:8px' }),
+              h('span', { style: 'font-weight:540' }, memberData.value.owner?.nickname || memberData.value.owner?.username || '-'),
+              h('span', { class: 'tag brand' }, '所有者')
+            ])
+          ]),
+          h('div', { class: 'field' }, [
+            h('label', {}, `协作者（${memberData.value.members.length}）`),
+            memberData.value.members.length
+              ? memberData.value.members.map(m => h('div', {
+                  class: 'flex between wrap', style: 'padding:8px 0;border-bottom:1px solid var(--line-2);gap:8px'
+                }, [
+                  h('div', { class: 'flex', style: 'gap:8px;align-items:center;min-width:0' }, [
+                    h('img', { src: m.avatar || '/assets/eqs-mark.svg', style: 'width:26px;height:26px;border-radius:8px' }),
+                    h('div', { style: 'min-width:0' }, [
+                      h('div', { class: 'truncate', style: 'font-weight:540' }, m.nickname || m.username),
+                      h('div', { class: 'small muted' }, [m.username, m.dept_name ? ' · ' + m.dept_name : ''].join(''))
+                    ])
+                  ]),
+                  h('div', { class: 'flex', style: 'gap:4px;align-items:center' }, [
+                    h('button', { class: ['btn', 'sm', m.role === 'editor' ? 'primary' : ''], onClick: () => setMemberRole(m, 'editor') }, '可编辑'),
+                    h('button', { class: ['btn', 'sm', m.role === 'viewer' ? 'primary' : ''], onClick: () => setMemberRole(m, 'viewer') }, '只读'),
+                    h('button', { class: 'btn ghost sm danger', onClick: () => removeMember(m) }, '移除')
+                  ])
+                ]))
+              : h(Empty, { text: '还没有协作者，这份表单只有你能改' })
+          ]),
+          memberData.value.candidates?.length ? h('div', { class: 'field' }, [
+            h('label', {}, '添加协作者'),
+            h('div', { class: 'flex wrap', style: 'gap:6px' }, memberData.value.candidates.map(u => h('div', {
+              class: 'flex', style: 'gap:6px;align-items:center;border:1px solid var(--line);border-radius:9px;padding:4px 8px'
+            }, [
+              h('span', { class: 'small' }, u.nickname || u.username),
+              h('button', { class: 'btn sm', onClick: () => inviteMember(u.id, 'editor') }, '可编辑'),
+              h('button', { class: 'btn sm', onClick: () => inviteMember(u.id, 'viewer') }, '只读')
+            ])))
+          ]) : h('div', { class: 'hint' }, '没有可添加的人了（所有启用账号都已经是协作者）')
+        ] : [h('div', { style: 'padding:20px' }, '加载中…')],
+        footer: [h('button', { class: 'btn', onClick: () => memberOpen.value = false }, '关闭')]
       }) : null
     ])
   }

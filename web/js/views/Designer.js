@@ -568,6 +568,9 @@ export default {
           class: 'input', value: sget('password', ''), onInput: e => set('password', e.target.value)
         })) : null,
         sw('onlyWechat', '仅限微信内填写'),
+        // 「登录后才能填」：Issue 原文里写着「白名单、密码、登录、微信填写」，
+        // 这一条之前既没有开关也没有服务端校验——问卷是公开入口，拿到链接就能填。
+        sw('needLogin', '仅限登录用户填写'),
         sw('allowQuery', '允许答卷编号查询'),
         sw('recordWechat', '记录微信昵称头像'),
         h('div', { class: 'row' }, [

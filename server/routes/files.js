@@ -6,6 +6,7 @@ import { requireUser, requirePerm, currentUser, can } from '../lib/auth.js'
 import { upload, localPath, storageConfig, DRIVERS } from '../lib/storage.js'
 import { safeJson } from '../lib/forms.js'
 import { buildZip, extractZip, writeZipStream } from '../lib/zip.js'
+import { formRole, formVisibleScope, requireFormRole } from '../lib/formMembers.js'
 
 /** multipart/form-data 解析（够用即可） */
 /**
@@ -102,9 +103,14 @@ export default function register(r) {
     const user = currentUser(req)
     if (!user) {
       if (!formId) fail(401, '请先登录')
-      const form = get('SELECT id, status FROM forms WHERE id = ? AND deleted_at IS NULL', formId)
+      const form = get('SELECT id, status, settings FROM forms WHERE id = ? AND deleted_at IS NULL', formId)
       if (!form) fail(404, '表单不存在')
       if (form.status !== 'published') fail(403, '表单未发布，无法上传附件')
+      // 表单要求登录才能填时，附件上传也必须拦住：否则匿名者仍能往这个表单灌文件，
+      // 「仅登录可填」只剩答题那一步成立
+      let fs2 = {}
+      try { fs2 = JSON.parse(form.settings || '{}') } catch {}
+      if (fs2.needLogin) fail(401, '该表单仅限登录用户填写，请先登录')
     }
     const maxMb = 100
     if (data.length > maxMb * 1024 * 1024) fail(413, `文件超过 ${maxMb}MB`)
@@ -144,7 +150,9 @@ export default function register(r) {
     if (url.searchParams.get('formId')) { where.push('form_id = ?'); args.push(Number(url.searchParams.get('formId'))) }
     // 附件挂在表单上，可见性就该跟表单一致：之前任何带 data:read 的账号
     // 都能列出全站附件（含别人的表单 id、原始文件名、存储路径）。
-    if (!can(me, '*')) { where.push('form_id IN (SELECT id FROM forms WHERE created_by = ?)'); args.push(me.id) }
+    // 附件可见性跟表单一致：协作者也能看到自己那份问卷的附件
+    const scope = formVisibleScope(me, 'forms')
+    if (scope.sql !== '1 = 1') { where.push(`form_id IN (SELECT id FROM forms WHERE ${scope.sql})`); args.push(...scope.args) }
     const rows = all(`SELECT * FROM files ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY id DESC LIMIT 500`, ...args)
     sendJson(res, 200, { ok: true, data: rows })
   })
@@ -156,8 +164,8 @@ export default function register(r) {
     // 删文件比删表单更狠：磁盘上的文件当场没了，回收中心接不住。
     // 之前只校验 data:write，换一个 id 就能删掉别人整个问卷的附件。
     if (!can(me, '*')) {
-      const form = row.form_id ? get('SELECT created_by FROM forms WHERE id = ?', row.form_id) : null
-      if (form?.created_by !== me.id) fail(403, '无权删除该文件')
+      const form = row.form_id ? get('SELECT * FROM forms WHERE id = ?', row.form_id) : null
+      if (!form || formRole(me, form) !== 'owner') fail(403, '无权删除该文件')
     }
     if (row.driver === 'local') {
       const f = localPath(row.stored)
@@ -176,9 +184,9 @@ export default function register(r) {
    */
   r.get('/api/forms/:id/attachments.zip', async (req, res, { params }) => {
     const user = requirePerm(req, 'data:read')
-    const form = get('SELECT id, title, created_by FROM forms WHERE id = ?', Number(params.id))
+    const form = get('SELECT * FROM forms WHERE id = ?', Number(params.id))
     if (!form) fail(404, '表单不存在')
-    if (!can(user, '*') && form.created_by !== user.id) fail(403, '无权导出该表单的附件')
+    requireFormRole(user, form, 'edit')
     const rows = all(`SELECT fl.* FROM files fl JOIN submissions s ON s.id = fl.submission_id
       WHERE s.form_id = ? AND s.deleted_at IS NULL AND fl.driver = 'local'`, Number(params.id))
     // 文件可能已经从磁盘上被删或在别处丢失，跳过后在响应头里报数——

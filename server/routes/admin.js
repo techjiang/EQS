@@ -147,6 +147,8 @@ export default function register(r) {
     // 人没了，协作关系也得跟着走：留在 bank_members 里就是一个指向空气的权限位，
     // 而 id 会被新注册的账号复用，于是新用户凭空继承了一个题库的编辑权。
     run('DELETE FROM bank_members WHERE user_id = ?', target.id)
+    // 表单协作同理：留着就是一条指向空气的权限位，而 id 会被新账号复用
+    run('DELETE FROM form_members WHERE user_id = ?', target.id)
     revokeUserSessions(target.id, { byUserId: me.id })
     log(me, '删除用户', target.username)
     sendJson(res, 200, { ok: true })
