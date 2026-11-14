@@ -162,6 +162,30 @@ export default {
       } catch (e) { err(e.message) } finally { importing.value = false }
     }
 
+    /*
+     * 备份体检。
+     * 导入会验库，但不验附件：包是人工拷来拷去的，断点续传一断、网盘同步失败、
+     * tar 少拿一层目录，都能做出「库好、附件缺一半」的包——导入时照样显示「导入成功」。
+     * 所以给一个只读的体检入口：先看清缺什么，再决定要不要导。
+     */
+    const inspecting = ref(false)
+    const report = ref(null)
+    const inspect = async (file) => {
+      if (!file) return
+      inspecting.value = true
+      report.value = null
+      try {
+        const fd = new FormData()
+        fd.append('file', file)
+        const res = await fetch('/api/backup/inspect', { method: 'POST', body: fd, credentials: 'same-origin' })
+        const j = await res.json()
+        if (!j.ok) throw new Error(j.message)
+        report.value = { ...j.data, name: file.name, bytes: file.size }
+        if (j.data.ok) ok('体检通过：库可读，附件对得上')
+        else err(`体检发现问题：${j.data.errors[0] || '见明细'}`)
+      } catch (e) { err(e.message) } finally { inspecting.value = false }
+    }
+
     const rollback = async (name) => {
       if (!await confirmBox(`回滚到 ${name}？当前数据会先被另存一份，回滚本身也能再撤回。`)) return
       rollingBack.value = true
@@ -452,8 +476,39 @@ export default {
                     type: 'file', accept: '.zip', class: 'hide',
                     onChange: e => { restore(e.target.files?.[0]); e.target.value = '' }
                   })
+                ]),
+                h('label', { class: 'btn', style: inspecting.value ? 'opacity:.6;pointer-events:none' : '' }, [
+                  inspecting.value ? '体检中…' : '体检备份',
+                  h('input', {
+                    type: 'file', accept: '.zip', class: 'hide',
+                    onChange: e => { inspect(e.target.files?.[0]); e.target.value = '' }
+                  })
                 ])
               ]),
+              report.value ? h('div', {
+                class: 'card pad', style: 'margin-top:12px;background:var(--surface-2,#f7f9fc)'
+              }, [
+                h('div', { class: 'flex between wrap', style: 'gap:8px' }, [
+                  h('b', { class: 'small' }, `${report.value.name} 体检结果`),
+                  h('span', { class: ['tag', report.value.ok ? 'ok' : 'danger'] }, report.value.ok ? '可以导入' : '不建议导入')
+                ]),
+                h('div', { class: 'small muted', style: 'margin-top:6px;line-height:1.7' }, [
+                  report.value.db ? h('div', {}, `数据库：${report.value.db.ok ? '可用' : '有问题'} · ${fmtSize(report.value.db.bytes || 0)}`) : null,
+                  report.value.files ? h('div', {},
+                    `附件：包里 ${report.value.files.inZip} 个（${fmtSize(report.value.files.bytes)}）· 库里有记录 ${report.value.files.referenced} 个 · 对得上 ${report.value.files.present} 个`) : null,
+                  report.value.files?.remote ? h('div', {}, `另有 ${report.value.files.remote} 个存在对象存储，不属于本地文件`) : null,
+                  report.value.files?.missingCount
+                    ? h('div', { style: 'color:var(--danger)' }, `缺 ${report.value.files.missingCount} 个附件（${fmtSize(report.value.files.missingBytes)}）`)
+                    : null,
+                  ...(report.value.warnings || []).map(w => h('div', {}, `提醒：${w}`)),
+                  ...(report.value.errors || []).map(e2 => h('div', { style: 'color:var(--danger)' }, `问题：${e2}`))
+                ]),
+                report.value.files?.missing?.length ? h('div', {
+                  class: 'small', style: 'margin-top:8px;max-height:180px;overflow:auto'
+                }, report.value.files.missing.map(m => h('div', { style: 'word-break:break-all;padding:2px 0' },
+                  `#${m.id} ${m.name} · ${m.formTitle || '表单 #' + (m.formId || '-')} · ${fmtSize(m.size || 0)}`))) : null,
+                h('button', { class: 'btn sm', style: 'margin-top:10px', onClick: () => report.value = null }, '知道了')
+              ]) : null,
               h('div', { class: 'small muted', style: 'margin-top:12px' },
                 '命令行也可以直接备份：bash scripts/backup.sh（服务运行中同样安全，会先做事一致快照）。'),
               h('div', { style: 'margin-top:18px' }, [

@@ -577,6 +577,40 @@ export default function register(r) {
     sendJson(res, 201, { ok: true, id })
   })
 
+  /**
+   * 批量保存人工分：`{ items: [{ id, scores, note }] }`。
+   * 只保存传上来的那几份；某一份出错不牵连其它份——报回哪几份被拒，别整批回滚。
+   */
+  r.put('/api/submissions/review-batch', async (req, res) => {
+    const user = requirePerm(req, 'data:write')
+    const body = await readJson(req)
+    const items = Array.isArray(body.items) ? body.items : []
+    if (!items.length) fail(400, '没有要保存的答卷')
+    if (items.length > 200) fail(400, '一次最多保存 200 份答卷')
+    const saved = []
+    const rejected = []
+    const formCache = new Map()
+    for (const it of items) {
+      const id = Number(it?.id)
+      const row = id ? get('SELECT * FROM submissions WHERE id = ? AND deleted_at IS NULL', id) : null
+      if (!row) { rejected.push({ id, reason: '答卷不存在' }); continue }
+      if (!formCache.has(row.form_id)) formCache.set(row.form_id, pickForm(row.form_id))
+      const form = formCache.get(row.form_id)
+      if (!form) { rejected.push({ id, reason: '表单不存在' }); continue }
+      if (form.kind !== 'exam') { rejected.push({ id, reason: '只有考试答卷需要批阅' }); continue }
+      const role = formRole(user, form)
+      if (!role || role === 'viewer') { rejected.push({ id, reason: '无权批阅该答卷' }); continue }
+      try {
+        const data = applyReview(user, row, form, it.scores, it.note, { merge: true })
+        saved.push({ id, score: data.score, review: data.review })
+      } catch (e) {
+        rejected.push({ id, reason: e.message || '保存失败' })
+      }
+    }
+    if (saved.length) log(user, '批量批阅', `${saved.length} 份答卷${rejected.length ? `，${rejected.length} 份被拒` : ''}`)
+    sendJson(res, 200, { ok: true, saved: saved.length, rejected })
+  })
+
   r.put('/api/submissions/:id', async (req, res, { params }) => {
     const user = requirePerm(req, 'data:write')
     const row = get('SELECT * FROM submissions WHERE id = ? AND deleted_at IS NULL', Number(params.id))
@@ -605,6 +639,40 @@ export default function register(r) {
    * 人工批阅：给主观题打分并重算成绩
    * body: { scores: { [fieldId]: 0..满分 }, note?: string }
    */
+  /**
+   * 给一份答卷落人工分。单份批阅与批量阅卷共用这一处：
+   * 两条路各写一遍的话，「哪些题可以给分」很快会分叉——而分叉的后果是
+   * 老师在工作台里给的分，换个入口保存就变成非法值。
+   */
+  function applyReview(user, row, form, rawScores, note, { merge = false } = {}) {
+    const data = JSON.parse(row.data)
+    // 只认这份卷子里真有、且确实没有标准答案的题，防止给选择题凭空加分
+    const subjective = new Map(form.schema.filter(f => isSubjective(f) && fieldVisible(f, data)).map(f => [f.id, f]))
+    /*
+     * merge 是批量阅卷用的：那一页只提交「这次填了分的题」。
+     * 直接整体覆盖的话，同一份卷子分两次批（先批第一题、第二天再批第二题），
+     * 第二次就把第一次的分抹了——成绩悄悄回落，而两次都提示「已保存」。
+     * 单份批阅保持整体覆盖：老师看到的是全部题目，改动就是全部改动。
+     */
+    const scores = merge ? { ...manualScoresOf(row) } : {}
+    for (const [fid, raw] of Object.entries(rawScores || {})) {
+      const f = subjective.get(fid)
+      if (!f) continue
+      // 显式传 null 表示「撤掉这道题的分数」，让它回到待批
+      if (raw === null) { delete scores[fid]; continue }
+      if (raw === undefined || raw === '') continue
+      const n = Number(raw)
+      if (!Number.isFinite(n)) fail(400, `「${f.label}」的分数不是数字`)
+      if (n < 0 || n > f.score) fail(400, `「${f.label}」应在 0 - ${f.score} 分之间`)
+      scores[fid] = Math.round(n * 100) / 100
+    }
+    const g = gradeSubmission(form.schema, data, form.settings, scores)
+    run('UPDATE submissions SET manual_scores = ?, score = ?, passed = ?, reviewed_at = ?, reviewed_by = ?, review_note = ?, updated_at = ? WHERE id = ?',
+      JSON.stringify(scores), g.score, g.passed ? 1 : 0, now(), user.id, String(note ?? row.review_note ?? '').slice(0, 500), now(), row.id)
+    const updated = get('SELECT * FROM submissions WHERE id = ?', row.id)
+    return { ...withManual(updated), review: buildReview(form.schema, data, form.settings, scores) }
+  }
+
   r.put('/api/submissions/:id/review', async (req, res, { params }) => {
     const user = requirePerm(req, 'data:write')
     const row = get('SELECT * FROM submissions WHERE id = ? AND deleted_at IS NULL', Number(params.id))
@@ -614,26 +682,64 @@ export default function register(r) {
     if (form.kind !== 'exam') fail(400, '只有考试答卷需要批阅')
     requireFormRole(user, form, 'edit')
     const body = await readJson(req)
-    const data = JSON.parse(row.data)
-    // 只认这份卷子里真有、且确实没有标准答案的题，防止给选择题凭空加分
-    const subjective = new Map(form.schema.filter(f => isSubjective(f) && fieldVisible(f, data)).map(f => [f.id, f]))
-    const scores = {}
-    for (const [fid, raw] of Object.entries(body.scores || {})) {
-      const f = subjective.get(fid)
-      if (!f) continue
-      if (raw === null || raw === undefined || raw === '') continue
-      const n = Number(raw)
-      if (!Number.isFinite(n)) fail(400, `「${f.label}」的分数不是数字`)
-      if (n < 0 || n > f.score) fail(400, `「${f.label}」应在 0 - ${f.score} 分之间`)
-      scores[fid] = Math.round(n * 100) / 100
+    // 合并而不是覆盖：文档里一直写着「未出现在 scores 里的主观题保留原有分数」，
+    // 而代码此前是整体替换——前端每次都把全部题目回传，所以没人发现这句话是假的。
+    const data = applyReview(user, row, form, body.scores, body.note, { merge: true })
+    log(user, '批阅答卷', `#${row.id} → ${data.score}/${data.review?.total ?? '-'}`)
+    dispatchWebhooks('update', { formId: form.id, formTitle: form.title, submission: withManual(get('SELECT * FROM submissions WHERE id = ?', row.id)) }).catch(() => {})
+    sendJson(res, 200, { ok: true, data })
+  })
+
+  /**
+   * 批量阅卷：一次拿一整页待批的主观题。
+   *
+   * 以前批卷是「点开一份 → 给分 → 保存 → 回到列表 → 点开下一份」，
+   * 一次五步，30 份就是 150 次点击，而且中间还要重新加载列表。
+   * 现在按表单一次取出这一页的待批答卷（含逐题作答原文与已给的分），
+   * 前端翻页即阅，保存可以攒着一起提交。
+   *
+   * 口径与「待批阅」筛选完全一致：有主观题的考试表单、还有题没给分。
+   */
+  r.get('/api/forms/:id/review-queue', async (req, res, { params }) => {
+    const user = requirePerm(req, 'data:read')
+    const form = pickForm(params.id)
+    if (!form) fail(404, '表单不存在')
+    requireFormRole(user, form, 'edit')
+    if (form.kind !== 'exam') fail(400, '只有考试答卷需要批阅')
+    const url = new URL(req.url, 'http://x')
+    const limit = Math.min(Math.max(Number(url.searchParams.get('limit')) || 20, 1), 50)
+    const offset = Math.max(Number(url.searchParams.get('offset')) || 0, 0)
+    // 先按「这份卷子还剩几题没批」筛一遍：没有主观题或已批完的不进队列
+    const queue = []
+    let scanned = 0
+    for (const row of each('SELECT id, public_id, data, manual_scores, score, passed, created_at, review_note, reviewed_at FROM submissions WHERE form_id = ? AND deleted_at IS NULL ORDER BY id ASC', form.id)) {
+      scanned++
+      if (pendingLeft(form, row) === 0) continue
+      queue.push(row)
     }
-    const g = gradeSubmission(form.schema, data, form.settings, scores)
-    run('UPDATE submissions SET manual_scores = ?, score = ?, passed = ?, reviewed_at = ?, reviewed_by = ?, review_note = ?, updated_at = ? WHERE id = ?',
-      JSON.stringify(scores), g.score, g.passed ? 1 : 0, now(), user.id, String(body.note ?? row.review_note ?? '').slice(0, 500), now(), row.id)
-    log(user, '批阅答卷', `#${row.id} → ${g.score}/${g.total}`)
-    const updated = get('SELECT * FROM submissions WHERE id = ?', row.id)
-    dispatchWebhooks('update', { formId: form.id, formTitle: form.title, submission: withManual(updated) }).catch(() => {})
-    sendJson(res, 200, { ok: true, data: { ...withManual(updated), review: buildReview(form.schema, data, form.settings, scores) } })
+    const page = queue.slice(offset, offset + limit)
+    const data = page.map(row => {
+      const answers = JSON.parse(row.data)
+      const manual = manualScoresOf(row)
+      const flow = buildFlow(form.schema, answers)
+      const items = form.schema
+        .filter(f => isSubjective(f) && flow.active.has(f.id))
+        .map(f => ({
+          id: f.id, label: f.label, type: f.type, score: Number(f.score) || 0,
+          // 作答原文按题目自己的样子摊开：矩阵题 join 出来是 [object Object]
+          given: answerText(f, answers[f.id]) || '',
+          givenRaw: answers[f.id] === undefined ? null : answers[f.id],
+          analysis: f.analysis || '',
+          current: manual[f.id] === undefined ? null : manual[f.id]
+        }))
+      return {
+        id: row.id, publicId: row.public_id, createdAt: row.created_at,
+        score: row.score, passed: row.passed, note: row.review_note || '',
+        answeredCount: items.filter(i => i.given).length,
+        items
+      }
+    })
+    sendJson(res, 200, { ok: true, data, total: queue.length, scanned, offset, limit })
   })
 
   /** 从回收站恢复一份答卷 */

@@ -1,4 +1,5 @@
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import crypto from 'node:crypto'
 import { db, dbFile, DATA_DIR, switchDb } from './db.js'
@@ -383,4 +384,146 @@ export async function restoreFiles(zip, targetRoot = DATA_DIR) {
     bytes += entry.uncompSize || 0
   }
   return { added, skipped, bytes }
+}
+
+/* ---------------- 备份包体检 ----------------
+ *
+ * 导入这一步现在会验库（文件头、integrity_check、核心表），但**不验附件**。
+ * 于是「导入成功」这四个字仍然只是一句关于 eqs.db 的结论：
+ * 备份包里的 zip 是人工拷来拷去的，断点续传中断、网盘同步失败、tar 少拿一层目录，
+ * 都能做出一个「库好、附件缺一半」的包 —— 导入完照样弹「导入成功，附件补入 0 项」，
+ * 而那半张答卷上的小抄照片、身份证扫描件，在没人点开之前谁都不知道它没了。
+ *
+ * 所以多一步只读体检：拿包里的库自述去对包里的条目，缺了哪几个、是谁的、属于哪张表单，
+ * 一条条列出来。体检不改任何东西，也不顶替现有数据。
+ */
+
+const FILES_PREFIX = 'eqs-data/files/'
+
+/** 小文件用 KB、大文件用 MB：一律报「0.0MB」等于什么都没说 */
+function humanBytes(n) {
+  if (n < 1024) return `${n}B`
+  if (n < 1048576) return `${(n / 1024).toFixed(1)}KB`
+  return `${(n / 1048576).toFixed(1)}MB`
+}
+export { humanBytes }
+
+/**
+ * @param zipPath 已落盘的备份 zip
+ * @returns {Promise<{ok:boolean, db:object, files:object, warnings:string[], errors:string[]}>}
+ */
+export async function inspectBackup(zipPath) {
+  const warnings = []
+  const errors = []
+  const zip = openZipFile(zipPath)
+  if (!zip) {
+    return { ok: false, db: null, files: null, warnings, errors: ['无法读取压缩包目录，请用 EQS 导出的备份文件'] }
+  }
+
+  await sqliteReady()
+  const dbEntry = zip.entries.find(e => e.name === DB_ENTRY)
+  const mEntry = zip.entries.find(e => e.name === MANIFEST_ENTRY)
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'eqs-inspect-'))
+  try {
+    let manifest = null
+    if (mEntry) {
+      const mPath = path.join(tmpDir, 'manifest.json')
+      await extractZipEntryToFile(zip, mEntry, mPath)
+      try { manifest = JSON.parse(fs.readFileSync(mPath, 'utf8')) } catch { warnings.push('清单 manifest.json 存在但不是合法 JSON，已忽略') }
+    } else {
+      warnings.push('包里没有 manifest.json（老版本备份）：无法核对清单里报的文件数与数据库摘要')
+    }
+
+    /* ---------- 数据库 ---------- */
+    let db = null
+    const refs = []
+    if (!dbEntry) {
+      errors.push('备份包里没有 eqs-data/eqs.db，不是 EQS 的备份文件')
+    } else {
+      const incoming = path.join(tmpDir, 'eqs.db')
+      await extractZipEntryToFile(zip, dbEntry, incoming)
+      const check = validateDatabase(incoming)
+      db = { ...check, entry: DB_ENTRY, bytes: fs.statSync(incoming).size }
+      if (!check.ok) errors.push(check.reason)
+      // 清单说这个库是多少字节、什么摘要，实物对不对得上
+      if (check.ok && manifest?.db?.sha256) {
+        const got = await sha256File(incoming)
+        db.sha256Match = got === manifest.db.sha256
+        if (!db.sha256Match) errors.push('库文件的 SHA-256 与清单不符（包被改过，或导出时写坏了）')
+      }
+      if (check.ok && manifest?.db?.bytes && manifest.db.bytes !== db.bytes) {
+        warnings.push(`清单记的库大小 ${manifest.db.bytes} 字节，实际 ${db.bytes} 字节`)
+      }
+      if (check.ok) {
+        // 拿包里这个库自己的 files 表当参照：附件应该有哪些，只有它知道
+        let conn = null
+        try {
+          const { DatabaseSync } = sqliteMod
+          conn = new DatabaseSync(incoming, { readOnly: true })
+          const titles = new Map(conn.prepare('SELECT id, title FROM forms').all().map(f => [f.id, f.title]))
+          for (const r of conn.prepare('SELECT id, name, stored, size, driver, form_id FROM files').all()) {
+            refs.push({ ...r, formTitle: titles.get(r.form_id) || '' })
+          }
+        } catch (e) {
+          warnings.push(`无法读取包内 files 表：${e.message}`)
+        } finally {
+          try { conn?.close() } catch {}
+        }
+      }
+    }
+
+    /* ---------- 附件 ---------- */
+    const fileEntries = zip.entries.filter(e => e.name.startsWith(FILES_PREFIX))
+    const inZip = new Map(fileEntries.map(e => [e.name.slice(FILES_PREFIX.length), e]))
+    let unreferencedBytes = 0
+    let unreferenced = 0
+    const missing = []
+    let present = 0
+    let remote = 0
+    const referencedLocal = new Set()
+    for (const r of refs) {
+      if (r.driver && r.driver !== 'local') { remote++; continue }
+      referencedLocal.add(r.stored)
+      if (inZip.has(r.stored)) present++
+      else missing.push({ id: r.id, name: r.name, stored: r.stored, formId: r.form_id, formTitle: r.formTitle, size: r.size })
+    }
+    for (const [stored] of inZip) {
+      if (!referencedLocal.has(stored)) { unreferenced++; unreferencedBytes += inZip.get(stored).uncompSize || 0 }
+    }
+    const zipBytes = fileEntries.reduce((a, e) => a + (e.uncompSize || 0), 0)
+    const files = {
+      inZip: fileEntries.length,
+      bytes: zipBytes,
+      referenced: refs.length,
+      localReferenced: referencedLocal.size,
+      present,
+      missing: missing.slice(0, 50),
+      missingCount: missing.length,
+      missingBytes: missing.reduce((a, m) => a + (m.size || 0), 0),
+      remote,
+      unreferenced,
+      unreferencedBytes
+    }
+    if (files.missingCount) {
+      errors.push(`库里有 ${files.missingCount} 个本地附件在包里找不到（合计 ${humanBytes(files.missingBytes)}）`)
+    }
+    if (unreferenced) warnings.push(`包里有 ${unreferenced} 个文件没有任何记录引用（孤儿文件，不影响导入）`)
+    if (manifest?.files?.count != null && manifest.files.count !== fileEntries.length) {
+      warnings.push(`清单记的附件 ${manifest.files.count} 个，包里实际 ${fileEntries.length} 个`)
+    }
+    // 条目的 CRC 只在真正解出来时才算得动，这里只核长度：长度不对的一定是坏条目
+    const badEntry = fileEntries.find(e => e.compSize > 0 && e.localOffset + e.compSize > zip.size)
+    if (badEntry) errors.push(`附件条目越界：${badEntry.name}`)
+
+    return {
+      ok: errors.length === 0,
+      manifest: manifest ? { format: manifest.format, version: manifest.version, createdAt: manifest.createdAt, counts: manifest.counts } : null,
+      db,
+      files,
+      warnings,
+      errors
+    }
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true })
+  }
 }

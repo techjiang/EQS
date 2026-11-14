@@ -177,6 +177,8 @@
 | GET | `/api/submissions/:id` | 单份答卷详情（含 `manualScores`、批阅信息） |
 | PUT | `/api/submissions/:id` | 编辑答卷内容（保留已有主观题人工分） |
 | PUT | `/api/submissions/:id/review` | 主观题批阅，见下 |
+| GET | `/api/forms/:id/review-queue?limit=&offset=` | 阅卷队列：这一页还没批完的答卷，含逐题作答原文与已给的分 |
+| PUT | `/api/submissions/review-batch` | 批量保存人工分，body `{ items: [{ id, scores, note }] }` |
 | DELETE | `/api/submissions/:id` | 删除 |
 | POST | `/api/submissions/batch-delete` | `{ids}` 批量删除 |
 
@@ -193,7 +195,34 @@ PUT /api/submissions/:id/review
 
 保存后按「客观题自动分 + 主观题人工分」重算总分，写回 `score` 并记录
 `reviewed_at` / `reviewed_by` / `review_note`，同时触发 `update` WebHook。
-未出现在 `scores` 里的主观题保留原有分数，因此可以分批批阅、随时调整。
+未出现在 `scores` 里的主观题保留原有分数，因此可以分批批阅、随时调整；
+显式传 `null` 表示撤掉那道题的分，它会重新回到待批阅队列。
+
+### 批量阅卷
+
+一份一份点开批是最慢的那条路：点开 → 给分 → 保存 → 等列表刷新 → 点开下一份。
+一个班 40 人就是 200 次点击，中间夹着 40 次整页重新加载。
+
+```
+GET /api/forms/7/review-queue?limit=10&offset=0
+```
+
+按答卷顺序返回这一页还没批完的答卷，`items` 里是这道题的主观题条目：
+`given`（作答原文，已按题目自己的样子摊开，矩阵题不会是 `[object Object]`）、
+`score`（满分）、`current`（已给的分，没批过是 `null`）、`analysis`。
+`total` 是整个队列的长度，`scanned` 是扫过的答卷数。
+
+```
+PUT /api/submissions/review-batch
+{ "items": [ { "id": 33, "scores": { "q_lesson": 12 }, "note": "论点完整" } ] }
+```
+
+**这一批只提交填了分的题**，服务端做的是合并而不是覆盖——同一份卷子分两天批两题，
+第二天的保存不会把第一天的分抹掉（单份 `review` 接口同样是合并语义）。
+一份出错不牵连整批：返回 `{ saved, rejected: [{ id, reason }] }`，
+比如「应在 0 - 20 分之间」只拒那一份。一次最多 200 份。
+
+判完的答卷会因为「还剩几题没批」归零而自动离开队列，所以前端批完一页是重新拉当前页而不是翻页。
 
 ### 成绩排名
 
@@ -402,6 +431,7 @@ POST /api/banks/paper
 | GET | `/api/i18n/:lang`、PUT | 多语言资源 |
 | GET | `/api/sync/export?formId=1&sinceId=0&limit=1000` | 增量数据同步（游标分页） |
 | GET | `/api/backup/export` | 备份导出（流式 zip，含 `manifest.json`） |
+| POST | `/api/backup/inspect` | 备份包体检（multipart，字段 `file`；只读，不改任何数据） |
 | POST | `/api/backup/import` | 备份导入（multipart，字段 `file`；先校验后顶替，自动快照） |
 | GET | `/api/backup/snapshots` | 可回滚快照列表 |
 | POST | `/api/backup/rollback` | 回滚，body `{ name? }` 省略则回滚到最近一份 |

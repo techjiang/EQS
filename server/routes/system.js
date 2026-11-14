@@ -8,7 +8,7 @@ import { requireUser, can, createSession, sessionCookie } from '../lib/auth.js'
 import {
   exportBackupStream, saveRequestToFile, extractMultipartFile, restoreFiles,
   createPreImportSnapshot, listSnapshots, rollbackToSnapshot, validateDatabase,
-  sqliteReady, stampNow
+  inspectBackup, sqliteReady, stampNow
 } from '../lib/backup.js'
 import { openZipFile as openZipPath, extractZipEntryToFile } from '../lib/zip.js'
 import { smtpSend, wxAccessToken } from '../lib/notify.js'
@@ -134,6 +134,36 @@ export default function register(r) {
         manifest: manifest ? { version: manifest.version, createdAt: manifest.createdAt, counts: manifest.counts } : null,
         note: '附件按合并处理：备份里没有的文件会保留，不会被删除；如需撤回请点「回滚到导入前」'
       })
+    } finally {
+      fs.rmSync(work, { recursive: true, force: true })
+    }
+  })
+
+  /**
+   * 备份包体检（只读）。
+   *
+   * 导入会验库，但不验附件：包里的 zip 是人工拷来拷去的，断点续传一断、网盘同步失败、
+   * tar 少拿一层目录，都能做出「库好、附件缺一半」的包——导入照样弹「导入成功」，
+   * 而答卷里的小抄照片、证件扫描件在没人点开之前谁都不知道它没了。
+   * 这里先把包打开看一遍，一条条说清缺哪个文件、属于哪张表单，再让人决定要不要导。
+   */
+  r.post('/api/backup/inspect', async (req, res) => {
+    const me = requireUser(req)
+    if (!can(me, '*')) fail(403, '权限不足')
+    const ct = String(req.headers['content-type'] || '')
+    if (!ct.includes('multipart/form-data')) fail(400, '请上传 zip 备份文件')
+    const boundary = /boundary=(?:"([^"]+)"|([^;]+))/.exec(ct)
+    if (!boundary) fail(400, '缺少 boundary')
+    const work = fs.mkdtempSync(path.join(os.tmpdir(), 'eqs-inspect-req-'))
+    try {
+      const rawPath = path.join(work, 'body.bin')
+      await saveRequestToFile(req, rawPath)
+      const zipPath = path.join(work, 'backup.zip')
+      await extractMultipartFile(rawPath, boundary[1] || boundary[2], zipPath)
+      fs.rmSync(rawPath, { force: true })
+      const report = await inspectBackup(zipPath)
+      log(me, '备份体检', report.ok ? '通过' : `发现问题：${report.errors[0] || ''}`)
+      sendJson(res, 200, { ok: true, data: report })
     } finally {
       fs.rmSync(work, { recursive: true, force: true })
     }

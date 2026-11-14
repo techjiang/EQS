@@ -280,6 +280,75 @@ export default {
         load()
       } catch (e) { err(e.message) }
     }
+    /* ---------------- 批量阅卷 ----------------
+     *
+     * 以前批一份卷子要五步：点开 → 给分 → 保存 → 等列表刷新 → 点开下一份。
+     * 一个班 40 人就 200 次点击，中间还夹着 40 次整页重新加载。
+     * 这里把「一页待批答卷」一次取回来，逐份给分，最后一起保存：
+     * 队列顺序按交卷时间，批过的自动从这里消失（服务端 pendingLeft 归零）。
+     */
+    const batch = ref(null)
+    const batchBusy = ref(false)
+    const BATCH_LIMIT = 10
+
+    const openBatch = async () => {
+      if (!form.value) return err('请先在左上角选择一个具体表单')
+      if (form.value.kind !== 'exam') return err('只有考试需要批阅')
+      try {
+        await loadBatch(0)
+      } catch (e) { err(e.message) }
+    }
+
+    const loadBatch = async (offset, { silent = false } = {}) => {
+      const r = await api.get(`/api/forms/${formId.value}/review-queue?limit=${BATCH_LIMIT}&offset=${offset || 0}`)
+      const items = (r.data || []).map(x => ({
+        ...x,
+        // 输入框里存字符串更方便：空串表示「还没给分」，0 是有效的 0 分
+        draft: Object.fromEntries(x.items.map(it => [it.id, it.current == null ? '' : String(it.current)])),
+        noteDraft: x.note || ''
+      }))
+      batch.value = { formId: formId.value, title: form.value.title, total: r.total, scanned: r.scanned, offset: offset || 0, limit: BATCH_LIMIT, items }
+      // 保存之后队列清空是正常结果，不该再弹一句「没有待批阅」——那句提示是说给「点进来才发现空」的人
+      if (!items.length && !r.total && !silent) return ok('这张卷子没有待批阅的答卷了')
+    }
+
+    /** 只提交填过分的那几题：没填的题保持「待批」，不会因为看了一眼就被判 0 分 */
+    const saveBatch = async () => {
+      if (!batch.value || batchBusy.value) return
+      const payload = []
+      for (const x of batch.value.items) {
+        const scores = {}
+        for (const it of x.items) {
+          const v = x.draft[it.id]
+          if (v === '' || v === undefined || v === null) continue
+          scores[it.id] = Number(v)
+        }
+        if (Object.keys(scores).length) payload.push({ id: x.id, scores, note: x.noteDraft })
+      }
+      if (!payload.length) return err('还没有给任何一份卷子打分')
+      batchBusy.value = true
+      try {
+        const r = await api.put('/api/submissions/review-batch', { items: payload })
+        if (r.rejected?.length) {
+          err(`已保存 ${r.saved} 份，${r.rejected.length} 份被拒：${r.rejected[0].reason}`)
+        } else {
+          ok(`已保存 ${r.saved} 份，成绩已重算`)
+        }
+        // 批完就从队列里消失，所以重新拉这一页（不是往下翻，前面被清掉的位置要补上来）
+        await loadBatch(batch.value.offset, { silent: true })
+        await load()
+      } catch (e) { err(e.message) } finally { batchBusy.value = false }
+    }
+
+    const batchPage = async (dir) => {
+      const offset = Math.max((batch.value?.offset || 0) + dir * (batch.value?.limit || BATCH_LIMIT), 0)
+      try { await loadBatch(offset) } catch (e) { err(e.message) }
+    }
+
+    const fillBatch = (x, value) => {
+      for (const it of x.items) x.draft[it.id] = String(value === 'full' ? it.score : 0)
+    }
+
     const openEdit = async (row) => {
       // 编辑弹窗用的是这条答卷自己的卷子。之前直接改 form.value，
       // 结果「全部表单」视图下点一行，左上角选中的表单也跟着变了，关掉弹窗列表就换了一批数据
@@ -373,6 +442,10 @@ export default {
         }), '待批阅']),
         h('div', { style: 'flex:1' }),
         h('span', { class: 'small muted' }, `共 ${total.value} 份`),
+        // 批量阅卷和「待批阅」是同一件事的两面，摆在一起才不会有人问「批阅入口在哪」
+        form.value?.kind === 'exam'
+          ? h('button', { class: 'btn sm primary', onClick: openBatch, title: '一页十份一起批，不用一份一份点开' }, '批量阅卷')
+          : null,
         h('button', { class: 'btn sm danger', onClick: batchDelete }, '批量删除'),
         h('button', { class: 'btn sm primary', onClick: () => openEdit({ id: 0, data: {}, marked: 0 }) }, '+ 新增答卷')
       ]),
@@ -516,6 +589,71 @@ export default {
         footer: [
           h('button', { class: 'btn', onClick: () => review.value = null }, '取消'),
           h('button', { class: 'btn primary', onClick: saveReview }, '保存并重算成绩')
+        ]
+      }) : null,
+
+      batch.value ? Modal({
+        title: `批量阅卷 · ${batch.value.title}`, modelValue: true,
+        onClose: () => batch.value = null, wide: true,
+        children: h('div', {}, [
+          h('div', { class: 'flex between wrap mb', style: 'gap:8px' }, [
+            h('span', { class: 'small muted' },
+              `待批阅 ${batch.value.total} 份 · 第 ${batch.value.offset + 1} – ${batch.value.offset + batch.value.items.length} 份`),
+            h('span', { class: 'small muted' }, '只有填了分的题会被提交，留空表示「还没批」')
+          ]),
+          ...batch.value.items.map((x, xi) => h('div', {
+            style: 'padding:14px;border:1px solid var(--line);border-radius:10px;margin-bottom:12px'
+          }, [
+            h('div', { class: 'flex between wrap', style: 'gap:8px;align-items:center;margin-bottom:4px' }, [
+              // 用 gap 而不是给每个元素挂 margin：#3、编号、时间三段挤在一起时，
+              // 少写一个 margin 就变成「#3v7qu2-m3k4u2026-11-14」这种读不出来的串
+              h('div', { class: 'flex wrap', style: 'gap:8px;align-items:center' }, [
+                h('b', {}, `#${x.id}`),
+                x.publicId ? h('span', { class: 'mono small muted' }, x.publicId) : null,
+                h('span', { class: 'small muted' }, fmtDate(x.createdAt)),
+                h('span', { class: 'tag' }, `客观题 ${x.score ?? '-'} 分`)
+              ]),
+              h('div', { class: 'flex', style: 'gap:4px' }, [
+                h('button', { class: 'btn ghost sm', onClick: () => fillBatch(x, 'zero') }, '全 0 分'),
+                h('button', { class: 'btn ghost sm', onClick: () => fillBatch(x, 'full') }, '全满分')
+              ])
+            ]),
+            ...x.items.map(it => h('div', { style: 'padding:10px 0;border-top:1px dashed var(--line)' }, [
+              h('div', { class: 'flex between', style: 'gap:10px;align-items:flex-start' }, [
+                h('div', { style: 'font-size:13.5px;line-height:1.5' }, it.label),
+                h('span', { class: 'tag', style: 'flex:none' }, `满分 ${it.score}`)
+              ]),
+              h('div', {
+                style: 'white-space:pre-wrap;word-break:break-word;margin:6px 0 8px;font-size:13px;color:var(--text-2)'
+              }, it.given ? it.given : h('span', { class: 'muted' }, '（未作答）')),
+              h('div', { class: 'flex', style: 'gap:6px;align-items:center;flex-wrap:wrap' }, [
+                h('input', {
+                  class: 'input', type: 'number', min: 0, max: it.score, step: '0.5',
+                  style: 'max-width:96px', value: x.draft[it.id],
+                  placeholder: '未批',
+                  onInput: e => { x.draft[it.id] = e.target.value }
+                }),
+                h('button', { class: 'btn sm', onClick: () => { x.draft[it.id] = String(it.score) } }, '满分'),
+                h('button', { class: 'btn sm', onClick: () => { x.draft[it.id] = '0' } }, '0 分'),
+                it.analysis ? h('span', { class: 'small muted', style: 'margin-left:4px' }, '解析：' + it.analysis.slice(0, 40)) : null
+              ])
+            ])),
+            h('input', {
+              class: 'input', style: 'margin-top:8px', placeholder: '这份卷子的批阅备注（可选）',
+              value: x.noteDraft, onInput: e => { x.noteDraft = e.target.value }
+            })
+          ])),
+          batch.value.items.length ? null : Empty({ text: '这一页已经没有待批阅的答卷了' })
+        ]),
+        footer: [
+          h('button', { class: 'btn', disabled: batch.value.offset === 0, onClick: () => batchPage(-1) }, '上一页'),
+          h('button', {
+            class: 'btn',
+            disabled: batch.value.offset + batch.value.limit >= batch.value.total,
+            onClick: () => batchPage(1)
+          }, '下一页'),
+          h('button', { class: 'btn', onClick: () => batch.value = null }, '关闭'),
+          h('button', { class: 'btn primary', disabled: batchBusy.value, onClick: saveBatch }, batchBusy.value ? '保存中…' : '保存本页分数')
         ]
       }) : null,
 

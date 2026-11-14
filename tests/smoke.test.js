@@ -491,7 +491,10 @@ try {
   r = await req('PUT', `/api/submissions/${subId}/review`, { scores: { q2: 99 } })
   assert(r.status === 400, '给分超过题目分值被拒绝', 'status=' + r.status)
   r = await req('PUT', `/api/submissions/${subId}/review`, { scores: { q1: 20 } })
-  assert(r.status === 200 && r.json.data.score === 20, '客观题不接受人工加分（只认主观题）', String(r.json.data?.score))
+  // 客观题的分不会被采纳（q1 不进 manual_scores），而没出现在 scores 里的 q2 保留先前给过的 15 ——
+  // 这与文档里「未出现的主观题保留原有分数，因此可以分批批阅」是同一件事
+  assert(r.status === 200 && r.json.data.score === 35, '客观题不接受人工加分，且未提交的主观题保留原分', String(r.json.data?.score))
+  assert(r.json.data.manual_scores?.q1 === undefined, '客观题没有进 manual_scores', JSON.stringify(r.json.data?.manual_scores))
   r = await req('PUT', `/api/submissions/${subId}/review`, { scores: { q2: -5 } })
   assert(r.status === 400, '负分被拒绝')
 
@@ -4021,6 +4024,201 @@ try {
     assert(/0 段需要清洗/.test(again), '再跑一次是幂等的（不重复改）', again.split('\n')[1])
     assert(/无需清洗/.test(again), '干净之后明确说没事可做', again)
     fs.rmSync(work, { recursive: true, force: true })
+  }
+
+  console.log('\n[65] 备份包体检（附件也要对得上）')
+  {
+    const { readZipEntries, buildZip } = await import('../server/lib/zip.js')
+
+    // 造一张带附件的表单：体检要能拿库里的 files 表去对包里的条目
+    let r = await req('POST', '/api/forms', {
+      title: '带附件的体检卷', kind: 'survey',
+      schema: [{ id: 'f1', type: 'upload', label: '上传凭证' }]
+    })
+    const bkForm = r.json.id
+    await req('PUT', `/api/forms/${bkForm}`, { status: 'published' })
+    let up = await (async () => {
+      const fd = new FormData()
+      fd.append('file', new Blob([Buffer.alloc(2048, 7)], { type: 'application/pdf' }), '凭证.pdf')
+      fd.append('formId', String(bkForm))
+      const res = await fetch(BASE + '/api/upload', { method: 'POST', body: fd, headers: { Cookie: cookie } })
+      return res.json()
+    })()
+    assert(up.ok && up.id > 0, '附件上传成功（体检的比对对象）', JSON.stringify(up))
+
+    const zip = Buffer.from(await (await fetch(BASE + '/api/backup/export', { headers: { Cookie: cookie } })).arrayBuffer())
+    const inspect = async (buf, name = 'backup.zip') => {
+      const fd = new FormData()
+      fd.append('file', new Blob([buf]), name)
+      const res = await fetch(BASE + '/api/backup/inspect', { method: 'POST', headers: { Cookie: cookie }, body: fd })
+      return { status: res.status, json: await res.json() }
+    }
+
+    // 1) 完整的包：通过
+    let ins = await inspect(zip)
+    assert(ins.status === 200 && ins.json.ok, '体检接口可用', `${ins.status} ${ins.json?.message || ''}`)
+    const d = ins.json.data
+    assert(d.ok === true, '完整备份包判定为「可以导入」', JSON.stringify(d.errors))
+    assert(d.db?.ok === true, '体检报告里带数据库结论')
+    assert(d.db?.sha256Match === true, '库文件摘要与清单一致')
+    assert(d.files?.inZip >= 1, '包里附件数被数出来', String(d.files?.inZip))
+    assert(d.files?.present >= 1 && d.files?.missingCount === 0, '附件全部对得上', JSON.stringify(d.files))
+    assert(d.manifest?.version, '读得到清单版本')
+
+    // 2) 抠掉附件的包：库是好的，但附件缺了——这正是「导入成功但照片没了」的那种包
+    const entries = readZipEntries(zip) || []
+    const noAttach = buildZip(entries.filter(e => !e.name.startsWith('eqs-data/files/')))
+    ins = await inspect(noAttach)
+    assert(ins.status === 200 && ins.json.data.ok === false, '缺附件的包体检不通过', JSON.stringify(ins.json.data?.errors))
+    assert(ins.json.data.db?.ok === true, '缺附件不影响数据库那部分的结论')
+    assert(ins.json.data.files.missingCount >= 1, '数出缺了几个附件', String(ins.json.data.files?.missingCount))
+    const missOne = ins.json.data.files.missing.find(m => m.name === '凭证.pdf')
+    assert(missOne && missOne.formTitle === '带附件的体检卷',
+      '缺的是哪个文件、属于哪张表单，一条条说清楚', JSON.stringify(ins.json.data.files.missing))
+    assert(/找不到/.test(ins.json.data.errors.join(' ')), '错误说明是「在包里找不到」而不是含糊的失败')
+
+    // 3) 体检不动任何东西：库里那份记录还在、附件还能取
+    r = await req('GET', `/api/files?formId=${bkForm}`)
+    assert(Array.isArray(r.json.data) && r.json.data.length >= 1, '体检之后附件记录原样还在')
+    r = await req('GET', '/api/forms?pageSize=1')
+    assert(r.status === 200 && r.json.ok, '体检之后服务与数据库连接仍然可用')
+
+    // 4) 坏包：体检也要说人话，不能 500
+    ins = await inspect(Buffer.from('not a zip at all'))
+    assert(ins.status === 200 && ins.json.data.ok === false, '不是 zip 的文件体检直接判不通过', JSON.stringify(ins.json.data?.errors))
+    assert(/压缩包/.test(ins.json.data.errors.join(' ')), '不是 zip 时给的是「无法读取压缩包目录」')
+
+    // 5) 命令行体检：与接口同一份实现，退出码能被脚本用
+    const work = fs.mkdtempSync(path.join(os.tmpdir(), 'eqs-check-'))
+    const goodPath = path.join(work, 'good.zip')
+    const badPath = path.join(work, 'bad.zip')
+    fs.writeFileSync(goodPath, zip)
+    fs.writeFileSync(badPath, noAttach)
+    const { execFileSync } = await import('node:child_process')
+    const cli = (file) => {
+      try {
+        return { code: 0, out: execFileSync(process.execPath, ['scripts/check-backup.mjs', file], { encoding: 'utf8', env: { ...process.env, EQS_DATA_DIR: work } }) }
+      } catch (e) {
+        return { code: e.status, out: String(e.stdout || '') }
+      }
+    }
+    const good = cli(goodPath)
+    assert(good.code === 0 && /可以导入/.test(good.out), '命令行体检：好包退出码 0', good.out.split('\n').pop())
+    const bad = cli(badPath)
+    assert(bad.code === 1 && /不建议直接导入/.test(bad.out), '命令行体检：坏包退出码 1（CI 里能当闸用）', bad.out.split('\n').pop())
+    assert(/凭证\.pdf/.test(bad.out), '命令行把缺的文件名列出来', bad.out)
+    fs.rmSync(work, { recursive: true, force: true })
+  }
+
+  console.log('\n[66] 批量阅卷：一页一次批完')
+  {
+    let r = await req('POST', '/api/forms', {
+      title: '批量阅卷卷', kind: 'exam',
+      schema: [
+        { id: 'b1', type: 'radio', label: '客观题', options: [{ label: '对', value: 'Y' }, { label: '错', value: 'N' }], answer: ['Y'], score: 20, required: true },
+        { id: 'b2', type: 'textarea', label: '主观题一', answer: [], score: 20 },
+        { id: 'b3', type: 'textarea', label: '主观题二', answer: [], score: 10 }
+      ],
+      settings: { passPercent: 60 }
+    })
+    const bfid = r.json.id
+    await req('PUT', `/api/forms/${bfid}`, { status: 'published' })
+    const ids = []
+    for (let i = 0; i < 5; i++) {
+      r = await req('POST', `/api/public/forms/${bfid}/submit`, { data: { b1: 'Y', b2: `第 ${i + 1} 份的作答`, b3: `补充 ${i + 1}` } })
+      ids.push(r.json.id)
+    }
+    // 纯客观题的卷子不该出现在阅卷队列里（队列一有噪音老师就不看了）
+    r = await req('POST', '/api/forms', {
+      title: '纯客观卷', kind: 'exam',
+      schema: [{ id: 'c1', type: 'radio', label: '单选', options: [{ label: '对', value: 'Y' }, { label: '错', value: 'N' }], answer: ['Y'], score: 10 }]
+    })
+    const objForm = r.json.id
+    await req('PUT', `/api/forms/${objForm}`, { status: 'published' })
+    await req('POST', `/api/public/forms/${objForm}/submit`, { data: { c1: 'Y' } })
+
+    r = await req('GET', `/api/forms/${objForm}/review-queue`)
+    assert(r.status === 200 && r.json.total === 0, '没有主观题的考试不进阅卷队列', String(r.json.total))
+
+    r = await req('GET', `/api/forms/${bfid}/review-queue?limit=2`)
+    assert(r.status === 200 && r.json.ok, '阅卷队列接口可用', `${r.status} ${r.json?.message || ''}`)
+    assert(r.json.total === 5, '队列总数与待批答卷数一致', String(r.json.total))
+    assert(r.json.data.length === 2, '按 limit 分页取回', String(r.json.data.length))
+    const one = r.json.data[0]
+    assert(one.items.length === 2, '每题带一条主观题条目，不是一团 JSON', JSON.stringify(one.items?.map(i => i.id)))
+    assert(typeof one.items[0].given === 'string' && one.items[0].given.includes('份的作答'),
+      '作答原文被摊成可读文本（不是对象）', String(one.items[0].given))
+    assert(one.items.every(i => i.current === null), '还没批过的题 current 为空')
+
+    // 分页不重叠
+    const r2 = await req('GET', `/api/forms/${bfid}/review-queue?limit=2&offset=2`)
+    const seen = new Set([...r.json.data, ...r2.json.data].map(x => x.id))
+    assert(seen.size === 4, '分页之间不重叠', String(seen.size))
+
+    // 批量保存
+    r = await req('PUT', '/api/submissions/review-batch', {
+      items: [
+        { id: ids[0], scores: { b2: 18, b3: 9 }, note: '论点完整' },
+        { id: ids[1], scores: { b2: 12 } }
+      ]
+    })
+    assert(r.status === 200 && r.json.saved === 2, '批量保存两份答卷', JSON.stringify(r.json))
+    assert(!r.json.rejected?.length, '全部保存成功', JSON.stringify(r.json.rejected))
+
+    r = await req('GET', `/api/submissions/${ids[0]}`)
+    assert(r.json.data.score === 47, '第一份重算为 20 + 18 + 9 = 47', String(r.json.data?.score))
+    assert(r.json.data.manual_scores?.b3 === 9, '人工分被持久化', JSON.stringify(r.json.data?.manual_scores))
+    assert(!!r.json.data.reviewed_at, '记录批阅时间')
+
+    r = await req('GET', `/api/submissions/${ids[1]}`)
+    assert(r.json.data.score === 32, '第二份重算为 20 + 12 = 32', String(r.json.data?.score))
+
+    // 批完的两份从队列里消失，只批一部分的还在（b3 没给分）
+    r = await req('GET', `/api/forms/${bfid}/review-queue?limit=20`)
+    const left = (r.json.data || []).map(x => x.id)
+    assert(!left.includes(ids[0]), '两份主观题都批完的答卷离开队列')
+    assert(left.includes(ids[1]), '只批了一部分的答卷仍留在队列里')
+    assert(r.json.total === 4, '队列总数从 5 减到 4', String(r.json.total))
+
+    // 越界给分被拒，但不牵连同一批里的其它份
+    r = await req('PUT', '/api/submissions/review-batch', {
+      items: [
+        { id: ids[2], scores: { b2: 999 } },
+        { id: ids[3], scores: { b2: 10 } }
+      ]
+    })
+    assert(r.json.saved === 1 && r.json.rejected?.length === 1, '一份越界只拒那一份，其它照常保存', JSON.stringify({ saved: r.json.saved, rejected: r.json.rejected }))
+    assert(/0 - 20/.test(r.json.rejected[0].reason), '拒绝理由说清分数应在什么范围', r.json.rejected[0].reason)
+
+    // 客观题不能借批量阅卷加分；而且这一批只带了客观题，不该把上一批的人工分抹掉
+    r = await req('PUT', '/api/submissions/review-batch', { items: [{ id: ids[3], scores: { b1: 20 } }] })
+    const after = await req('GET', `/api/submissions/${ids[3]}`)
+    assert(after.json.data.score === 30, '客观题不接受人工加分，且批量保存是合并而不是覆盖（20 + 10）', String(after.json.data?.score))
+
+    // 分两次批同一份：第二次不能把第一次的分抹掉
+    r = await req('PUT', '/api/submissions/review-batch', { items: [{ id: ids[4], scores: { b2: 16 } }] })
+    r = await req('PUT', '/api/submissions/review-batch', { items: [{ id: ids[4], scores: { b3: 6 } }] })
+    const twice = await req('GET', `/api/submissions/${ids[4]}`)
+    assert(twice.json.data.score === 42, '同卷分两次批，先前的分留下来（20 + 16 + 6）', String(twice.json.data?.score))
+
+    // 显式传 null 表示撤回那道题的分，它回到待批
+    r = await req('PUT', '/api/submissions/review-batch', { items: [{ id: ids[4], scores: { b3: null } }] })
+    const back = await req('GET', `/api/submissions/${ids[4]}`)
+    assert(back.json.data.manual_scores?.b3 === undefined, 'null 能把已给的分撤掉', JSON.stringify(back.json.data?.manual_scores))
+    r = await req('GET', `/api/forms/${bfid}/review-queue?limit=20`)
+    assert((r.json.data || []).some(x => x.id === ids[4]), '撤分之后重新回到阅卷队列')
+
+    // 空请求、超量请求要有明确说法
+    r = await req('PUT', '/api/submissions/review-batch', { items: [] })
+    assert(r.status === 400 && /没有要保存/.test(r.json.message), '空批被拒并说明原因', `${r.status} ${r.json.message}`)
+    r = await req('PUT', '/api/submissions/review-batch', { items: Array.from({ length: 201 }, (_, i) => ({ id: i + 1 })) })
+    assert(r.status === 400 && /200/.test(r.json.message), '一次超过 200 份被拒', `${r.status} ${r.json.message}`)
+
+    // 问卷（非考试）没有阅卷队列
+    r = await req('POST', '/api/forms', { title: '普通问卷', kind: 'survey', schema: [] })
+    const surveyId = r.json.id
+    r = await req('GET', `/api/forms/${surveyId}/review-queue`)
+    assert(r.status === 400 && /批阅/.test(r.json.message), '问卷没有阅卷队列', `${r.status} ${r.json.message}`)
   }
 
   console.log('\n[45] 前端静态资源')
