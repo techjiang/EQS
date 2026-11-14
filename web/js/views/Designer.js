@@ -42,6 +42,9 @@ export default {
     const importOpen = ref(false)
     const importText = ref('')
     const importTab = ref('text')
+    // 字典选项：设计器里给选择题绑定一套字典，绑定时把选项写成快照
+    const dicts = ref([])
+    const dictPick = ref('')
 
     const load = async () => {
       try {
@@ -50,7 +53,12 @@ export default {
         if (!form.value.settings) form.value.settings = {}
       } catch (e) { err(e.message) } finally { loading.value = false }
     }
-    onMounted(load)
+    onMounted(async () => {
+      await load()
+      // 字典拿不到不该挡住设计器本身：这只是「选项少写几遍」的便利，不是必需能力
+      const r = await api.get('/api/dicts').catch(() => ({ data: [] }))
+      dicts.value = r.data || []
+    })
 
     const active = computed(() => form.value.schema[activeIdx.value] || null)
 
@@ -277,6 +285,54 @@ export default {
     const previewModel = ref({})
     watch(previewData, v => previewModel.value = v, { immediate: true })
 
+    /* ---------- 字典绑定 ---------- */
+    /**
+     * 从字典取选项写进当前题。
+     *
+     * 存的是**快照**（选项直接铺进 f.options），同时记下 props.dict 备将来同步用。
+     * 不做「引用式」的理由：引用的话，字典里改一个字，上个月已经发出去、已经收回
+     * 三千份答卷的那张表的选项就跟着变了——历史答卷的值突然对不上任何选项。
+     * 什么时候同步由人点（见后端 /api/forms/:id/sync-dict）。
+     */
+    const applyDict = async (code) => {
+      const f = active.value
+      if (!f || !code) return
+      try {
+        const r = await api.get(`/api/public/dicts/${encodeURIComponent(code)}`)
+        const opts = r.data.options || []
+        if (!opts.length) return err('这套字典里没有启用的选项')
+        const old = new Set((f.answer || []).map(String))
+        const keep = opts.filter(o => old.has(String(o.value))).map(o => String(o.value))
+        f.options = opts.map(o => ({ label: o.label, value: String(o.value) }))
+        // 标准答案只保留还存在的选项：字典里删掉的项留着，就是一道「谁答都错」的题
+        f.answer = (f.answer || []).filter(a => opts.some(o => String(o.value) === String(a)))
+        f.props = { ...(f.props || {}), dict: code }
+        ok(`已从字典取用 ${opts.length} 个选项` + (keep.length !== old.size ? '；有标准答案的选项已不在字典里，已清空' : ''))
+      } catch (e) { err(e.message) }
+    }
+
+    const syncDict = async (f) => {
+      if (!f?.props?.dict) return
+      try {
+        const r = await api.post(`/api/forms/${id}/sync-dict?code=${encodeURIComponent(f.props.dict)}`, {})
+        if (!r.changed) return ok('字典和卷面已经一致，没有需要同步的')
+        const c = r.changes[0] || {}
+        const bits = []
+        if (c.added?.length) bits.push(`新增 ${c.added.length} 项`)
+        if (c.removed?.length) bits.push(`移除 ${c.removed.length} 项`)
+        if (c.relabeled?.length) bits.push(`改名 ${c.relabeled.length} 项`)
+        if (c.droppedAnswers?.length) bits.push(`${c.droppedAnswers.length} 个标准答案已失效`)
+        ok('已同步：' + bits.join('，'))
+        form.value.schema = r.schema
+      } catch (e) { err(e.message) }
+    }
+
+    const unbindDict = (f) => {
+      const p = { ...(f.props || {}) }
+      delete p.dict
+      f.props = p
+    }
+
     /* ---------- 右侧检查器 ---------- */
     const fieldInspector = () => {
       const f = active.value
@@ -291,11 +347,22 @@ export default {
         ])),
         row('提示文字', h('input', { class: 'input', value: f.placeholder, placeholder: '输入框占位符', onInput: e => f.placeholder = e.target.value })),
         row('说明', h('input', { class: 'input', value: f.description, placeholder: '题目下方的说明', onInput: e => f.description = e.target.value })),
-        hasOptions(f.type) ? h('div', { class: 'field' }, [
+        hasOptions(f.type) && f.type !== 'matrix' ? h('div', { class: 'field' }, [
           h('label', { class: 'flex between' }, [
-            h('span', {}, f.type === 'matrix' ? '评分列' : '选项'),
-            h('button', { class: 'btn ghost sm', onClick: addOption }, '+ 添加')
+            h('span', {}, '选项'),
+            h('div', { class: 'flex', style: 'gap:4px' }, [
+              dicts.value.length ? h('select', {
+                class: 'select', style: 'height:26px;width:auto;font-size:12px;padding:0 6px',
+                value: '', onChange: e => { const c = e.target.value; e.target.value = ''; if (c) applyDict(c) }
+              }, [h('option', { value: '' }, '从字典取用…'), ...dicts.value.map(d => h('option', { value: d.code }, d.name))]) : null,
+              h('button', { class: 'btn ghost sm', onClick: addOption }, '+ 添加')
+            ])
           ]),
+          f.props?.dict ? h('div', { class: 'dict-badge', style: 'margin-bottom:8px' }, [
+            h('span', { class: 'tag brand' }, '字典：' + (dicts.value.find(d => d.code === f.props.dict)?.name || f.props.dict)),
+            h('button', { class: 'btn ghost sm', onClick: () => syncDict(f) }, '同步'),
+            h('button', { class: 'btn ghost sm', onClick: () => unbindDict(f) }, '解除')
+          ]) : null,
           f.options.map((o, i) => h('div', { class: 'opt-row' }, [
             h('input', { class: 'input', value: o.label, onInput: e => { o.label = e.target.value; o.value = e.target.value } }),
             h('button', { onClick: () => removeOption(i) }, '×')

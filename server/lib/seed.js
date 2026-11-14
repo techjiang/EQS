@@ -100,7 +100,7 @@ export function seedSettings() {
       'nav.banks': '题库刷题', 'nav.templates': '模板中心', 'nav.data': '答卷数据',
       'nav.report': '统计分析', 'nav.screen': '数据大屏', 'nav.users': '用户权限',
       'nav.recycle': '回收中心', 'nav.sessions': '登录设备', 'nav.logs': '审计日志',
-      'nav.settings': '系统设置',
+      'nav.settings': '系统设置', 'nav.dicts': '数据字典',
       'group.work': '工作', 'group.data': '数据', 'group.system': '系统',
       'action.save': '保存', 'action.publish': '发布', 'action.preview': '预览',
       'action.export': '导出', 'action.delete': '删除', 'action.edit': '编辑',
@@ -114,7 +114,7 @@ export function seedSettings() {
       'nav.banks': 'Question Banks', 'nav.templates': 'Templates', 'nav.data': 'Responses',
       'nav.report': 'Analytics', 'nav.screen': 'Data Wall', 'nav.users': 'Users & Roles',
       'nav.recycle': 'Recycle Bin', 'nav.sessions': 'Devices', 'nav.logs': 'Audit Log',
-      'nav.settings': 'Settings',
+      'nav.settings': 'Settings', 'nav.dicts': 'Data Dictionary',
       'group.work': 'Work', 'group.data': 'Data', 'group.system': 'System',
       'action.save': 'Save', 'action.publish': 'Publish', 'action.preview': 'Preview',
       'action.export': 'Export', 'action.delete': 'Delete', 'action.edit': 'Edit',
@@ -125,5 +125,44 @@ export function seedSettings() {
     const upsert = (lang, k, v) => run('INSERT INTO i18n(lang, key, value) VALUES(?,?,?) ON CONFLICT(lang, key) DO NOTHING', lang, k, v)
     for (const [k, v] of Object.entries(zh)) upsert('zh', k, v)
     for (const [k, v] of Object.entries(en)) upsert('en', k, v)
+  }
+}
+
+/**
+ * 内置三套字典。
+ * 只补空的：用户删掉内置字典是真删（他可能是故意的），启动时又复活会让人对着
+ * 「删不掉的字典」发呆。所以判断依据是「整个表为空」，而不是逐条 DO NOTHING。
+ */
+const DICTS = [
+  {
+    code: 'education', name: '学历', description: '从初中到博士的标准学历层级', sort: 10,
+    items: ['初中及以下', '高中 / 中专', '大专', '本科', '硕士', '博士']
+  },
+  {
+    code: 'industry', name: '行业', description: '国民经济行业分类（简化版）', sort: 20,
+    items: ['互联网 / 软件', '制造业', '金融', '教育', '医疗健康', '政府 / 公共事业', '零售 / 电商', '建筑 / 地产', '文化传媒', '其他']
+  },
+  {
+    code: 'satisfaction5', name: '满意度（五级）', description: '很满意到很不满意的五级量表', sort: 30,
+    items: [
+      { label: '很满意', value: '5' }, { label: '满意', value: '4' }, { label: '一般', value: '3' },
+      { label: '不满意', value: '2' }, { label: '很不满意', value: '1' }
+    ]
+  }
+]
+
+export function seedDicts() {
+  if (get('SELECT COUNT(*) c FROM dict_types').c > 0) return
+  const ts = now()
+  for (const d of DICTS) {
+    run('INSERT INTO dict_types(code, name, description, sort, created_at) VALUES(?,?,?,?,?)', d.code, d.name, d.description, d.sort, ts)
+    let sort = 10
+    for (const it of d.items) {
+      const label = typeof it === 'string' ? it : it.label
+      const value = typeof it === 'string' ? it : it.value
+      run('INSERT INTO dict_items(type_code, label, value, sort, enabled, created_at) VALUES(?,?,?,?,1,?)',
+        d.code, label, value ?? label, sort, ts)
+      sort += 10
+    }
   }
 }

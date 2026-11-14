@@ -2839,9 +2839,142 @@ try {
     assert(normalPage.json.data.seed === '', '未开乱序时不下发种子')
   }
 
+  console.log('\n[45] 数据字典')
+
+  {
+    // 内置字典：开箱就有，不用先建一套空的
+    const seeded = await req('GET', '/api/dicts')
+    assert(seeded.status === 200, '字典列表可读')
+    const edu = seeded.json.data.find(d => d.code === 'education')
+    assert(!!edu, '内置「学历」字典存在')
+    assert(edu.item_count >= 5, '内置字典带选项', String(edu.item_count))
+
+    // 公开取选项：填写页要用，不登录也能读
+    const pub = await fetch(BASE + '/api/public/dicts/education')
+    const pubJson = await pub.json()
+    assert(pub.status === 200 && pubJson.data.options.length >= 5, '公开字典接口返回选项')
+    assert(pubJson.data.options[0].value, '选项带 value')
+
+    // 建立一套新字典，选项一起带进去
+    const created = await req('POST', '/api/dicts', {
+      name: '测试城市', code: 'test_city',
+      items: [{ label: '北京' }, { label: '上海' }, { label: '广州', value: 'gz' }]
+    })
+    assert(created.status === 201, '新建字典成功')
+    assert(created.json.data.items.length === 3, '选项随字典一次写入')
+    assert(created.json.data.items[2].value === 'gz', '自定义 value 被保留')
+
+    // 标识重复要挡：两张表单绑同一个 code 但内容不同，是最难查的那种错
+    const dup = await req('POST', '/api/dicts', { name: '另一个城市', code: 'test_city' })
+    assert(dup.status === 409, '重复标识被拒绝')
+
+    // 名称重复也要挡
+    const dupName = await req('POST', '/api/dicts', { name: '测试城市', code: 'test_city2' })
+    assert(dupName.status === 409, '重名字典被拒绝')
+
+    // 同批里 value 重复只留一条：两条一样的值在下拉里选哪个都一样，统计时会合并成一项
+    const dedup = await req('PUT', '/api/dicts/test_city/items', {
+      items: [{ label: '北京' }, { label: '北京' }, { label: '上海' }]
+    })
+    assert(dedup.status === 200, '批量替换选项成功')
+    assert(dedup.json.data.length === 2, '同批重复值被丢掉', String(dedup.json.data.length))
+    assert(dedup.json.dropped === 1, '重复数量随接口返回')
+
+    // 单个选项的增删改
+    const one = await req('POST', '/api/dicts/test_city/items', { label: '深圳' })
+    assert(one.status === 201, '新增单个选项')
+    const dupItem = await req('POST', '/api/dicts/test_city/items', { label: '深圳' })
+    assert(dupItem.status === 409, '同字典下重复值被拒绝')
+    await req('PUT', `/api/dicts/test_city/items/${one.json.id}`, { label: '深圳市' })
+    const after = await req('GET', '/api/dicts/test_city')
+    assert(after.json.data.items.some(i => i.label === '深圳市'), '选项改名生效')
+    await req('DELETE', `/api/dicts/test_city/items/${one.json.id}`)
+    const after2 = await req('GET', '/api/dicts/test_city')
+    assert(!after2.json.data.items.some(i => i.label === '深圳市'), '选项删除生效')
+
+    // 文本粘贴导入：一行一项，「名称|值」
+    const imp = await req('POST', '/api/dicts/test_city/items/import', { text: '杭州|hz\n成都\n杭州|hz' })
+    assert(imp.status === 200, '粘贴导入成功')
+    assert(imp.json.added === 2, '导入去重（已存在与同批重复都跳过）', JSON.stringify({ added: imp.json.added, skipped: imp.json.skipped }))
+
+    // 停用的选项不再下发到填写页
+    const item = imp.json.data.find(i => i.label === '成都')
+    await req('PUT', `/api/dicts/test_city/items/${item.id}`, { enabled: false })
+    const pub2 = await fetch(BASE + '/api/public/dicts/test_city')
+    const pub2Json = await pub2.json()
+    assert(!pub2Json.data.options.some(o => o.label === '成都'), '停用的选项不下发到公开页')
+
+    // ---- 表单绑定字典 + 同步
+    const f = await req('POST', '/api/forms', {
+      title: '字典绑定测试', kind: 'survey',
+      schema: [{
+        id: 'd1', type: 'radio', label: '所在城市', answer: [], props: { dict: 'test_city' },
+        options: [{ label: '北京', value: '北京' }, { label: '上海', value: '上海' }]
+      }]
+    })
+    const fid = f.json.id
+    assert(!!fid, '绑定字典的表单创建成功')
+
+    // 用着的表单要能被查出来：删字典的确认框靠它说清影响面
+    const used = await req('GET', '/api/dicts/test_city')
+    assert(used.json.usedBy.some(x => x.id === fid), '字典能报出哪些表单在用它')
+
+    // 字典里加一项、改一项，同步后卷面跟着变
+    await req('PUT', '/api/dicts/test_city/items', {
+      items: [{ label: '北京', value: '北京' }, { label: '上海市', value: '上海' }, { label: '杭州', value: 'hz' }]
+    })
+    const sync = await req('POST', `/api/forms/${fid}/sync-dict`, {})
+    assert(sync.status === 200 && sync.json.changed === 1, '同步接口报告改动题数', JSON.stringify(sync.json.changed))
+    const syncedField = sync.json.schema.find(x => x.id === 'd1')
+    assert(syncedField.options.some(o => o.label === '上海市'), '选项改名被同步进卷面')
+    assert(syncedField.options.some(o => o.label === '杭州'), '字典新增项被补进卷面')
+
+    // 快照语义：不同步时，字典改了卷面不该跟着变（已发出去的问卷不能悄悄换选项）
+    await req('PUT', '/api/dicts/test_city/items', { items: [{ label: '北京', value: '北京' }] })
+    const untouched = await req('GET', `/api/forms/${fid}`)
+    assert(untouched.json.data.schema[0].options.length === 3, '字典改动不会静默改动已存的卷面')
+
+    // 同步时标准答案指向被移除的选项 → 一起剔除，否则「谁答都错」
+    await req('PUT', `/api/forms/${fid}`, {
+      schema: [{
+        id: 'd1', type: 'radio', label: '所在城市', answer: ['hz', '上海'],
+        props: { dict: 'test_city' }, options: [{ label: '上海', value: '上海' }, { label: '杭州', value: 'hz' }]
+      }]
+    })
+    const sync2 = await req('POST', `/api/forms/${fid}/sync-dict`, {})
+    const f2 = sync2.json.schema.find(x => x.id === 'd1')
+    assert(f2.options.length === 1 && f2.options[0].value === '北京', '只剩字典里还启用的选项')
+    assert(f2.answer.length === 0, '失效的标准答案被剔除', JSON.stringify(f2.answer))
+
+    // 只同步指定字典：一张卷子上挂了多套字典时，不该一键全改
+    await req('POST', `/api/forms/${fid}/sync-dict?code=nope`, {})
+    const nochange = await req('POST', '/api/forms/' + fid + '/sync-dict?code=education', {})
+    assert(nochange.json.changed === 0, '指定了不相关的字典时不做改动')
+
+    // 删字典：表单照常能用（选项是快照），但要回报受影响的表单
+    const del = await req('DELETE', '/api/dicts/test_city')
+    assert(del.status === 200, '删除字典成功')
+    assert(Array.isArray(del.json.affectedForms), '删除时回报受影响的表单')
+    const stillOk = await req('GET', `/api/forms/${fid}`)
+    assert(stillOk.status === 200 && stillOk.json.data.schema[0].options.length === 1, '删掉字典后表单照常可用')
+
+    // 权限：普通用户不能改字典（全站共享的选项被个人改口径，比没有字典更糟）
+    const created2 = await req('POST', '/api/users', {
+      username: 'dictuser', nickname: '字典观察员', password: 'dict-pass-123', role_id: 2
+    })
+    assert(created2.status === 201, '创建普通用户用于权限校验')
+    const ck = await asUser('dictuser', 'dict-pass-123')
+    const roRead = await call(ck, 'GET', '/api/dicts')
+    assert(roRead.status === 200, '普通用户能读字典（设计器要用）')
+    const roWrite = await call(ck, 'POST', '/api/dicts', { name: '越权字典', code: 'x_deny' })
+    assert(roWrite.status === 403, '普通用户不能新建字典')
+    const anon = await fetch(BASE + '/api/dicts')
+    assert(anon.status === 401, '未登录不能读字典管理接口')
+  }
+
   console.log('\n[44] 前端静态资源')
 
-  for (const p of ['/', '/js/main.js', '/css/app.css', '/js/views/Logs.js', '/assets/eqs-mark.svg', '/vendor/echarts.min.js']) {
+  for (const p of ['/', '/js/main.js', '/css/app.css', '/js/views/Logs.js', '/js/views/Dicts.js', '/assets/eqs-mark.svg', '/vendor/echarts.min.js']) {
     const res = await fetch(BASE + p)
     assert(res.ok, `静态资源可访问：${p}`)
   }

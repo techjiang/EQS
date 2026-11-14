@@ -208,6 +208,30 @@ CREATE TABLE IF NOT EXISTS positions (
   dept_id INTEGER NOT NULL DEFAULT 0,
   sort INTEGER NOT NULL DEFAULT 0
 );
+/*
+ * 数据字典：下拉/单选/多选这类「一批固定选项」的东西，以前只能在每张表单里各写一遍。
+ * 「学历」在 12 张表里各有一份，改一个说法就要改 12 处，还会漏。
+ * 绑定字典的表单存的是**快照**（见设计器 props.dict），不是引用：
+ * 字典改了不会静默改动一张已经发出去的问卷，什么时候同步由人点。
+ */
+CREATE TABLE IF NOT EXISTS dict_types (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  code TEXT NOT NULL UNIQUE,
+  name TEXT NOT NULL,
+  description TEXT DEFAULT '',
+  sort INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS dict_items (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  type_code TEXT NOT NULL,
+  label TEXT NOT NULL,
+  value TEXT NOT NULL,
+  sort INTEGER NOT NULL DEFAULT 0,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dict_items_type ON dict_items(type_code, sort);
 CREATE TABLE IF NOT EXISTS i18n (
   lang TEXT NOT NULL,
   key TEXT NOT NULL,

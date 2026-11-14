@@ -22,6 +22,7 @@ import Exams from './views/Exams.js'
 import Screen from './views/Screen.js'
 import Sessions from './views/Sessions.js'
 import Logs from './views/Logs.js'
+import Dicts from './views/Dicts.js'
 
 const NAV = [
   { group: '工作', key: 'group.work', items: [
@@ -38,6 +39,7 @@ const NAV = [
   ]},
   { group: '系统', key: 'group.system', items: [
     { path: '/users', name: '用户权限', key: 'nav.users', icon: 'users', admin: true },
+    { path: '/dicts', name: '数据字典', key: 'nav.dicts', icon: 'dict' },
     { path: '/recycle', name: '回收中心', key: 'nav.recycle', icon: 'recycle' },
     { path: '/sessions', name: '登录设备', key: 'nav.sessions', icon: 'shield' },
     { path: '/logs', name: '审计日志', key: 'nav.logs', icon: 'clock', admin: true },
@@ -116,6 +118,7 @@ export default {
       // 直接敲地址也不能进：菜单收起来了，地址栏还留着后门就白收
       if (p === '/settings') return state.user?.perms?.includes('*') ? Settings : Forbidden
       if (p === '/users') return state.user?.perms?.includes('*') ? Users : Forbidden
+      if (p === '/dicts') return Dicts
       return Dashboard
     })
 

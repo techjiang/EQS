@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { createRouter, sendJson, serveStatic, HttpError, clientIp } from './lib/http.js'
 import { ensureAdmin, seedRoles } from './lib/auth.js'
-import { seedTemplates, seedSettings } from './lib/seed.js'
+import { seedTemplates, seedSettings, seedDicts } from './lib/seed.js'
 import { log } from './lib/db.js'
 import { runWithRequest } from './lib/ctx.js'
 
@@ -15,6 +15,7 @@ import bankRoutes from './routes/banks.js'
 import adminRoutes from './routes/admin.js'
 import fileRoutes from './routes/files.js'
 import systemRoutes from './routes/system.js'
+import dictRoutes from './routes/dict.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const WEB_DIR = path.join(__dirname, '..', 'web')
@@ -24,9 +25,10 @@ seedRoles()
 ensureAdmin()
 seedTemplates()
 seedSettings()
+seedDicts()
 
 const router = createRouter()
-for (const register of [authRoutes, formRoutes, submissionRoutes, bankRoutes, adminRoutes, fileRoutes, systemRoutes]) register(router)
+for (const register of [authRoutes, formRoutes, submissionRoutes, bankRoutes, adminRoutes, fileRoutes, systemRoutes, dictRoutes]) register(router)
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x')

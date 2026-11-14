@@ -6,6 +6,7 @@ import { localPath } from '../lib/storage.js'
 import { formRole, formVisibleScope, submissionVisibleScope, requireFormRole, memberCandidates, listMembers, addMember, FORM_MEMBER_ROLES, ROLE_LABEL } from '../lib/formMembers.js'
 import { readXlsxUpload } from './files.js'
 import { parseXlsx, rowsToFields } from '../lib/sheet.js'
+import { itemsToOptions, listItems } from '../lib/dict.js'
 import fs from 'node:fs'
 import { log } from '../lib/db.js'
 
@@ -201,6 +202,82 @@ export default function register(r) {
     run('UPDATE forms SET schema = ?, updated_at = ? WHERE id = ?', JSON.stringify(schema), now(), form.id)
     log(user, 'Excel 导入题目', `${form.title} #${form.id} → ${clean.length} 道`)
     sendJson(res, 200, { ok: true, added: clean.length, skipped, droppedAnswers, unknownColumns, schema })
+  })
+
+  /**
+   * 把绑定字典的题目重新同步一遍。
+   *
+   * 为什么不是「自动跟着字典变」：schema 里节点存的是字典**快照**（见 lib/dict.js 的注释），
+   * 字典改动只影响「以后主动同步」的表单——已经收回来 3000 份答卷的表，选项不能悄悄变。
+   *
+   * 同步按 value 认题：选择题里 value 还在的，只更新 label（「本科」改成「大学本科」）；
+   * value 已经不在字典里的，从选项里拿掉；字典新增的，按字典顺序补进去。
+   * 三种变化都摊在返回里给人看，尤其是「拿掉的选项」——它会让历史答卷里的值失去对应项，
+   * 所以只报告不偷偷改分。
+   */
+  r.post('/api/forms/:id/sync-dict', async (req, res, { params }) => {
+    const user = requirePerm(req, 'form:update')
+    const form = pickForm(params.id)
+    if (!form) fail(404, '表单不存在')
+    requireFormRole(user, form, 'edit')
+    const url = new URL(req.url, 'http://x')
+    const onlyCode = url.searchParams.get('code') || ''
+    const schema = JSON.parse(JSON.stringify(form.schema || []))
+    const changes = []
+    const codes = new Set()
+
+    for (const f of schema) {
+      const code = f?.props?.dict
+      if (!code || (onlyCode && code !== onlyCode)) continue
+      const type = get('SELECT * FROM dict_types WHERE code = ?', code)
+      if (!type) { changes.push({ field: f.label, dict: code, missing: true, added: [], updated: [], removed: [] }); continue }
+      const opts = itemsToOptions(listItems(code, { onlyEnabled: true }))
+      const byValue = new Map(opts.map(o => [String(o.value), o]))
+      const oldOpts = Array.isArray(f.options) ? f.options : []
+      const kept = []
+      const removed = []
+      for (const o of oldOpts) {
+        const hit = byValue.get(String(o.value))
+        if (hit) kept.push({ label: hit.label, value: String(hit.value) })
+        else removed.push(o.label)
+      }
+      const oldValues = new Set(oldOpts.map(o => String(o.value)))
+      const added = opts.filter(o => !oldValues.has(String(o.value))).map(o => o.label)
+      // 顺序也对齐字典：字典里调整过顺序，同步后卷面顺序跟着变。
+      // 合并结果就是字典当前全部启用项——只在 kept 里挑会把新增项漏掉，
+      // 而「字典加了选项、同步完却没有」是最容易让人放弃这个功能的那种细节。
+      const merged = opts
+      const relabeled = kept.filter(k => {
+        const before = oldOpts.find(o => String(o.value) === k.value)
+        return before && before.label !== k.label
+      }).map(k => {
+        const before = oldOpts.find(o => String(o.value) === k.value)
+        return { value: k.value, from: before.label, to: k.label }
+      })
+      // 标准答案里指向被拿掉选项的，跟着剔除——留着就是「谁答都错」
+      const validValues = new Set(merged.map(o => String(o.value)))
+      const beforeAnswer = Array.isArray(f.answer) ? f.answer.map(String) : []
+      const answer = beforeAnswer.filter(v => validValues.has(v))
+      if (merged.length) f.options = merged
+      f.answer = answer
+      codes.add(code)
+      if (added.length || removed.length || relabeled.length || answer.length !== beforeAnswer.length) {
+        changes.push({
+          field: f.label, dict: code, missing: false,
+          added, removed, relabeled,
+          droppedAnswers: beforeAnswer.filter(v => !validValues.has(v))
+        })
+      }
+    }
+
+    // 还要处理 props.dict 但已经不是选择题的情况：字典只对「有选项」的题有意义
+
+    const touched = changes.filter(c => !c.missing)
+    if (touched.length) {
+      run('UPDATE forms SET schema = ?, updated_at = ? WHERE id = ?', JSON.stringify(schema), now(), form.id)
+      log(user, '同步字典选项', `${form.title} #${form.id}，${touched.length} 道题，字典：${[...codes].join(', ')}`)
+    }
+    sendJson(res, 200, { ok: true, changed: touched.length, changes, schema })
   })
 
   /* ---------------- 表单协作 ---------------- */

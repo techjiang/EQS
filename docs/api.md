@@ -442,3 +442,40 @@ data: {"error":"...","fallback":{...},"done":true}   ← AI 不可用时降级
 
 导出的 xlsx 是标准 OOXML（store 打包，Excel / WPS / Numbers / LibreOffice 均可打开），
 读取端同时支持 sharedStrings 与 inlineStr、以及 store / deflate 两种压缩方式。
+
+## 数据字典
+
+固定选项（学历、行业、问题类型…）集中维护一份，表单绑定后按需同步。
+
+| 方法 | 路径 | 权限 | 说明 |
+| --- | --- | --- | --- |
+| GET | `/api/dicts` | 登录 | 全部字典；`?items=1` 连选项一起返回 |
+| GET | `/api/dicts/:code` | 登录 | 单套字典，附 `usedBy`（哪些表单绑定了它） |
+| GET | `/api/public/dicts/:code` | 匿名 | 填写页渲染用，只返回**启用**的选项 |
+| POST | `/api/dicts` | 管理员 | `{ name, code?, description?, items? }`，`code` 省略则由名称生成 |
+| PUT | `/api/dicts/:code` | 管理员 | 改名 / 说明 / 排序（`code` 不可改，表单里存的就是它） |
+| DELETE | `/api/dicts/:code` | 管理员 | 一并删除选项；响应里 `affectedForms` 是受影响的表单 |
+| GET | `/api/dicts/:code/items` | 登录 | 选项列表（含停用项） |
+| POST | `/api/dicts/:code/items` | 管理员 | 单条新增 |
+| PUT | `/api/dicts/:code/items` | 管理员 | **整批替换**，同批重复 value 丢弃并回 `dropped` |
+| PUT | `/api/dicts/:code/items/:id` | 管理员 | 改名 / 改值 / 启停 / 排序 |
+| DELETE | `/api/dicts/:code/items/:id` | 管理员 | 删除单条 |
+| POST | `/api/dicts/:code/items/import` | 管理员 | `{ text }` 一行一项，「名称\|值」可选；已存在的值跳过并计入 `skipped` |
+
+### 表单与字典的绑定
+
+设计器里给选择题「从字典取用」时，选项会**拷贝**进 `schema[i].options`，同时记下
+`schema[i].props.dict = '<code>'`。这是快照，不是引用。
+
+理由：引用式绑定下，改一次字典里一个错别字，上个月已经发出去、已经收回三千份答卷那张表的
+选项就跟着变了——历史答卷的值突然对不上任何选项，报表里全成「其他」。
+所以字典改动只影响「以后主动同步」的表单：
+
+```
+POST /api/forms/:id/sync-dict          # 同步这张表上所有绑定字典的题
+POST /api/forms/:id/sync-dict?code=xx  # 只同步某一套字典
+```
+
+同步按 `value` 认题：值还在的只更新显示名，值已不在字典里（或被停用）的从选项里移除，
+字典新增的按字典顺序补齐；标准答案里指向被移除项的一并剔除（否则这题变成「谁答都错」）。
+响应里 `changes[]` 逐题给出 `added / removed / relabeled / droppedAnswers`。
