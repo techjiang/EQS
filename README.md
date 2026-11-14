@@ -169,7 +169,10 @@ bash scripts/start.sh                        # 启动即完成迁移
 
 ## API
 
-请求头带 `Cookie: eqs_token=…`（登录会话）或 `X-API-Key: eqs_…`（在系统设置 → API Key 创建，等同管理员权限，停用后立即失效）。
+请求头带 `Cookie: eqs_token=…`（登录会话）或 `X-API-Key: eqs_…`（在系统设置 → API Key 创建）。
+
+> **API Key 只拥有签发人本人的权限**：管理员签的 Key 才是管理员级，普通用户签不了 Key。停用后立即失效。
+> 这条以前写的是「等同管理员权限」，于是任何登录用户自助签一把 Key 就能导出整站数据——现在不成立了。
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
@@ -209,7 +212,7 @@ bash scripts/start.sh                        # 启动即完成迁移
 
 ```bash
 node --watch server/index.js   # 热重启
-node tests/smoke.test.js       # 冒烟测试（275 项）
+node tests/smoke.test.js       # 冒烟测试（340 项）
 ```
 
 ## 项目结构

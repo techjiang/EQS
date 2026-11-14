@@ -47,6 +47,9 @@ export default function register(r) {
     const user = requirePerm(req, 'form:create')
     const body = await readJson(req)
     if (!body.title) fail(400, '请填写表单标题')
+    // 模板中心是全站共享的：谁都能往里塞东西，模板中心就变成广告位。
+    // 实测普通用户建一张 is_template=1 的表单，它立刻出现在所有人的模板列表里。
+    if (body.is_template && !can(user, '*')) fail(403, '只有管理员可以把表单存为公共模板')
     const kind = KINDS.includes(body.kind) ? body.kind : 'survey'
     const ts = now()
     const result = run(
@@ -75,7 +78,10 @@ export default function register(r) {
     if (body.schema !== undefined) { sets.push('schema = ?'); args.push(JSON.stringify(normalizeSchema(body.schema))) }
     if (body.settings !== undefined) { sets.push('settings = ?'); args.push(JSON.stringify(body.settings)) }
     if (body.status !== undefined) { sets.push('status = ?'); args.push(['draft', 'published', 'closed'].includes(body.status) ? body.status : 'draft') }
-    if (body.is_template !== undefined) { sets.push('is_template = ?'); args.push(body.is_template ? 1 : 0) }
+    if (body.is_template !== undefined) {
+      if (!can(user, '*')) fail(403, '只有管理员可以把表单存为公共模板')
+      sets.push('is_template = ?'); args.push(body.is_template ? 1 : 0)
+    }
     if (body.category !== undefined) { sets.push('category = ?'); args.push(String(body.category)) }
     if (!sets.length) fail(400, '没有需要更新的内容')
     sets.push('updated_at = ?'); args.push(now())
@@ -140,8 +146,10 @@ export default function register(r) {
     const ts = now()
     const result = run(
       'INSERT INTO forms(title, description, kind, schema, settings, status, is_template, category, created_by, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+      // 复制出来的东西默认是「我的表单」：以前连 is_template 一起抄，
+      // 普通用户复制一张模板就等于往模板中心塞了一份，模板中心变成广告位
       `${form.title} - 副本`, form.description, form.kind, JSON.stringify(form.schema), JSON.stringify(form.settings),
-      'draft', form.is_template, form.category, user.id, ts, ts
+      'draft', can(user, '*') ? form.is_template : 0, form.category, user.id, ts, ts
     )
     sendJson(res, 201, { ok: true, id: Number(result.lastInsertRowid) })
   })
@@ -187,9 +195,11 @@ export default function register(r) {
   r.get('/api/templates', async (req, res) => {
     const user = currentUser(req)
     if (!user) fail(401, '请先登录')
+    // 只列管理员建的模板：普通用户私存的「模板」进了公共列表就是污染
     const rows = all(`SELECT f.id, f.title, f.description, f.kind, f.category, f.settings, f.updated_at,
       (SELECT COUNT(*) FROM forms x WHERE x.is_template = 0 AND x.title LIKE f.title || '%') AS uses
-      FROM forms f WHERE f.is_template = 1 AND f.deleted_at IS NULL ORDER BY f.updated_at DESC`)
+      FROM forms f JOIN users u ON u.id = f.created_by JOIN roles r ON r.id = u.role_id
+      WHERE f.is_template = 1 AND f.deleted_at IS NULL AND r.code = 'admin' ORDER BY f.updated_at DESC`)
     sendJson(res, 200, { ok: true, data: rows.map(x => ({ ...x, settings: safeJson(x.settings, {}) })) })
   })
 

@@ -25,7 +25,7 @@ export function verifyPassword(pwd, stored) {
 const b64 = s => Buffer.from(s).toString('base64url')
 
 export function signSession(payload) {
-  const body = b64(JSON.stringify(payload))
+  const body = b64(JSON.stringify({ iat: Date.now(), ...payload }))
   const sig = crypto.createHmac('sha256', SECRET).update(body).digest('base64url')
   return `${body}.${sig}`
 }
@@ -49,24 +49,39 @@ export const ROLE_PERMS = {
   user: ['form:create', 'form:read', 'form:update', 'form:delete', 'data:read', 'data:write', 'bank:read', 'bank:write', 'report:read']
 }
 
-/** API Key 身份：文档承诺 X-API-Key 可调接口，这里真正兑现 */
+/**
+ * API Key 身份：文档承诺 X-API-Key 可调接口，这里真正兑现。
+ *
+ * 但「Key 是谁签的」必须一起记住。之前一律按管理员解析 ——
+ * 任何登录用户（包括自助注册的）自己签一把 Key，就拿到了全站管理员权限：
+ * 实测能导出整站备份、新建管理员账号、改别人的问卷。Key 是凭证不是提权通道，
+ * 它只该等价于「签发它的那个人」。
+ */
 function apiKeyUser(req) {
   const raw = req.headers['x-api-key'] || parseCookies(req).eqs_apikey || ''
   const key = String(raw).trim()
   if (!key) return null
   const row = get('SELECT * FROM api_keys WHERE key = ? AND enabled = 1', key)
   if (!row) return null
+  // owner_id=0 是老数据：签发人未知，不能再当成管理员，一律作废（重新签一把即可）
+  if (!row.owner_id) return null
+  const owner = get('SELECT id, username, nickname, avatar, role_id, status FROM users WHERE id = ?', row.owner_id)
+  if (!owner || owner.status !== 1) return null
+  const role = get('SELECT * FROM roles WHERE id = ?', owner.role_id)
+  let perms = []
+  try { perms = JSON.parse(role?.perms || '[]') } catch {}
   return {
-    id: 0, username: `apikey:${row.name}`, nickname: row.name || 'API Key',
-    role: 'admin', roleName: 'API Key', perms: ['*'], viaApiKey: true
+    ...owner, role: role?.code || 'user', roleName: role?.name || '用户', perms, viaApiKey: true, apiKeyName: row.name
   }
 }
 
 export function currentUser(req) {
   const session = readSession(req)
   if (!session?.uid) return apiKeyUser(req)
-  const user = get('SELECT id, username, nickname, email, phone, avatar, role_id, dept_id, status FROM users WHERE id = ?', session.uid)
+  const user = get('SELECT id, username, nickname, email, phone, avatar, role_id, dept_id, status, pwd_changed_at FROM users WHERE id = ?', session.uid)
   if (!user || user.status !== 1) return null
+  // 改过密码之后，之前签出去的会话全部作废：否则「密码泄露 → 改密码」等于没改
+  if (user.pwd_changed_at && (!session.iat || session.iat < new Date(user.pwd_changed_at).getTime())) return null
   const role = get('SELECT * FROM roles WHERE id = ?', user.role_id)
   let perms = []
   try { perms = JSON.parse(role?.perms || '[]') } catch {}
@@ -92,10 +107,17 @@ export function requirePerm(req, perm) {
 }
 
 export function tokenFromApiKey(req, cookies) {
-  const key = req.headers['x-api-key'] || cookies.eqs_apikey
+  const key = req.headers['x-api-key'] || cookies?.eqs_apikey
   if (!key) return false
   const row = get('SELECT * FROM api_keys WHERE key = ? AND enabled = 1', String(key))
-  return !!row
+  if (!row || !row.owner_id) return false
+  const owner = get('SELECT status FROM users WHERE id = ?', row.owner_id)
+  return owner?.status === 1
+}
+
+/** 记录「最后一次改密码的时间」，用来作废更早签发的会话 */
+export function stampPasswordChange(userId) {
+  run('UPDATE users SET pwd_changed_at = ? WHERE id = ?', new Date().toISOString(), userId)
 }
 
 export function ensureAdmin() {

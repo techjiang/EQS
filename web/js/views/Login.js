@@ -68,7 +68,9 @@ export default {
           h('b', { style: 'font-size:19px' }, state.site.name || 'EQS')
         ]),
         h('h1', {}, mode.value === 'login' ? '登录你的工作台' : '创建新账号'),
-        h('p', { class: 'sub' }, mode.value === 'login' ? '使用管理员分配的账号，或自行注册体验。' : '注册后即可创建问卷与考试。'),
+        h('p', { class: 'sub' }, mode.value === 'login'
+          ? (state.site.allowRegister ? '使用管理员分配的账号，或自行注册体验。' : '请使用管理员分配的账号登录。')
+          : '注册后即可创建问卷与考试。'),
         input('username', '账号', 'text', '请输入账号'),
         input('password', '密码', 'password', '请输入密码'),
         mode.value === 'register' ? input('nickname', '昵称', 'text', '显示名称（可选）') : null,
@@ -78,8 +80,11 @@ export default {
           disabled: loading.value, onClick: submit
         }, loading.value ? '处理中…' : (mode.value === 'login' ? '登录' : '注册并登录')),
         h('div', { class: 'flex between', style: 'margin-top:14px' }, [
-          h('a', { href: 'javascript:;', class: 'small', onClick: () => mode.value = mode.value === 'login' ? 'register' : 'login' },
-            mode.value === 'login' ? '没有账号？注册一个' : '已有账号？去登录'),
+          // 自助注册默认关闭：站点没开这个门时，别摆一个点下去必定 403 的链接
+          state.site.allowRegister || mode.value === 'register'
+            ? h('a', { href: 'javascript:;', class: 'small', onClick: () => mode.value = mode.value === 'login' ? 'register' : 'login' },
+                mode.value === 'login' ? '没有账号？注册一个' : '已有账号？去登录')
+            : h('span', { class: 'small muted' }, '账号由管理员开通'),
           h('a', { href: '/', class: 'small muted', 'data-link': true }, '先去逛逛 →')
         ]),
         h('div', { class: 'mt2', style: 'border-top:1px solid var(--line);padding-top:14px' }, [
@@ -89,7 +94,7 @@ export default {
             h('button', { class: 'btn', style: 'flex:1', onClick: () => oauth('wechat') }, '微信')
           ])
         ]),
-        h('p', { class: 'small muted center', style: 'margin-top:16px' }, '默认管理员：admin / admin123，登录后请及时修改')
+        h('p', { class: 'small muted center', style: 'margin-top:16px' }, '首次部署请用安装时设置的管理员账号登录，并立即修改密码')
       ]))
     ])
   }

@@ -74,7 +74,7 @@ export default {
       try {
         const r = await api.post('/api/api-keys', { name })
         ok('已创建，请立即保存：' + r.key)
-        prompt('请复制并妥善保存（只显示一次）', r.key)
+        prompt('请复制并妥善保存（只显示一次）。它只拥有创建者本人的权限。', r.key)
         load()
       } catch (e) { err(e.message) }
     }
@@ -143,7 +143,9 @@ export default {
             field('站点标语', txt(s, 'slogan', '一体化问卷 · 考试 · 刷题平台')),
             field('Logo 地址', txt(s, 'logo', '/assets/eqs-mark.svg')),
             field('站点访问地址', txt(s, 'baseUrl', 'https://your-domain.com'), '用于生成回调地址与第三方登录'),
-            field('ICP 备案号', txt(s, 'icp', ''))
+            field('ICP 备案号', txt(s, 'icp', '')),
+            sw(s, 'allowRegister', '允许自助注册'),
+            h('div', { class: 'hint' }, '默认关闭。问卷系统里的账号等于「能建卷、能看自己那份数据」，陌生人注册进来没有审核环节，建议只在内部试用时打开。')
           ])
         }
         case 'storage': {

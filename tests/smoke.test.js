@@ -48,6 +48,26 @@ async function req(method, url, body, headers = {}) {
   return { status: res.status, json, res }
 }
 
+/** 用指定账号登录，拿到它自己的 cookie —— 多身份测试用，不污染全局会话 */
+async function asUser(username, password) {
+  const res = await fetch(BASE + '/api/auth/login', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password })
+  })
+  const sc = res.headers.get('set-cookie')
+  return sc ? sc.split(';')[0] : ''
+}
+
+/** 用给定 cookie 发请求 */
+async function call(ck, method, url, body) {
+  const res = await fetch(BASE + url, {
+    method, headers: { 'Content-Type': 'application/json', Cookie: ck },
+    body: body === undefined ? undefined : JSON.stringify(body)
+  })
+  const ct = res.headers.get('content-type') || ''
+  return { status: res.status, json: ct.includes('json') ? await res.json() : null, res }
+}
+
 const server = spawn(process.execPath, ['server/index.js'], {
   env: { ...process.env, PORT: String(PORT), EQS_DATA_DIR: DATA_DIR, EQS_ADMIN_PASSWORD: 'test-pass-123' },
   stdio: ['ignore', 'pipe', 'pipe']
@@ -76,6 +96,14 @@ try {
 
   r = await req('GET', '/api/auth/me')
   assert(r.json.user?.username === 'admin', '会话可识别当前用户')
+
+  // 自助注册默认关闭：私域问卷系统里「谁都能注册」等于谁都能建卷看数据
+  r = await req('POST', '/api/auth/register', { username: 'noswitch', password: 'noswitch-1' })
+  assert(r.status === 403, '默认不允许自助注册', String(r.status))
+  r = await req('PUT', '/api/settings/site', { allowRegister: true })
+  assert(r.json.ok, '管理员可以打开自助注册开关')
+  r = await req('GET', '/api/settings/public')
+  assert(r.json.data.allowRegister === true, '公开设置里带出注册开关（登录页据此决定显不显示入口）')
 
   console.log('\n[2] 模板与表单')
   r = await req('GET', '/api/templates')
@@ -1353,22 +1381,6 @@ try {
   console.log('\n[45] 权限边界：普通用户不该摸到别人的东西')
   {
     const saved = cookie
-    // 普通用户会用自己的 cookie，这里另起一套，避免污染全局会话
-    const asUser = async (username, password) => {
-      const res = await fetch(BASE + '/api/auth/login', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username, password })
-      })
-      return res.headers.get('set-cookie').split(';')[0]
-    }
-    const call = async (ck, method, url, body) => {
-      const res = await fetch(BASE + url, {
-        method, headers: { 'Content-Type': 'application/json', Cookie: ck },
-        body: body === undefined ? undefined : JSON.stringify(body)
-      })
-      const ct = res.headers.get('content-type') || ''
-      return { status: res.status, json: ct.includes('json') ? await res.json() : null, res }
-    }
 
     // 管理员建一张私有问卷 + 挂一个附件
     cookie = saved
@@ -1431,6 +1443,111 @@ try {
     await req('PUT', '/api/users/' + hangon.id, { role_id: 2 })
     p = await req('DELETE', '/api/roles/' + tmpRole.id)
     assert(p.status === 200, '角色空出来之后可以正常删除')
+  }
+
+  console.log('\n[46] 账号与凭证：Key 不等于提权、改密要验旧密码、登录要限速')
+  {
+    const adminCookie = cookie
+
+    // —— API Key 只应有签发人本人的权限 ——
+    await req('POST', '/api/settings/site', { allowRegister: true })
+    await req('POST', '/api/auth/register', { username: 'keyless', password: 'keyless-123' })
+    const userCk = await asUser('keyless', 'keyless-123')
+    let p = await call(userCk, 'POST', '/api/auth/api-key', {})
+    assert(p.status === 403, '普通用户不能自助签发 API Key（那是给自己发管理员）', String(p.status))
+
+    cookie = adminCookie
+    const adminKey = (await req('POST', '/api/api-keys', { name: '管理员集成' })).json.key
+    const kUsers = await fetch(BASE + '/api/users', { headers: { 'X-API-Key': adminKey } })
+    assert(kUsers.ok, '管理员签的 Key 仍可调用接口', String(kUsers.status))
+
+    // 老数据里的 Key（没有 owner_id）一律不再生效
+    const legacy = new DatabaseSync(path.join(DATA_DIR, 'eqs.db'))
+    legacy.prepare("INSERT INTO api_keys(name, key, enabled, created_at) VALUES('遗留密钥', 'eqs_legacy_should_be_dead', 1, ?)").run(new Date().toISOString())
+    legacy.close()
+    const legacyRes = await fetch(BASE + '/api/users', { headers: { 'X-API-Key': 'eqs_legacy_should_be_dead' } })
+    assert(legacyRes.status === 401, '签发人未知的历史 Key 不再被当成管理员', String(legacyRes.status))
+
+    // —— 改密码必须验旧密码、守长度，并让旧会话失效 ——
+    p = await call(userCk, 'PUT', '/api/auth/me', { password: '1' })
+    assert(p.status === 400 && /当前密码/.test(p.json.message), '改密码不给旧密码直接拒绝', p.status + ' ' + JSON.stringify(p.json))
+    p = await call(userCk, 'PUT', '/api/auth/me', { oldPassword: 'wrong-old', password: 'newpass-123' })
+    assert(p.status === 403, '旧密码不对时拒绝改密', String(p.status))
+    p = await call(userCk, 'PUT', '/api/auth/me', { oldPassword: 'keyless-123', password: '12345' })
+    assert(p.status === 400, '新密码太短被拒绝', String(p.status))
+    p = await call(userCk, 'PUT', '/api/auth/me', { oldPassword: 'keyless-123', password: 'newpass-123' })
+    assert(p.status === 200 && p.json.relogin, '改密成功后要求重新登录', JSON.stringify(p.json))
+    p = await call(userCk, 'GET', '/api/forms')
+    assert(p.status === 401, '改密后旧会话立即失效（否则密码泄露改了也没用）', String(p.status))
+    p = await req('POST', '/api/auth/login', { username: 'keyless', password: 'keyless-123' })
+    assert(p.status === 401, '旧密码不能再用')
+    const newCk = await asUser('keyless', 'newpass-123')
+    assert(!!newCk, '新密码可以登录')
+
+    // 后台接口不能绕开「验证旧密码」
+    p = await call(newCk, 'PUT', '/api/users/' + (await call(newCk, 'GET', '/api/users')).json.data[0].id, { password: 'bypass-123' })
+    assert(p.status === 403 || p.status === 400, '普通用户改自己密码绕不开旧密码校验', p.status + ' ' + JSON.stringify(p.json))
+
+    // —— 登录失败限速 ——
+    let limited = false
+    for (let i = 0; i < 12; i++) {
+      const res = await req('POST', '/api/auth/login', { username: 'keyless', password: 'bad-' + i })
+      if (res.status === 429) { limited = true; break }
+    }
+    assert(limited, '连续输错密码后开始拒绝（否则六位密码一夜跑完）')
+
+    // —— 模板中心不被普通用户污染 ——
+    cookie = adminCookie
+    p = await call(newCk, 'POST', '/api/forms', { title: '广告模板', is_template: 1, schema: [] })
+    assert(p.status === 403, '普通用户不能把表单存为公共模板', String(p.status))
+    p = await call(newCk, 'POST', '/api/templates/1/use', {})
+    if (p.status === 201) {
+      const copied = await call(newCk, 'GET', '/api/forms/' + p.json.id)
+      assert(copied.json.data?.is_template === 0, '套用模板复制出来的表单不再进模板中心')
+    }
+  }
+
+  console.log('\n[47] 别人的东西不该能写：题目、答卷导入、组卷')
+  {
+    const adminCookie = cookie
+    await req('POST', '/api/banks', { name: '管理员私有题库' })
+    const banks = (await req('GET', '/api/banks')).json.data
+    const bId = banks.find(b => b.name === '管理员私有题库').id
+    const q = await req('POST', `/api/banks/${bId}/questions`, { type: 'radio', label: '不能被你删的题', options: ['A', 'B'], answer: ['A'], score: 5 })
+    const qId = q.json.ids[0]
+
+    await req('POST', '/api/auth/register', { username: 'intruder', password: 'intruder-123' })
+    const ck = await asUser('intruder', 'intruder-123')
+
+    let p = await call(ck, 'POST', `/api/banks/${bId}/questions`, { type: 'radio', label: '塞进来的题', options: ['A', 'B'], answer: ['A'] })
+    assert(p.status === 404 || p.status === 403, '不能往别人的题库里塞题', p.status + ' ' + JSON.stringify(p.json))
+    p = await call(ck, 'PUT', '/api/questions/' + qId, { label: '被改掉的题' })
+    assert(p.status === 403, '不能改别人题库里的题目', String(p.status))
+    p = await call(ck, 'DELETE', '/api/questions/' + qId, {})
+    assert(p.status === 403, '不能删别人题库里的题目（写比读更该守门）', String(p.status))
+    p = await call(ck, 'POST', `/api/banks/${bId}/import-text`, { text: '[单选] 灌进来的\nA. 甲\nB. 乙\n答案：A' })
+    assert(p.status === 404 || p.status === 403, '不能往别人题库导入题目', String(p.status))
+    p = await call(ck, 'POST', `/api/banks/${bId}/paper`, { count: 1 })
+    assert(p.status === 404 || p.status === 403, '不能用别人的题库组卷（等于连答案一起拿走）', String(p.status))
+
+    cookie = adminCookie
+    const still = (await req('GET', `/api/banks/${bId}/questions`)).json
+    assert(still.total === 1 && still.data[0].title === '不能被你删的题', '几次越权尝试后题目原样还在', JSON.stringify(still.data.map(x => x.title)))
+
+    // 别人的表单：不能灌答卷
+    await req('POST', '/api/forms', { title: '管理员的卷', kind: 'survey', schema: [{ type: 'text', label: '姓名', required: true }] })
+    const forms = (await req('GET', '/api/forms')).json.data
+    const fId = forms.find(f => f.title === '管理员的卷').id
+    await req('PUT', '/api/forms/' + fId, { status: 'published' })
+    cookie = ''
+    p = await call(ck, 'POST', '/api/submissions', { formId: fId, data: { [Object.keys({})[0] || 'x']: 'y' } })
+    assert(p.status === 403 || p.status === 422, '普通用户不能往别人的表单后台新增答卷', p.status + ' ' + JSON.stringify(p.json))
+    p = await call(ck, 'POST', `/api/forms/${fId}/import`, { items: [{ data: {} }] })
+    assert(p.status === 403, '普通用户不能往别人的表单导入答卷', String(p.status))
+
+    cookie = adminCookie
+    const subs = (await req('GET', `/api/submissions?formId=${fId}`)).json
+    assert(subs.total === 0, '越权写入全部没落库', JSON.stringify(subs.total))
   }
 
   console.log('\n[44] 前端静态资源')

@@ -288,6 +288,10 @@ table.table{width:100%;border-collapse:collapse;font-size:13.5px}
   .page{padding:14px}
   .grid.c2,.grid.c3,.grid.c4{grid-template-columns:1fr}
   .grid[style*="grid-template-columns"]{grid-template-columns:1fr!important}
+  /* 指标卡在窄屏一张一行太浪费：四个数字要滚两屏才看完，改成两列 */
+  .grid.c4{grid-template-columns:repeat(2,1fr);gap:10px}
+  .stat{padding:14px}
+  .stat .v{font-size:23px}
   .page-head h1{font-size:19px}
   .card-h{flex-wrap:wrap}
   .topbar{padding:0 14px}

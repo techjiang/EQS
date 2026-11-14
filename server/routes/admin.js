@@ -1,6 +1,6 @@
 import { get, all, run, now, log, setting, setSetting } from '../lib/db.js'
 import { readJson, fail, sendJson, clientIp } from '../lib/http.js'
-import { requireUser, requirePerm, can, hashPassword } from '../lib/auth.js'
+import { requireUser, requirePerm, can, hashPassword, verifyPassword, stampPasswordChange } from '../lib/auth.js'
 import { storageConfig } from '../lib/storage.js'
 import { smtpSend, sendSms, dispatchWebhooks } from '../lib/notify.js'
 import { aiConfig, generateForm, localGenerate } from '../lib/ai.js'
@@ -112,11 +112,21 @@ export default function register(r) {
       if (body.status !== undefined) { sets.push('status = ?'); args.push(body.status ? 1 : 0) }
     }
     if (body.password) {
+      // 改「自己」的密码一律要验旧密码：否则「验证旧密码」只在 /api/auth/me 成立，
+      // 换个地址（这里）就绕过去了——管理员账号更是最该守住的那个。
+      if (me.id === target.id) {
+        const row = get('SELECT password FROM users WHERE id = ?', target.id)
+        if (!body.oldPassword) fail(400, '修改自己的密码请输入当前密码')
+        if (!verifyPassword(body.oldPassword, row.password)) fail(403, '当前密码不正确')
+        if (String(body.password) === String(body.oldPassword)) fail(400, '新密码不能与当前密码相同')
+      }
       if (String(body.password).length < 6) fail(400, '密码至少 6 位')
       sets.push('password = ?'); args.push(hashPassword(body.password))
     }
     if (!sets.length) fail(400, '没有需要更新的内容')
     run(`UPDATE users SET ${sets.join(', ')} WHERE id = ?`, ...args, target.id)
+    // 管理员重置了别人的密码：那个人手里的旧会话必须立刻失效，否则「重置」形同虚设
+    if (body.password) stampPasswordChange(target.id)
     log(me, '修改用户', target.username)
     sendJson(res, 200, { ok: true })
   })
@@ -228,6 +238,8 @@ export default function register(r) {
         name: site.name || 'EQS',
         logo: site.logo || '',
         icp: site.icp || '',
+        // 登录页要据此决定「注册」入口显不显示，别摆一个点了必定 403 的链接
+        allowRegister: site.allowRegister === true,
         lang: setting('i18n', {})?.defaultLang || 'zh',
         mapKey: setting('map', {})?.enabled ? { key: setting('map', {}).amapKey, security: setting('map', {}).amapSecurity } : null,
         oauth: {
@@ -339,7 +351,7 @@ export default function register(r) {
   r.get('/api/api-keys', async (req, res) => {
     const me = requireUser(req)
     if (!can(me, '*')) fail(403, '权限不足')
-    sendJson(res, 200, { ok: true, data: all('SELECT id, name, enabled, created_at FROM api_keys ORDER BY id DESC') })
+    sendJson(res, 200, { ok: true, data: all('SELECT id, name, enabled, owner_id, created_at FROM api_keys ORDER BY id DESC') })
   })
 
   r.post('/api/api-keys', async (req, res) => {
@@ -347,7 +359,10 @@ export default function register(r) {
     if (!can(me, '*')) fail(403, '权限不足')
     const body = await readJson(req)
     const key = 'eqs_' + (await import('node:crypto')).randomBytes(24).toString('hex')
-    run('INSERT INTO api_keys(name, key, enabled, created_at) VALUES(?,?,1,?)', body.name || '默认密钥', key, now())
+    // owner_id 必须记：不记的话所有 Key 只能按「未知身份」处理，
+    // 而「未知身份」以前被当成管理员——那就是一条提权通道。
+    run('INSERT INTO api_keys(name, key, enabled, owner_id, created_at) VALUES(?,?,1,?,?)', body.name || '默认密钥', key, me.id, now())
+    log(me, '创建 API Key', body.name || '默认密钥')
     sendJson(res, 201, { ok: true, key })
   })
 

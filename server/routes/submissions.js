@@ -379,6 +379,8 @@ export default function register(r) {
     const body = await readJson(req)
     const form = pickForm(body.formId)
     if (!form) fail(404, '表单不存在')
+    // 后台「新增答卷」是给表单主人补录的，不是给任何人往别人问卷里灌数据的入口
+    if (!can(user, '*') && form.created_by !== user.id) fail(403, '无权向该表单添加答卷')
     const data = body.data || {}
     const errors = validateSubmission(form.schema, data)
     if (errors.length) fail(422, errors.join('；'))
@@ -484,7 +486,8 @@ export default function register(r) {
       const row = get('SELECT * FROM submissions WHERE id = ? AND deleted_at IS NULL', Number(id))
       if (!row) { skipped++; continue }
       const form = pickForm(row.form_id, { withDeleted: true })
-      if (!can(user, '*') && form?.created_by !== user.id) { skipped++; continue }
+      // 表单记录都没了（被彻底删除）时 form 是 null，`form?.created_by !== user.id` 恒真，得单独判
+      if (!can(user, '*') && (!form || form.created_by !== user.id)) { skipped++; continue }
       run('UPDATE submissions SET deleted_at = ? WHERE id = ?', ts, row.id)
       count++
     }
@@ -535,6 +538,7 @@ export default function register(r) {
     const user = requirePerm(req, 'data:write')
     const form = pickForm(params.id)
     if (!form) fail(404, '表单不存在')
+    if (!can(user, '*') && form.created_by !== user.id) fail(403, '无权向该表单导入答卷')
     const body = await readJson(req)
     const list = Array.isArray(body.items) ? body.items : []
     if (!list.length) fail(400, '没有可导入的数据')

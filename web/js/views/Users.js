@@ -66,10 +66,27 @@ export default {
       try { await api.post('/api/depts', { name: deptName.value }); deptName.value = ''; ok('已添加'); load() } catch (e) { err(e.message) }
     }
 
+    /**
+     * 改自己的密码必须验旧密码（后端也这么要求），所以走 /api/auth/me；
+     * 改别人的才是「管理员重置」，走 /api/users/:id。
+     * 之前两条路合成一条、都不验旧密码：借到一台没锁屏的电脑就能把账号密码改成 1 位。
+     */
     const setPwd = async (u) => {
+      const self = u.id === state.user?.id
+      const oldPwd = self ? prompt(`请输入 ${u.username} 的当前密码`) : null
+      if (self && !oldPwd) return
       const pwd = prompt(`为 ${u.username} 设置新密码（至少 6 位）`)
       if (!pwd) return
-      try { await api.put(`/api/users/${u.id}`, { password: pwd }); ok('密码已重置') } catch (e) { err(e.message) }
+      try {
+        if (self) {
+          const r = await api.put('/api/auth/me', { oldPassword: oldPwd, password: pwd })
+          ok('密码已修改，请用新密码重新登录')
+          if (r?.relogin) { state.user = null; location.href = '/login' }
+        } else {
+          await api.put(`/api/users/${u.id}`, { password: pwd })
+          ok('密码已重置')
+        }
+      } catch (e) { err(e.message) }
     }
 
     // 内置 admin 角色只允许改名：权限位锁死

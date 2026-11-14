@@ -4,7 +4,7 @@
 
 鉴权二选一：
 - Cookie：`eqs_token=<登录返回的会话>`
-- 请求头：`X-API-Key: eqs_xxx`（在系统设置 → API Key 创建）
+- 请求头：`X-API-Key: eqs_xxx`（在系统设置 → API Key 创建，只拥有签发人本人的权限）
 
 ## 鉴权
 

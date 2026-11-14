@@ -181,6 +181,13 @@ function ensureColumns(table, columns) {
 // 没有 owner 就只能所有人可见或者所有人不可见，两种都不对。
 ensureColumns('files', { owner_id: 'INTEGER NOT NULL DEFAULT 0' })
 
+// API Key 必须记「是谁签的」：以前所有 Key 一律按管理员解析，
+// 于是任何登录用户自己签一把 Key 就等于拿到全站管理员权限（实测能读全站备份、建管理员账号）。
+ensureColumns('api_keys', { owner_id: 'INTEGER NOT NULL DEFAULT 0' })
+
+// 改密码之后旧会话必须失效：以前换了密码，别人手里那条 7 天有效的 Cookie 照用不误。
+ensureColumns('users', { pwd_changed_at: 'TEXT' })
+
 ensureColumns('submissions', {
   manual_scores: "TEXT NOT NULL DEFAULT '{}'",
   reviewed_at: 'TEXT',

@@ -180,9 +180,14 @@ export default function register(r) {
     sendJson(res, 200, { ok: true, data: rows, total: rows.length })
   })
 
+  /*
+   * 往题库里写题也要看题库归属。之前只查「题目存在」，于是任何登录用户
+   * 拿着别人的题库 id 就能往里塞题、改题、删题 —— 实测把管理员题库的题删干净了，
+   * 而写接口比读接口更该守门：读丢的是信息，写丢的是数据。
+   */
   r.post('/api/banks/:id/questions', async (req, res, { params }) => {
     const user = requirePerm(req, 'bank:write')
-    const bank = get('SELECT * FROM banks WHERE id = ? AND deleted_at IS NULL', Number(params.id))
+    const bank = readableBank(user, params.id)
     if (!bank) fail(404, '题库不存在')
     const body = await readJson(req)
     const items = Array.isArray(body.items) ? body.items : [body]
@@ -208,6 +213,7 @@ export default function register(r) {
     const user = requirePerm(req, 'bank:write')
     const q = get('SELECT * FROM questions WHERE id = ? AND deleted_at IS NULL', Number(params.id))
     if (!q) fail(404, '题目不存在')
+    if (!readableBank(user, q.bank_id)) fail(403, '无权修改该题目')
     const body = await readJson(req)
     const f = normalizeField({ ...parseQ(q), ...body })
     coerceAnswerToField(f)
@@ -221,6 +227,7 @@ export default function register(r) {
     const user = requirePerm(req, 'bank:write')
     const q = get('SELECT * FROM questions WHERE id = ?', Number(params.id))
     if (!q) fail(404, '题目不存在')
+    if (!readableBank(user, q.bank_id)) fail(403, '无权删除该题目')
     run('UPDATE questions SET deleted_at = ? WHERE id = ?', now(), q.id)
     sendJson(res, 200, { ok: true })
   })
@@ -228,7 +235,7 @@ export default function register(r) {
   /** 批量导入题目（文本） */
   r.post('/api/banks/:id/import-text', async (req, res, { params }) => {
     const user = requirePerm(req, 'bank:write')
-    const bank = get('SELECT * FROM banks WHERE id = ? AND deleted_at IS NULL', Number(params.id))
+    const bank = readableBank(user, params.id)
     if (!bank) fail(404, '题库不存在')
     const { text } = await readJson(req)
     // 题库导入的默认分值不能是 0：recalculate 里 `f.score || 5` 会把 0 变成 5，
@@ -286,7 +293,7 @@ export default function register(r) {
   /** Excel 批量导入题目 */
   r.post('/api/banks/:id/import-xlsx', async (req, res, { params }) => {
     const user = requirePerm(req, 'bank:write')
-    const bank = get('SELECT * FROM banks WHERE id = ? AND deleted_at IS NULL', Number(params.id))
+    const bank = readableBank(user, params.id)
     if (!bank) fail(404, '题库不存在')
     const buf = await readXlsxUpload(req)
     if (!buf?.length) fail(400, '请上传 xlsx 文件')
@@ -311,7 +318,7 @@ export default function register(r) {
   /** 组卷：按题库随机抽题生成考试 */
   r.post('/api/banks/:id/paper', async (req, res, { params }) => {
     const user = requirePerm(req, 'bank:write')
-    const bank = get('SELECT * FROM banks WHERE id = ? AND deleted_at IS NULL', Number(params.id))
+    const bank = readableBank(user, params.id)
     if (!bank) fail(404, '题库不存在')
     const body = await readJson(req)
     const count = Math.max(1, Math.min(200, Number(body.count) || 10))
