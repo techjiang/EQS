@@ -1,0 +1,17 @@
+[Unit]
+Description=EQS 问卷考试平台
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/eqs
+ExecStart=/usr/bin/node server/index.js
+Environment=PORT=8080
+Environment=EQS_DATA_DIR=/opt/eqs/data
+Restart=always
+RestartSec=3
+User=eqs
+Group=eqs
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,644 @@
+import { get, all, run, now, log, setting, setSetting } from '../lib/db.js'
+import { readJson, fail, sendJson, clientIp } from '../lib/http.js'
+import { requireUser, requirePerm, can, hashPassword, verifyPassword, stampPasswordChange, revokeUserSessions } from '../lib/auth.js'
+import { storageConfig } from '../lib/storage.js'
+import { smtpSend, sendSms, dispatchWebhooks } from '../lib/notify.js'
+import { aiConfig, generateForm, localGenerate } from '../lib/ai.js'
+import { safeJson, paginate } from '../lib/forms.js'
+
+const SECRET_FIELDS = ['password', 'pass', 'apiKey', 'secretKey', 'secret', 'accessKey', 'appSecret', 'secretId']
+
+/** 输出时脱敏密钥类字段 */
+function mask(obj) {
+  if (!obj || typeof obj !== 'object') return obj
+  const out = Array.isArray(obj) ? [] : {}
+  for (const [k, v] of Object.entries(obj)) {
+    if (v && typeof v === 'object') out[k] = mask(v)
+    else if (isSecretKey(k) && typeof v === 'string' && v.length > 4) out[k] = v.slice(0, 2) + '****' + v.slice(-2)
+    else out[k] = v
+  }
+  return out
+}
+
+/**
+ * 密钥字段名判断：不分大小写，并覆盖「名字里带这些东西」的组合词。
+ * 之前只做精确匹配，clientSecret / sdkAppId 这类名字漏网，密钥被原样下发到浏览器。
+ */
+const SECRET_SUFFIX = ['secret', 'secretkey', 'secretid', 'password', 'pass', 'apikey', 'accesskey', 'token']
+function isSecretKey(key) {
+  const k = String(key).toLowerCase()
+  if (SECRET_FIELDS.some(f => f.toLowerCase() === k)) return true
+  return SECRET_SUFFIX.some(s2 => k.endsWith(s2))
+}
+
+/** 单个密钥值脱敏：短密钥整体遮掉，避免「前 2 后 2」把 6 位的 key 泄露一半 */
+function maskSecret(v) {
+  const s2 = String(v ?? '')
+  if (!s2) return ''
+  return s2.length > 8 ? s2.slice(0, 2) + '****' + s2.slice(-2) : '****'
+}
+
+/** 值里带 **** 就是脱敏残留，回写时必须换成库里的原值，否则密钥被这一串星号覆盖掉 */
+const MASKED = /\*\*\*\*/
+
+/**
+ * 把前端提交的配置合并到现有配置上。
+ * 值为脱敏串（含 ****）时保留库里的原值；对象递归合并，数组直接替换。
+ */
+function mergeMasked(prev, next) {
+  if (next === null || next === undefined) return prev
+  if (typeof next === 'string') return MASKED.test(next) ? prev : next
+  if (typeof next !== 'object') return next
+  if (Array.isArray(next)) return next
+  const base = prev && typeof prev === 'object' && !Array.isArray(prev) ? prev : {}
+  const out = { ...base }
+  for (const [k, v] of Object.entries(next)) {
+    if (isSecretKey(k) && typeof v === 'string' && MASKED.test(v)) {
+      // 名字就是密钥的字段，脱敏串一律视为「没改」
+      if (typeof base[k] === 'string') continue
+    }
+    out[k] = k in base ? mergeMasked(base[k], v) : v
+  }
+  return out
+}
+
+export default function register(r) {
+  /* ---------------- 用户 ---------------- */
+  r.get('/api/users', async (req, res) => {
+    const me = requirePerm(req, 'form:read')
+    const url = new URL(req.url, 'http://x')
+    const keyword = url.searchParams.get('keyword')
+    const where = []
+    const args = []
+    if (keyword) { where.push('(u.username LIKE ? OR u.nickname LIKE ?)'); args.push(`%${keyword}%`, `%${keyword}%`) }
+    const rows = all(`SELECT u.id, u.username, u.nickname, u.email, u.phone, u.avatar, u.role_id, u.dept_id, u.position_id, u.status, u.last_login_at, u.created_at,
+      r.name AS role_name, d.name AS dept_name, p.name AS position_name
+      FROM users u LEFT JOIN roles r ON r.id = u.role_id LEFT JOIN depts d ON d.id = u.dept_id
+      LEFT JOIN positions p ON p.id = u.position_id
+      ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY u.id ASC`, ...args)
+    // 通讯录不是公开资料。普通用户带 form:read 就能拿到全站账号、邮箱、手机号，
+    // 前端那一栏明明写着「用户与权限（仅管理员）」——非管理员只回自己这一条。
+    if (!can(me, '*')) return sendJson(res, 200, { ok: true, data: rows.filter(u => u.id === me.id), self: true })
+    sendJson(res, 200, { ok: true, data: rows })
+  })
+
+  r.post('/api/users', async (req, res) => {
+    const me = requirePerm(req, 'form:create')
+    if (!can(me, '*')) fail(403, '仅管理员可新增用户')
+    const body = await readJson(req)
+    if (!body.username || !body.password) fail(400, '账号和密码必填')
+    if (String(body.password).length < 6) fail(400, '密码至少 6 位')
+    if (get('SELECT id FROM users WHERE username = ?', body.username)) fail(409, '账号已存在')
+    run(`INSERT INTO users(username, nickname, password, email, phone, role_id, dept_id, position_id, status, created_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?)`,
+      body.username, body.nickname || body.username, hashPassword(body.password), body.email || '', body.phone || '',
+      Number(body.role_id) || 2, Number(body.dept_id) || 0, Number(body.position_id) || 0, body.status === 0 ? 0 : 1, now())
+    log(me, '新增用户', body.username)
+    sendJson(res, 201, { ok: true })
+  })
+
+  r.put('/api/users/:id', async (req, res, { params }) => {
+    const me = requirePerm(req, 'form:create')
+    const target = get('SELECT * FROM users WHERE id = ?', Number(params.id))
+    if (!target) fail(404, '用户不存在')
+    if (!can(me, '*') && me.id !== target.id) fail(403, '无权修改其他用户')
+    const body = await readJson(req)
+    const sets = []
+    const args = []
+    for (const k of ['nickname', 'email', 'phone', 'avatar']) {
+      if (body[k] !== undefined) { sets.push(`${k} = ?`); args.push(String(body[k])) }
+    }
+    if (can(me, '*')) {
+      if (body.role_id !== undefined) { sets.push('role_id = ?'); args.push(Number(body.role_id)) }
+      if (body.dept_id !== undefined) { sets.push('dept_id = ?'); args.push(Number(body.dept_id)) }
+      if (body.position_id !== undefined) { sets.push('position_id = ?'); args.push(Number(body.position_id)) }
+      if (body.status !== undefined) { sets.push('status = ?'); args.push(body.status ? 1 : 0) }
+    }
+    if (body.password) {
+      // 改「自己」的密码一律要验旧密码：否则「验证旧密码」只在 /api/auth/me 成立，
+      // 换个地址（这里）就绕过去了——管理员账号更是最该守住的那个。
+      if (me.id === target.id) {
+        const row = get('SELECT password FROM users WHERE id = ?', target.id)
+        if (!body.oldPassword) fail(400, '修改自己的密码请输入当前密码')
+        if (!verifyPassword(body.oldPassword, row.password)) fail(403, '当前密码不正确')
+        if (String(body.password) === String(body.oldPassword)) fail(400, '新密码不能与当前密码相同')
+      }
+      if (String(body.password).length < 6) fail(400, '密码至少 6 位')
+      sets.push('password = ?'); args.push(hashPassword(body.password))
+    }
+    if (!sets.length) fail(400, '没有需要更新的内容')
+    run(`UPDATE users SET ${sets.join(', ')} WHERE id = ?`, ...args, target.id)
+    // 管理员重置了别人的密码：那个人手里的旧会话必须立刻失效，否则「重置」形同虚设
+    if (body.password) { stampPasswordChange(target.id); revokeUserSessions(target.id, { byUserId: me.id }) }
+    // 禁用账号同理：会话在库里，不吊销的话手里那条 Cookie 还能用到 7 天后
+    if (body.status !== undefined && !body.status) revokeUserSessions(target.id, { byUserId: me.id })
+    log(me, '修改用户', target.username)
+    sendJson(res, 200, { ok: true })
+  })
+
+  r.delete('/api/users/:id', async (req, res, { params }) => {
+    const me = requirePerm(req, 'form:create')
+    if (!can(me, '*')) fail(403, '仅管理员可删除用户')
+    const target = get('SELECT * FROM users WHERE id = ?', Number(params.id))
+    if (!target) fail(404, '用户不存在')
+    if (target.id === me.id) fail(400, '不能删除自己')
+    if (target.username === 'admin') fail(400, '内置管理员不可删除')
+    run('DELETE FROM users WHERE id = ?', target.id)
+    // 人没了，协作关系也得跟着走：留在 bank_members 里就是一个指向空气的权限位，
+    // 而 id 会被新注册的账号复用，于是新用户凭空继承了一个题库的编辑权。
+    run('DELETE FROM bank_members WHERE user_id = ?', target.id)
+    // 表单协作同理：留着就是一条指向空气的权限位，而 id 会被新账号复用
+    run('DELETE FROM form_members WHERE user_id = ?', target.id)
+    revokeUserSessions(target.id, { byUserId: me.id })
+    log(me, '删除用户', target.username)
+    sendJson(res, 200, { ok: true })
+  })
+
+  /* ---------------- 角色 / 部门 ---------------- */
+  r.get('/api/roles', async (req, res) => {
+    const me = requirePerm(req, 'form:read')
+    const rows = all(`SELECT r.*, (SELECT COUNT(*) FROM users u WHERE u.role_id = r.id) AS user_count
+      FROM roles r ORDER BY r.id`).map(x => ({ ...x, perms: safeJson(x.perms, []) }))
+    // 角色表是权限模型本身。非管理员拿不到别人的权限位，也不需要：
+    // 只回自己那一个，前端下拉框不至于空着，越权面也不再外扩。
+    if (!can(me, '*')) return sendJson(res, 200, { ok: true, data: rows.filter(r2 => r2.id === me.role_id) })
+    sendJson(res, 200, { ok: true, data: rows })
+  })
+
+  r.post('/api/roles', async (req, res) => {
+    const me = requirePerm(req, 'form:create')
+    if (!can(me, '*')) fail(403, '权限不足')
+    const body = await readJson(req)
+    if (!body.name || !body.code) fail(400, '角色名称和标识必填')
+    if (get('SELECT id FROM roles WHERE code = ?', body.code)) fail(409, '角色标识已存在')
+    run('INSERT INTO roles(name, code, perms, builtin) VALUES(?,?,?,0)', body.name, body.code, JSON.stringify(body.perms || []))
+    sendJson(res, 201, { ok: true })
+  })
+
+  r.put('/api/roles/:id', async (req, res, { params }) => {
+    const me = requirePerm(req, 'form:create')
+    if (!can(me, '*')) fail(403, '权限不足')
+    const role = get('SELECT * FROM roles WHERE id = ?', Number(params.id))
+    if (!role) fail(404, '角色不存在')
+    const body = await readJson(req)
+    /*
+     * 内置 admin 的 ['*'] 是「唯一还能改回来」的那把钥匙：
+     * 勾掉它保存一次，全站立刻没有管理员，而这把钥匙本身也再没人改得回来——
+     * 只能进数据库手动改。所以它只允许改名，权限位锁死。
+     */
+    if (role.code === 'admin' && body.perms !== undefined) {
+      const next = Array.isArray(body.perms) ? body.perms : []
+      if (!next.includes('*')) fail(400, '内置「超级管理员」角色的权限不可移除，否则将无人能再管理系统')
+    }
+    run('UPDATE roles SET name = ?, perms = ? WHERE id = ?',
+      body.name ?? role.name, JSON.stringify(body.perms ?? safeJson(role.perms, [])), role.id)
+    sendJson(res, 200, { ok: true })
+  })
+
+  r.delete('/api/roles/:id', async (req, res, { params }) => {
+    const me = requirePerm(req, 'form:create')
+    if (!can(me, '*')) fail(403, '权限不足')
+    const role = get('SELECT * FROM roles WHERE id = ?', Number(params.id))
+    if (!role) fail(404, '角色不存在')
+    if (role.builtin) fail(400, '内置角色不可删除')
+    // 删角色不检查占用：用户会留在一个不存在的 role_id 上，权限全空，
+    // 登录后每个按钮都「权限不足」，而他自己的资料页看不出任何原因。
+    const used = get('SELECT COUNT(*) c FROM users WHERE role_id = ?', role.id).c
+    if (used) fail(400, `还有 ${used} 个用户属于该角色，请先把他们改到其他角色`)
+    run('DELETE FROM roles WHERE id = ?', role.id)
+    sendJson(res, 200, { ok: true })
+  })
+
+  /*
+   * 组织架构。以前 depts 只有「加一个」和「删一个」：
+   * 不能改名、不能设上级、父部门可以随便写成任意数字（包括它自己），
+   * 删除也不看有没有人挂在这部门下面——删完用户还在，只是部门名变成了空白。
+   * 部门树一旦塌了，后面所有「按部门筛数据」的口径都跟着错。
+   */
+  const deptRows = () => all(`SELECT d.*,
+      (SELECT COUNT(*) FROM users u WHERE u.dept_id = d.id) AS user_count,
+      (SELECT COUNT(*) FROM depts c WHERE c.parent_id = d.id) AS child_count,
+      (SELECT COUNT(*) FROM positions p WHERE p.dept_id = d.id) AS position_count
+    FROM depts d ORDER BY d.sort, d.id`)
+
+  /** 把扁平部门拼成树。前端要画树，后端算一次比每个组件各算一遍省事 */
+  const deptTree = (rows, parentId = 0, depth = 0) => rows
+    .filter(d => Number(d.parent_id) === Number(parentId))
+    .map(d => ({ ...d, depth, children: deptTree(rows, d.id, depth + 1) }))
+
+  r.get('/api/depts', async (req, res) => {
+    requireUser(req)
+    const rows = deptRows()
+    sendJson(res, 200, { ok: true, data: rows, tree: deptTree(rows) })
+  })
+
+  r.post('/api/depts', async (req, res) => {
+    const me = requirePerm(req, 'form:create')
+    if (!can(me, '*')) fail(403, '权限不足')
+    const body = await readJson(req)
+    const name = String(body.name || '').trim()
+    if (!name) fail(400, '请填写部门名称')
+    const parentId = Number(body.parent_id) || 0
+    if (parentId && !get('SELECT id FROM depts WHERE id = ?', parentId)) fail(400, '上级部门不存在')
+    if (get('SELECT id FROM depts WHERE name = ? AND parent_id = ?', name, parentId)) fail(409, '同一上级下已有同名部门')
+    const result = run('INSERT INTO depts(name, parent_id, sort) VALUES(?,?,?)', name, parentId, Number(body.sort) || 0)
+    log(me, '新增部门', name)
+    sendJson(res, 201, { ok: true, id: Number(result.lastInsertRowid) })
+  })
+
+  /** 改名 / 换上级 / 排序。换上级要防「把部门挂到自己的子孙下面」——那会做出一棵环 */
+  r.put('/api/depts/:id', async (req, res, { params }) => {
+    const me = requirePerm(req, 'form:create')
+    if (!can(me, '*')) fail(403, '权限不足')
+    const dept = get('SELECT * FROM depts WHERE id = ?', Number(params.id))
+    if (!dept) fail(404, '部门不存在')
+    const body = await readJson(req)
+    const name = body.name === undefined ? dept.name : String(body.name).trim()
+    if (!name) fail(400, '部门名称不能为空')
+    const parentId = body.parent_id === undefined ? dept.parent_id : Number(body.parent_id) || 0
+    if (parentId === dept.id) fail(400, '上级部门不能是自己')
+    if (parentId) {
+      if (!get('SELECT id FROM depts WHERE id = ?', parentId)) fail(400, '上级部门不存在')
+      // 沿着目标上级往上走，碰到自己就说明成环了
+      let cur = parentId, guard = 0
+      while (cur && guard++ < 50) {
+        if (cur === dept.id) fail(400, '不能把部门挂到自己的下级部门下面')
+        cur = Number(get('SELECT parent_id FROM depts WHERE id = ?', cur)?.parent_id) || 0
+      }
+    }
+    const dup = get('SELECT id FROM depts WHERE name = ? AND parent_id = ? AND id <> ?', name, parentId, dept.id)
+    if (dup) fail(409, '同一上级下已有同名部门')
+    run('UPDATE depts SET name = ?, parent_id = ?, sort = ? WHERE id = ?',
+      name, parentId, body.sort === undefined ? dept.sort : Number(body.sort) || 0, dept.id)
+    log(me, '修改部门', `${dept.name} → ${name}`)
+    sendJson(res, 200, { ok: true })
+  })
+
+  r.delete('/api/depts/:id', async (req, res, { params }) => {
+    const me = requirePerm(req, 'form:create')
+    if (!can(me, '*')) fail(403, '权限不足')
+    const dept = get('SELECT * FROM depts WHERE id = ?', Number(params.id))
+    if (!dept) fail(404, '部门不存在')
+    // 直接删会把一批人留在「不存在的部门」上：他们照常能用系统，但按部门筛选时集体消失
+    const users = get('SELECT COUNT(*) c FROM users WHERE dept_id = ?', dept.id).c
+    if (users) fail(400, `还有 ${users} 个用户在这个部门，请先调整他们的部门`)
+    const children = get('SELECT COUNT(*) c FROM depts WHERE parent_id = ?', dept.id).c
+    if (children) fail(400, `该部门下还有 ${children} 个子部门，请先移动或删除它们`)
+    run('DELETE FROM positions WHERE dept_id = ?', dept.id)
+    run('DELETE FROM depts WHERE id = ?', dept.id)
+    log(me, '删除部门', dept.name)
+    sendJson(res, 200, { ok: true })
+  })
+
+  /* ---------------- 职位 ---------------- */
+  r.get('/api/positions', async (req, res) => {
+    requireUser(req)
+    const rows = all(`SELECT p.*, d.name AS dept_name,
+        (SELECT COUNT(*) FROM users u WHERE u.position_id = p.id) AS user_count
+      FROM positions p LEFT JOIN depts d ON d.id = p.dept_id ORDER BY p.sort, p.id`)
+    sendJson(res, 200, { ok: true, data: rows })
+  })
+
+  r.post('/api/positions', async (req, res) => {
+    const me = requirePerm(req, 'form:create')
+    if (!can(me, '*')) fail(403, '权限不足')
+    const body = await readJson(req)
+    const name = String(body.name || '').trim()
+    if (!name) fail(400, '请填写职位名称')
+    const deptId = Number(body.dept_id) || 0
+    if (deptId && !get('SELECT id FROM depts WHERE id = ?', deptId)) fail(400, '所属部门不存在')
+    if (get('SELECT id FROM positions WHERE name = ? AND dept_id = ?', name, deptId)) fail(409, '该部门下已有同名职位')
+    const result = run('INSERT INTO positions(name, dept_id, sort) VALUES(?,?,?)', name, deptId, Number(body.sort) || 0)
+    log(me, '新增职位', name)
+    sendJson(res, 201, { ok: true, id: Number(result.lastInsertRowid) })
+  })
+
+  r.put('/api/positions/:id', async (req, res, { params }) => {
+    const me = requirePerm(req, 'form:create')
+    if (!can(me, '*')) fail(403, '权限不足')
+    const pos = get('SELECT * FROM positions WHERE id = ?', Number(params.id))
+    if (!pos) fail(404, '职位不存在')
+    const body = await readJson(req)
+    const name = body.name === undefined ? pos.name : String(body.name).trim()
+    if (!name) fail(400, '职位名称不能为空')
+    const deptId = body.dept_id === undefined ? pos.dept_id : Number(body.dept_id) || 0
+    if (deptId && !get('SELECT id FROM depts WHERE id = ?', deptId)) fail(400, '所属部门不存在')
+    run('UPDATE positions SET name = ?, dept_id = ?, sort = ? WHERE id = ?',
+      name, deptId, body.sort === undefined ? pos.sort : Number(body.sort) || 0, pos.id)
+    sendJson(res, 200, { ok: true })
+  })
+
+  r.delete('/api/positions/:id', async (req, res, { params }) => {
+    const me = requirePerm(req, 'form:create')
+    if (!can(me, '*')) fail(403, '权限不足')
+    const pos = get('SELECT * FROM positions WHERE id = ?', Number(params.id))
+    if (!pos) fail(404, '职位不存在')
+    const used = get('SELECT COUNT(*) c FROM users WHERE position_id = ?', pos.id).c
+    if (used) fail(400, `还有 ${used} 个用户的职位是「${pos.name}」，请先调整`)
+    run('DELETE FROM positions WHERE id = ?', pos.id)
+    log(me, '删除职位', pos.name)
+    sendJson(res, 200, { ok: true })
+  })
+
+  /* ---------------- 系统设置 ---------------- */
+  const CONFIG_KEYS = ['site', 'storage', 'mail', 'sms', 'wechat', 'oauth', 'map', 'ai', 'i18n', 'notify']
+
+  r.get('/api/settings', async (req, res) => {
+    const me = requireUser(req)
+    if (!can(me, '*')) fail(403, '权限不足')
+    const out = {}
+    for (const k of CONFIG_KEYS) out[k] = mask(setting(k, {}))
+    sendJson(res, 200, { ok: true, data: out })
+  })
+
+  r.get('/api/settings/public', async (req, res) => {
+    const site = setting('site', {})
+    sendJson(res, 200, {
+      ok: true,
+      data: {
+        name: site.name || 'EQS',
+        logo: site.logo || '',
+        icp: site.icp || '',
+        // 登录页要据此决定「注册」入口显不显示，别摆一个点了必定 403 的链接
+        allowRegister: site.allowRegister === true,
+        lang: setting('i18n', {})?.defaultLang || 'zh',
+        mapKey: setting('map', {})?.enabled ? { key: setting('map', {}).amapKey, security: setting('map', {}).amapSecurity } : null,
+        oauth: {
+          google: !!setting('oauth', {})?.google?.clientId,
+          wechat: !!setting('oauth', {})?.wechatMp?.appId
+        }
+      }
+    })
+  })
+
+  r.put('/api/settings/:key', async (req, res, { params }) => {
+    const me = requirePerm(req, 'form:create')
+    if (!can(me, '*')) fail(403, '权限不足')
+    if (!CONFIG_KEYS.includes(params.key)) fail(400, '不支持的配置项')
+    const body = await readJson(req)
+    const prev = setting(params.key, {})
+    // 合并而不是整块替换：clientId / apiKey 这些是嵌套两层的对象，
+    // 只比顶层 key 时，前端提交的 {'google': {clientSecret: 'GO****ET'}} 会整块顶上，
+    // 脱敏串被当成真密钥写回库里——保存一次，密钥就废了。
+    const merged = mergeMasked(prev, body)
+    setSetting(params.key, merged)
+    log(me, '修改设置', params.key)
+    sendJson(res, 200, { ok: true })
+  })
+
+  r.post('/api/settings/storage/test', async (req, res) => {
+    const me = requireUser(req)
+    if (!can(me, '*')) fail(403, '权限不足')
+    const cfg = storageConfig()
+    sendJson(res, 200, { ok: true, driver: cfg.driver, message: cfg.driver === 'local' ? '本地存储可用' : '已保存配置，上传时将进行真实验证' })
+  })
+
+  r.post('/api/settings/mail/test', async (req, res) => {
+    const me = requireUser(req)
+    if (!can(me, '*')) fail(403, '权限不足')
+    const body = await readJson(req)
+    const cfg = setting('mail', {})
+    if (!cfg.host) fail(400, '请先保存邮件服务器配置')
+    try {
+      await smtpSend(cfg, { to: body.to || cfg.user, subject: 'EQS 邮件测试', html: '<p>这是一封来自 EQS 的测试邮件。</p>' })
+      sendJson(res, 200, { ok: true, message: '测试邮件已发送' })
+    } catch (e) { fail(400, e.message) }
+  })
+
+  r.post('/api/settings/sms/test', async (req, res) => {
+    const me = requireUser(req)
+    if (!can(me, '*')) fail(403, '权限不足')
+    const body = await readJson(req)
+    if (!body.phone) fail(400, '请填写测试手机号')
+    const cfg = setting('sms', {})
+    try {
+      await sendSms(cfg, { phone: body.phone, text: 'EQS 短信测试', params: { code: '123456' } })
+      sendJson(res, 200, { ok: true })
+    } catch (e) { fail(400, e.message) }
+  })
+
+  /* ---------------- WebHook / API Key ---------------- */
+  r.get('/api/webhooks', async (req, res) => {
+    const me = requirePerm(req, 'form:read')
+    // 订阅地址和签名密钥是管理员的东西：普通用户带 form:read 也能拿到 secret，
+    // 就等于拿到伪造回调签名的能力。非管理员只被告知「有配置」，不给内容。
+    if (!can(me, '*')) return sendJson(res, 200, { ok: true, data: [], masked: true })
+    sendJson(res, 200, {
+      ok: true,
+      data: all('SELECT * FROM webhooks ORDER BY id').map(x => ({ ...x, secret: maskSecret(x.secret), events: safeJson(x.events, []) }))
+    })
+  })
+
+  r.post('/api/webhooks', async (req, res) => {
+    const me = requirePerm(req, 'form:create')
+    if (!can(me, '*')) fail(403, '权限不足')
+    const body = await readJson(req)
+    if (!body.url) fail(400, '请填写回调地址')
+    run('INSERT INTO webhooks(name, url, events, secret, enabled, created_at) VALUES(?,?,?,?,?,?)',
+      body.name || 'webhook', body.url, JSON.stringify(body.events || ['create']), body.secret || '', body.enabled === 0 ? 0 : 1, now())
+    sendJson(res, 201, { ok: true })
+  })
+
+  r.put('/api/webhooks/:id', async (req, res, { params }) => {
+    const me = requirePerm(req, 'form:create')
+    if (!can(me, '*')) fail(403, '权限不足')
+    const h = get('SELECT * FROM webhooks WHERE id = ?', Number(params.id))
+    if (!h) fail(404, 'WebHook 不存在')
+    const body = await readJson(req)
+    // 前端拿到的是脱敏后的 secret，原样提交回来不能把真密钥覆盖成一串星号
+    const secret = typeof body.secret === 'string' && MASKED.test(body.secret) ? h.secret : (body.secret ?? h.secret)
+    run('UPDATE webhooks SET name = ?, url = ?, events = ?, secret = ?, enabled = ? WHERE id = ?',
+      body.name ?? h.name, body.url ?? h.url, JSON.stringify(body.events ?? safeJson(h.events, [])),
+      secret, body.enabled === undefined ? h.enabled : (body.enabled ? 1 : 0), h.id)
+    sendJson(res, 200, { ok: true })
+  })
+
+  r.delete('/api/webhooks/:id', async (req, res, { params }) => {
+    const me = requirePerm(req, 'form:create')
+    if (!can(me, '*')) fail(403, '权限不足')
+    run('DELETE FROM webhooks WHERE id = ?', Number(params.id))
+    sendJson(res, 200, { ok: true })
+  })
+
+  r.post('/api/webhooks/:id/test', async (req, res, { params }) => {
+    const me = requireUser(req)
+    if (!can(me, '*')) fail(403, '权限不足')
+    const h = get('SELECT * FROM webhooks WHERE id = ?', Number(params.id))
+    if (!h) fail(404, 'WebHook 不存在')
+    const result = await dispatchWebhooks('test', { message: 'EQS 测试事件', hookId: h.id })
+    sendJson(res, 200, { ok: true, result })
+  })
+
+  r.get('/api/api-keys', async (req, res) => {
+    const me = requireUser(req)
+    if (!can(me, '*')) fail(403, '权限不足')
+    sendJson(res, 200, { ok: true, data: all('SELECT id, name, enabled, owner_id, created_at FROM api_keys ORDER BY id DESC') })
+  })
+
+  r.post('/api/api-keys', async (req, res) => {
+    const me = requireUser(req)
+    if (!can(me, '*')) fail(403, '权限不足')
+    const body = await readJson(req)
+    const key = 'eqs_' + (await import('node:crypto')).randomBytes(24).toString('hex')
+    // owner_id 必须记：不记的话所有 Key 只能按「未知身份」处理，
+    // 而「未知身份」以前被当成管理员——那就是一条提权通道。
+    run('INSERT INTO api_keys(name, key, enabled, owner_id, created_at) VALUES(?,?,1,?,?)', body.name || '默认密钥', key, me.id, now())
+    log(me, '创建 API Key', body.name || '默认密钥')
+    sendJson(res, 201, { ok: true, key })
+  })
+
+  r.delete('/api/api-keys/:id', async (req, res, { params }) => {
+    const me = requireUser(req)
+    if (!can(me, '*')) fail(403, '权限不足')
+    run('DELETE FROM api_keys WHERE id = ?', Number(params.id))
+    sendJson(res, 200, { ok: true })
+  })
+
+  /* ---------------- AI ---------------- */
+  r.post('/api/ai/generate', async (req, res) => {
+    const me = requirePerm(req, 'form:create')
+    const body = await readJson(req)
+    if (!body.prompt) fail(400, '请描述你想要的表单')
+    try {
+      const result = await generateForm(body.prompt, { lang: body.lang || 'zh', kind: body.kind || 'survey', model: body.model })
+      sendJson(res, 200, { ok: true, data: result, source: 'ai', model: body.model || aiConfig().model })
+    } catch (e) {
+      log(me, 'AI 生成失败', e.message)
+      sendJson(res, 200, { ok: true, data: localGenerate(body.prompt, body.kind), source: 'local', warning: e.message })
+    }
+  })
+
+  /**
+   * 流式生成。
+   *
+   * 以前每帧只发 `delta`，前端拿到一长串 JSON 文本，只能自己盯着看或者干等——
+   * 「流式生成实时预览」这句话在界面上等于没有。现在每帧额外带 `fields`：
+   * 服务端把已经配平的题目对象切出来发下来，前端能一道一道往画布上画。
+   * 收尾时补一帧 `done`，带完整的 title / description / schema，
+   * 让前端不必自己再从拼串里 parse 一遍（拼串和多帧之间的边界最容易出岔子）。
+   */
+  r.post('/api/ai/stream', async (req, res) => {
+    requirePerm(req, 'form:create')
+    const body = await readJson(req)
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache, no-transform',
+      Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no'
+    })
+    const send = (obj) => res.write(`data: ${JSON.stringify(obj)}\n\n`)
+    try {
+      const { streamForm, extractJson } = await import('../lib/ai.js')
+      const { normalizeSchema } = await import('../lib/forms.js')
+      let acc = ''
+      let fields = []
+      for await (const chunk of streamForm(body.prompt || '', { lang: body.lang, kind: body.kind, model: body.model })) {
+        acc = chunk.acc
+        fields = chunk.fields
+        send({ delta: chunk.delta, fields })
+      }
+      const parsed = extractJson(acc)
+      // 完整解析成功就用它（带 title/description）；只剩半截 JSON 时用已经剖出来的题，别把用户画的题弄丢
+      send({
+        done: true,
+        title: parsed?.title || '',
+        description: parsed?.description || '',
+        schema: Array.isArray(parsed?.fields) && parsed.fields.length ? normalizeSchema(parsed.fields) : fields
+      })
+    } catch (e) {
+      const local = localGenerate(body.prompt || '', body.kind)
+      send({ error: e.message, fallback: local, done: true })
+    }
+    res.end()
+  })
+
+  /**
+   * 模型列表：Issue 原文的「模型列表与默认模型配置」。
+   * 顺手把「生成语言」的候选也一起给出来——之前 AI 多语言生成要靠人记住 zh / en / ja 这些码，
+   * 而前端连传都没传（`kind` 传了，`lang` 一直是默认值）。
+   */
+  r.get('/api/ai/models', async (req, res) => {
+    const me = requireUser(req)
+    if (!can(me, '*')) fail(403, '权限不足')
+    const cfg = aiConfig()
+    const langs = [
+      { code: 'zh', label: '简体中文' }, { code: 'zhtw', label: '繁體中文' },
+      { code: 'en', label: 'English' }, { code: 'ja', label: '日本語' }, { code: 'ko', label: '한국어' }
+    ]
+    if (!cfg.enabled || !cfg.apiKey) {
+      return sendJson(res, 200, { ok: true, data: { models: [], current: cfg.model, langs, reachable: false, reason: 'AI 未启用或未配置 API Key' } })
+    }
+    try {
+      const { listModels } = await import('../lib/ai.js')
+      const models = await listModels({ force: new URL(req.url, 'http://x').searchParams.get('refresh') === '1' })
+      sendJson(res, 200, { ok: true, data: { models, current: cfg.model, langs, reachable: true } })
+    } catch (e) {
+      // 拿不到列表不是错误：有的兼容服务没有 /models，手填模型名照样能用
+      sendJson(res, 200, { ok: true, data: { models: [], current: cfg.model, langs, reachable: false, reason: e.message } })
+    }
+  })
+
+  r.get('/api/ai/config', async (req, res) => {
+    const me = requireUser(req)
+    if (!can(me, '*')) fail(403, '权限不足')
+    const cfg = aiConfig()
+    sendJson(res, 200, { ok: true, data: { ...cfg, apiKey: cfg.apiKey ? cfg.apiKey.slice(0, 3) + '****' : '' } })
+  })
+
+  /* ---------------- 审计日志 ---------------- */
+  /**
+   * 日志页。
+   * 之前只有一个「最近 200 条，全部动作混在一起」的接口，也没有任何页面调它 ——
+   * 于是「谁在什么时候删了那张问卷」这件事，系统里记着，但没人看得见。
+   */
+  r.get('/api/logs', async (req, res) => {
+    const me = requireUser(req)
+    if (!can(me, '*')) fail(403, '权限不足')
+    const url = new URL(req.url, 'http://x')
+    const action = url.searchParams.get('action') || ''
+    const keyword = String(url.searchParams.get('keyword') || '').trim()
+    const where = []
+    const args = []
+    if (action) { where.push('action = ?'); args.push(action) }
+    if (keyword) {
+      // 动作名也要能搜：用户想查「登录失败」，最直觉的就是往框里打这四个字
+      where.push('(username LIKE ? OR detail LIKE ? OR ip LIKE ? OR action LIKE ?)')
+      args.push(`%${keyword}%`, `%${keyword}%`, `%${keyword}%`, `%${keyword}%`)
+    }
+    const total = get(`SELECT COUNT(*) c FROM logs ${where.length ? 'WHERE ' + where.join(' AND ') : ''}`, ...args).c
+    const p = paginate(req, total)
+    const rows = all(`SELECT * FROM logs ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+      ORDER BY id DESC LIMIT ? OFFSET ?`, ...args, p.pageSize, p.offset)
+    // 动作分组给前端做下拉：日志长得快，全量 distinct 每页算一次不划算，这里限 60 个
+    const actions = all('SELECT action, COUNT(*) c FROM logs GROUP BY action ORDER BY c DESC LIMIT 60')
+    sendJson(res, 200, { ok: true, data: rows, actions, page: p.page, pageSize: p.pageSize, total, totalPages: p.totalPages })
+  })
+
+  /** 只清「够老」的日志：一次误点把审计记录清空的代价太大，保留期由调用方明确给出 */
+  r.delete('/api/logs', async (req, res) => {
+    const me = requireUser(req)
+    if (!can(me, '*')) fail(403, '权限不足')
+    const url = new URL(req.url, 'http://x')
+    const days = Math.min(3650, Math.max(7, Number(url.searchParams.get('days')) || 90))
+    const before = new Date(Date.now() - days * 864e5).toISOString()
+    const r2 = run('DELETE FROM logs WHERE created_at < ?', before)
+    log(me, '清理审计日志', `删除 ${days} 天前的记录，共 ${Number(r2.changes || 0)} 条`, clientIp(req))
+    sendJson(res, 200, { ok: true, removed: Number(r2.changes || 0), days })
+  })
+
+  /* ---------------- 多语言 ---------------- */
+  r.get('/api/i18n/:lang', async (req, res, { params }) => {
+    const rows = all('SELECT key, value FROM i18n WHERE lang = ?', params.lang)
+    sendJson(res, 200, { ok: true, data: Object.fromEntries(rows.map(x => [x.key, x.value])) })
+  })
+
+  r.put('/api/i18n/:lang', async (req, res, { params }) => {
+    const me = requireUser(req)
+    if (!can(me, '*')) fail(403, '权限不足')
+    const body = await readJson(req)
+    for (const [k, v] of Object.entries(body)) {
+      run('INSERT INTO i18n(lang, key, value) VALUES(?,?,?) ON CONFLICT(lang, key) DO UPDATE SET value = excluded.value', params.lang, k, String(v))
+    }
+    sendJson(res, 200, { ok: true })
+  })
+}
