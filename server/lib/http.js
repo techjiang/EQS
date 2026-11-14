@@ -63,30 +63,56 @@ export function sendJson(res, status, data, headers = {}) {
  * 以前无条件信任 `X-Forwarded-For`，取最左边那一段 —— 而这个头是**客户端自己发的**，
  * 想写什么写什么。后果不是「日志里 IP 不准」这么轻：
  *   1. 登录失败限速按「账号 + IP」计数，换个头就换了个计数器 —— 实测连打 12 次全是 401，一次不锁；
- *   2. 问卷的「每个 IP 限填 1 次」同理，换 3 个头就交了 3 份；
+ *   2. 问卷的「每个 IP 限 1 次」同理，换 3 个头就交了 3 份；
  *   3. 匿名答卷里记的 IP 是谁都能指定的字符串，出了事根本追不回来。
  *
- * 默认只认 socket 的对端地址。反向代理后面（Nginx / 容器网关）才需要在
- * 系统设置 → 站点 里显式打开「信任代理头」，并指定代理层数：
- * 右边第 N 段才是可信代理追加的，左边全是调用方自己填的。
+ * 但一刀切成「永远不信」也不行：README 推荐的部署就是 Nginx 反代，
+ * 那样所有人对端都是 127.0.0.1，于是「每 IP 限填一次」变成「全站只能填一次」。
+ *
+ * 所以做成三档，默认 'off'（只认 TCP 对端），由部署者按自己的拓扑显式选择：
+ *   'off'  从不信任 XFF。直连公网、或前面有没有代理你不确定时用这个 —— 最安全。
+ *   'on'   信任 XFF，按 trustHops 从右往左取。Nginx 直接反代是 1，前面再加 CDN 是 2。
+ *   'auto' 对端是回环/内网地址时才采信，取最右段。
+ *
+ * 为什么 auto 不当默认：它在「没有代理、但有人伪造 XFF」和「真有代理」这两种情况下
+ * 看到的是同一个东西。默认猜错的方向必须偏安全。
  */
-let ipCfg = { at: 0, trust: false, hops: 1 }
+/**
+ * 每次现读配置，不做缓存。
+ * 试过 5 秒缓存：在设置页改完「信任代理」，接下来 5 秒内的请求还在用旧口径 ——
+ * 用户看到的是一次「保存了但没生效」，比自己判断对错更难查。一次 settings 查询是微秒级，
+ * 省这点不如省一个坑。
+ */
 function ipTrust() {
-  const now = Date.now()
-  if (now - ipCfg.at > 5000) {
-    const s = setting('site', {}) || {}
-    ipCfg = { at: now, trust: s.trustProxy === true, hops: Math.min(5, Math.max(1, Number(s.trustHops) || 1)) }
-  }
-  return ipCfg
+  const s = setting('site', {}) || {}
+  // 兼容只写了布尔值的旧配置：true → on（按层数取），false → off
+  const mode = s.trustProxy === true ? 'on' : s.trustProxy === false ? 'off' : (['auto', 'on', 'off'].includes(s.trustProxy) ? s.trustProxy : 'off')
+  return { mode, hops: Math.min(5, Math.max(1, Number(s.trustHops) || 1)) }
+}
+
+/** 回环 / 私有 / 链路本地：来自这些地址的请求只可能是本机或内网里的代理 */
+function isInnerIp(ip) {
+  const s = String(ip || '')
+  if (s === '::1' || s.startsWith('127.')) return true
+  if (/^10\./.test(s)) return true
+  if (/^192\.168\./.test(s)) return true
+  if (/^172\.(1[6-9]|2\d|3[01])\./.test(s)) return true
+  if (/^169\.254\./.test(s)) return true
+  if (/^f[cd]/i.test(s)) return true            // IPv6 ULA
+  if (/^fe80:/i.test(s)) return true
+  return false
 }
 
 export function clientIp(req) {
   const direct = String(req.socket?.remoteAddress || '').replace('::ffff:', '')
   const cfg = ipTrust()
-  if (!cfg.trust) return direct
+  if (cfg.mode === 'off') return direct
+  if (cfg.mode === 'auto' && !isInnerIp(direct)) return direct
   const chain = String(req.headers['x-forwarded-for'] || '').split(',').map(x => x.trim()).filter(Boolean)
   if (!chain.length) return direct
-  return chain[Math.max(0, chain.length - cfg.hops)] || direct
+  // 最右段才是紧接着我们的那层代理亲手写的，左边全是透传进来的、可伪造
+  const hops = cfg.mode === 'auto' ? 1 : cfg.hops
+  return chain[Math.max(0, chain.length - hops)] || direct
 }
 
 /** 静态文件目录服务，带 etag 与 gzip */

@@ -1453,7 +1453,7 @@ try {
     const adminCookie = cookie
 
     // —— API Key 只应有签发人本人的权限 ——
-    await req('POST', '/api/settings/site', { allowRegister: true })
+    await req('PUT', '/api/settings/site', { allowRegister: true })
     await req('POST', '/api/auth/register', { username: 'keyless', password: 'keyless-123' })
     const userCk = await asUser('keyless', 'keyless-123')
     let p = await call(userCk, 'POST', '/api/auth/api-key', {})
@@ -1596,7 +1596,7 @@ try {
     assert(p.status === 401, '退出后的旧 Cookie 在服务端已作废', String(p.status))
 
     // 别人家的会话不能被我踢
-    await req('POST', '/api/settings/site', { allowRegister: true })
+    await req('PUT', '/api/settings/site', { allowRegister: true })
     await req('POST', '/api/auth/register', { username: 'sessionuser', password: 'session-123' })
     const otherCk = await asUser('sessionuser', 'session-123')
     const otherSid = (await call(otherCk, 'GET', '/api/auth/sessions')).json.data[0].id
@@ -1620,7 +1620,7 @@ try {
     // 停用账号后，手里那条 Cookie 立刻不再通行
     // 「退出其它设备」把此前的 adminCookie 也吊销了，这里改用 ck1
     cookie = ck1
-    await req('POST', '/api/settings/site', { allowRegister: true })
+    await req('PUT', '/api/settings/site', { allowRegister: true })
     await req('POST', '/api/auth/register', { username: 'tobedisabled', password: 'disabled-123' })
     const disabledCk = await asUser('tobedisabled', 'disabled-123')
     const du = (await req('GET', '/api/users')).json.data.find(u => u.username === 'tobedisabled')
@@ -1639,7 +1639,7 @@ try {
      * 这里直接用一个来自「新 IP」的请求去撞锁定，确认它并没有换到一个新的计数器。
      */
     cookie = await asUser('admin', 'test-pass-123')
-    await req('POST', '/api/settings/site', { trustProxy: false })
+    await req('PUT', '/api/settings/site', { trustProxy: 'off' })
     const fakeIps = []
     for (let i = 0; i < 12; i++) {
       const res = await fetch(BASE + '/api/auth/login', {
@@ -1651,11 +1651,35 @@ try {
     }
     assert(fakeIps.includes(429), '换 X-Forwarded-For 无法绕过登录失败锁定', fakeIps.join(','))
 
-    // 打开「信任代理」后，才按代理层数从右往左取——这是给真站在 Nginx 后面的部署用的
-    await req('POST', '/api/settings/site', { trustProxy: true, trustHops: 1 })
+    /*
+     * 但也不能一刀切成「永远不信」：README 推荐的部署就是 Nginx 反代，
+     * 那样所有人对端都是 127.0.0.1，「每 IP 限填一次」会变成「全站只能填一次」。
+     * 所以留了显式开关：打开后按层数从右往左取（最右段才是紧邻我们的代理亲手写的）。
+     */
+    await req('PUT', '/api/settings/site', { trustProxy: 'on', trustHops: 1 })
+    const mk = async (xff) => (await req('POST', '/api/forms', {
+      title: 'IP 口径测试', kind: 'survey',
+      schema: [{ id: 'q1', type: 'radio', label: '选一个', options: ['A', 'B'] }],
+      settings: { limit: { perIp: true, maxTimes: 1 } }
+    }))
+    const ipForm = (await mk()).json.id
+    await req('PUT', `/api/forms/${ipForm}`, { status: 'published' })
+    const submitWith = async (xff) => {
+      const res = await fetch(BASE + `/api/public/forms/${ipForm}/submit`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Forwarded-For': xff },
+        body: JSON.stringify({ data: { q1: 'A' } })
+      })
+      return res.status
+    }
+    // 打开信任代理后，最右段就是「代理说的真实来源」：换一个就换了一个访客，这条是设计如此
+    const a = await submitWith('203.0.113.7')
+    const b = await submitWith('198.51.100.9')
+    assert(a === 201 && b === 201, '显式信任代理时按最右段识别真实来源（Nginx 后面的正常形态）', `${a},${b}`)
+
     const r1 = await req('POST', '/api/auth/login', { username: 'nobody-here', password: 'x' })
     assert(r1.status === 401, '信任代理模式下登录照常校验')
-    await req('POST', '/api/settings/site', { trustProxy: false })
+    await req('PUT', '/api/settings/site', { trustProxy: 'off' })
   }
 
   console.log('\n[50] 审计日志：看得见，查得到')

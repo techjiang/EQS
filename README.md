@@ -115,6 +115,9 @@ sudo systemctl enable --now eqs
 # 3. 配置 Nginx 反向代理（示例见 deploy/nginx.conf）
 sudo cp deploy/nginx.conf /etc/nginx/conf.d/eqs.conf
 sudo nginx -s reload
+
+# 4. 打开后台 → 系统设置 → 站点 → 「客户端 IP 来源」选「信任代理头」，层数 1
+#    不做这步，所有访客的 IP 都是 127.0.0.1，「每个 IP 限填一次」会变成「全站只能填一次」
 ```
 
 ## 备份与迁移

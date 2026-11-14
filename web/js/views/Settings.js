@@ -147,14 +147,24 @@ export default {
             sw(s, 'allowRegister', '允许自助注册'),
             h('div', { class: 'hint' }, '默认关闭。问卷系统里的账号等于「能建卷、能看自己那份数据」，陌生人注册进来没有审核环节，建议只在内部试用时打开。'),
             h('div', { style: 'height:14px' }),
-            sw(s, 'trustProxy', '信任反向代理传来的 X-Forwarded-For'),
-            s.trustProxy ? field('代理层数', h('input', {
+            field('客户端 IP 来源', h('select', {
+              class: 'select', style: 'max-width:320px',
+              value: s.trustProxy === true ? 'on' : ['auto', 'on'].includes(s.trustProxy) ? s.trustProxy : 'off',
+              onChange: e => s.trustProxy = e.target.value
+            }), [
+              ['off', '不信任（默认）：只认 TCP 对端地址，最安全'],
+              ['on', '信任代理头，按下面的层数从右往左取（Nginx 反代请选这个）'],
+              ['auto', '对端是本机/内网地址时才采信，取最右段']
+            ].map(([v, l]) => h('option', { value: v }, l))),
+            s.trustProxy === 'on' ? field('代理层数', h('input', {
               class: 'input', type: 'number', min: 1, max: 5, value: s.trustHops ?? 1,
               onInput: e => s.trustHops = Number(e.target.value) || 1
             }), '从右往左第几段是可信代理写的。Nginx 直接反代就是 1，前面再加一层 CDN 就是 2。') : null,
             h('div', { class: 'hint' },
-              '默认不信任。这个头是客户端自己发的，无条件相信它等于让「每个 IP 限填一次」「登录失败锁号」这两条防线失效——' +
-              '换个头就换了个计数器和一条新身份。只有在 Nginx / 容器网关后面才需要打开。')
+              'X-Forwarded-For 是客户端自己发的头，无条件相信它会让「每个 IP 限填一次」「登录失败锁号」两条防线失效——' +
+              '换个头就换了个计数器和一条新身份。默认不信任。' +
+              '如果你用 Nginx 反代（deploy/nginx.conf 那套），必须改成「信任代理头、1 层」，否则所有人的 IP 都是 127.0.0.1，' +
+              '「每个 IP 限填一次」会变成「全站只能填一次」。')
           ])
         }
         case 'storage': {
