@@ -319,6 +319,29 @@ export function gradeSubmission(schema, data, settings = {}, manual = {}) {
   return { score, total, paperTotal, ungraded, passLine, passed: score >= passLine, graded: scored > 0 }
 }
 
+/** 验证码是防机器人的，不是题目；哪怕误填了分值也不该进阅卷队列 */
+const NO_GRADE_TYPES = new Set(['captcha', 'divider', 'richtext', 'html', 'image'])
+
+/** 需要人工给分的题：有分值、无标准答案、不是说明类组件 */
+export function isSubjective(f) {
+  return Number(f?.score) > 0 && !(f?.answer?.length) && !NO_GRADE_TYPES.has(f?.type)
+}
+
+/**
+ * 这份答卷还剩几道主观题没给分。
+ * 与 gradeSubmission 同口径：有分值、无标准答案、当前可见、且没出现在 manual_scores 里。
+ */
+export function pendingLeft(form, row) {
+  if (!form || form.kind !== 'exam') return 0
+  const data = safeJson(row.data, {})
+  const manual = manualScoresOf(row)
+  // 直接查库拿到的是未解析的行，schema 还是 JSON 字符串
+  const schema = Array.isArray(form.schema) ? form.schema : safeJson(form.schema, [])
+  return schema.filter(f =>
+    isSubjective(f) && fieldVisible(f, data) && !Object.prototype.hasOwnProperty.call(manual, f.id)
+  ).length
+}
+
 /** 从答卷记录里取人工批阅分：{ [fieldId]: number } */
 export function manualScoresOf(row) {
   if (!row?.manual_scores) return {}
@@ -532,7 +555,10 @@ export function createStatsAccumulator(form) {
         total,
         trend,
         avgScore: scoreCount ? Math.round((scoreSum / scoreCount) * 100) / 100 : null,
-        passRate: passedCount,
+        // 字段名写的是 Rate、放的却是人数，大屏那边只能再算一次百分比。
+        // 两个都给：人数用于「通过人数」卡片，比率用于「通过率」卡片，别让调用方猜。
+        passedCount,
+        passRate: total ? Math.round((passedCount / total) * 1000) / 10 : 0,
         questions: list
       }
     }

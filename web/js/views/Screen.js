@@ -120,13 +120,11 @@ export default {
       const today = trend.length ? trend[trend.length - 1].count : 0
       const answered = (d.questions || []).reduce((a, q) => a + (q.count || 0), 0)
       if (d.form?.kind === 'exam') {
-        const pass = d.passRate ?? 0
-        const rate = d.total ? Math.round(pass / d.total * 100) : 0
         return [
           ['总答卷', d.total ?? 0],
           ['平均分', d.avgScore ?? '—'],
-          ['通过人数', pass],
-          ['通过率', rate + '%']
+          ['通过人数', d.passedCount ?? 0],
+          ['通过率', (d.passRate ?? 0) + '%']
         ]
       }
       const peak = trend.reduce((a, t) => Math.max(a, t.count), 0)

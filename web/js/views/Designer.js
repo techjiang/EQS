@@ -401,7 +401,10 @@ export default {
               onInput: e => set('duration', Number(e.target.value))
             }), '0 表示不限时')
           ]),
-          sw('showResult', '交卷后显示逐题对错与解析', true)
+          sw('showResult', '交卷后显示逐题对错与解析', true),
+          sw('showRank', '交卷后显示我的名次', true),
+          sw('showRanking', '公开成绩榜（填写页显示前 10 名）'),
+          h('div', { class: 'hint' }, '成绩榜是匿名入口：只公布名次、打码后的昵称和分数，不公开答卷内容。关掉「逐题对错」时名次也不下发。')
         ]) : null,
         h('div', { style: 'border-top:1px solid var(--line);margin:14px 0' }),
         h('h4', {}, '外观'),

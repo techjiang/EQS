@@ -1,7 +1,7 @@
 import { h, ref, onMounted, onBeforeUnmount, nextTick } from '/vendor/vue.esm.js'
 import { api } from '../api.js'
 import { route } from '../router.js'
-import { ok, err, Empty } from '../ui.js'
+import { ok, err, Empty, fmtDate } from '../ui.js'
 import { Icon } from '../icons.js'
 
 const PALETTE = ['#5b7cfa', '#8b5bfa', '#22d3ee', '#f59e0b', '#10b981', '#f472b6', '#a78bfa', '#34d399']
@@ -14,6 +14,8 @@ export default {
     const loading = ref(true)
     const chartType = ref('bar')
     const charts = []
+    const ranking = ref(null)
+    const rankLimit = ref(20)
 
     const loadForms = async () => {
       const r = await api.get('/api/forms?pageSize=200')
@@ -27,6 +29,10 @@ export default {
       try {
         const r = await api.get(`/api/forms/${formId.value}/report`)
         data.value = r.data
+        // 排名是考试才有的东西；问卷的「分数」只有人工分，排出来没有意义
+        ranking.value = r.data.form?.kind === 'exam'
+          ? await api.get(`/api/forms/${formId.value}/ranking?limit=${rankLimit.value}`).then(x => x.data).catch(() => null)
+          : null
       } catch (e) { err(e.message) } finally {
         loading.value = false
         await nextTick()
@@ -77,6 +83,21 @@ export default {
               }]
             }
         chart.setOption(opt)
+      }
+      // 分数分布：排名不给参照系，分档才看得出「90 分在这里算不算好」
+      const distEl = document.getElementById('rank_dist')
+      if (distEl && ranking.value?.distribution?.buckets?.length) {
+        const chart = window.echarts.init(distEl)
+        charts.push(chart)
+        const b = ranking.value.distribution.buckets
+        chart.setOption({
+          color: [PALETTE[2]],
+          grid: { left: 12, right: 16, top: 24, bottom: 8, containLabel: true },
+          tooltip: { trigger: 'axis' },
+          xAxis: { type: 'category', data: b.map(x => `${x.from}`), axisLabel: { color: axisColor, fontSize: 11 }, axisLine: { lineStyle: { color: splitColor } } },
+          yAxis: { type: 'value', minInterval: 1, axisLabel: { color: axisColor, fontSize: 11 }, splitLine: { lineStyle: { color: splitColor } } },
+          series: [{ type: 'bar', data: b.map(x => x.count), barMaxWidth: 30, itemStyle: { borderRadius: [6, 6, 0, 0], color: PALETTE[2] } }]
+        })
       }
       // 趋势图
       const trendEl = document.getElementById('trend_chart')
@@ -149,6 +170,43 @@ export default {
               h('div', { class: 'card-h' }, [h('h3', {}, '提交趋势'), h('button', { class: 'btn sm ghost', onClick: () => exportPng('trend_chart') }, [Icon('download', { style: 'width:13px;height:13px' }), 'PNG'])]),
               h('div', { id: 'trend_chart', class: 'chart', style: 'height:220px;padding:8px' })
             ]),
+            ranking.value ? h('div', { class: 'card mb' }, [
+              h('div', { class: 'card-h' }, [
+                h('div', {}, [
+                  h('h3', {}, '成绩排名'),
+                  h('div', { class: 'small muted' }, `共 ${ranking.value.total} 份有成绩的答卷 · 同分同名次、下一名跳号 · 前 ${ranking.value.top.length} 名${ranking.value.top.some(r => r.pending) ? ' · 带「待批」的卷子主观题还没批完，及格线按当前可判分总分算' : ''}`)
+                ]),
+                h('select', {
+                  class: 'select', style: 'height:30px;width:auto;padding:0 8px', value: rankLimit.value,
+                  onChange: async e => {
+                    rankLimit.value = Number(e.target.value)
+                    ranking.value = await api.get(`/api/forms/${formId.value}/ranking?limit=${rankLimit.value}`).then(x => x.data).catch(() => null)
+                    await nextTick(); renderCharts()
+                  }
+                }, [10, 20, 50, 100].map(n => h('option', { value: n }, `前 ${n} 名`)))
+              ]),
+              ranking.value.top.length ? h('div', { style: 'overflow-x:auto' }, h('table', { class: 'table' }, [
+                h('thead', {}, h('tr', {}, ['名次', '考生', '得分', '是否通过', '提交时间'].map(t => h('th', {}, t)))),
+                h('tbody', {}, ranking.value.top.map(r => h('tr', {}, [
+                  h('td', {}, h('span', {
+                    class: ['tag', r.rank === 1 ? 'warn' : r.rank <= 3 ? 'brand' : ''],
+                    style: 'font-variant-numeric:tabular-nums'
+                  }, String(r.rank))),
+                  h('td', {}, r.name || '匿名考生'),
+                  h('td', {}, h('b', {}, String(r.score))),
+                  // 待批阅的卷子可判分总分更低、及格线也低，所以「50 分通过、48 分未通过」不是判错
+                  h('td', {}, h('div', { class: 'flex', style: 'gap:5px' }, [
+                    h('span', { class: ['tag', r.passed ? 'ok' : 'danger'] }, r.passed ? '通过' : '未通过'),
+                    r.pending ? h('span', { class: 'tag warn', title: '主观题未批完，及格线按当前可判分总分算' }, `待批 ${r.pending}`) : null
+                  ])),
+                  h('td', { class: 'small muted' }, fmtDate(r.createdAt))
+                ])))
+              ])) : h('div', { class: 'card-b muted small' }, '还没有可排名的成绩：需要考试类表单，且答卷已被判分')
+            ]) : null,
+            ranking.value?.distribution?.buckets?.length ? h('div', { class: 'card mb' }, [
+              h('div', { class: 'card-h' }, [h('h3', {}, '分数分布'), h('span', { class: 'small muted' }, '排名本身不说明水平，分布才说明')]),
+              h('div', { id: 'rank_dist', class: 'chart', style: 'height:200px' })
+            ]) : null,
             h('div', { class: 'grid c2' }, data.value.questions.map(q => h('div', { class: 'card' }, [
               h('div', { class: 'card-h' }, [
                 h('div', { style: 'min-width:0' }, [

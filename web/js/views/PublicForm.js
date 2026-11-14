@@ -16,6 +16,7 @@ export default {
     const result = ref(null)
     const error = ref('')
     const password = ref('')
+    const board = ref(null)
     const wx = ref(null)
     let startAt = Date.now()
     const fieldErrors = ref([])
@@ -45,6 +46,10 @@ export default {
         form.value = r.data
         model.value = defaultData(r.data.schema)
         document.title = r.data.title + ' · EQS'
+        // 表单开了排行榜才去取；没开时接口会 403，不必每次都问一遍
+        if (r.data.settings?.showRanking && r.data.kind === 'exam') {
+          board.value = await api.get(`/api/public/forms/${id}/ranking?limit=10`).then(x => x.data).catch(() => null)
+        }
         const w = route.value.query.wx
         if (w) { try { wx.value = JSON.parse(atob(w.replace(/-/g, '+').replace(/_/g, '/'))) } catch {} }
         restartTimer()
@@ -79,6 +84,9 @@ export default {
           wxAvatar: wx.value?.avatar || ''
         })
         result.value = r
+        if (form.value?.settings?.showRanking && form.value.kind === 'exam') {
+          board.value = await api.get(`/api/public/forms/${id}/ranking?limit=10`).then(x => x.data).catch(() => null)
+        }
         fieldErrors.value = []
         done.value = true
         ok(r.message || '提交成功')
@@ -158,6 +166,9 @@ export default {
                 h('div', { class: 'small muted' }, result.value.graded === false
                   ? '本卷暂无可自动判分的题目，成绩需人工批阅'
                   : `满分 ${result.value.total ?? '-'} 分 · 及格线 ${result.value.passLine ?? '-'} 分 · ${result.value.passed ? '通过' : '未通过'}`),
+                // 名次与分数一起给：只给分数的话「85 分」在这张卷子里算什么水平是不知道的
+                result.value.rank ? h('div', { class: 'small muted', style: 'margin-top:6px' },
+                  `第 ${result.value.rank.rank} / ${result.value.rank.total} 名 · 超过 ${result.value.rank.percentile}% 的考生`) : null,
                 result.value.ungraded ? h('div', {
                   style: 'margin-top:8px;padding:8px 12px;border-radius:9px;background:rgba(245,158,11,.12);font-size:12.5px;color:var(--warn, #b06b00)'
                 }, `还有 ${result.value.ungraded} 道主观题等待人工批阅，批阅后总分与是否通过会更新，可凭答卷编号回来查询`) : null
@@ -247,6 +258,17 @@ export default {
                       })
                   ]) : null
                 ]) : null
+              ]) : null,
+              board.value?.length ? h('div', { style: 'margin-top:20px;padding-top:16px;border-top:1px solid var(--line)' }, [
+                h('div', { style: 'font-weight:600;font-size:13.5px;margin-bottom:8px' }, '成绩榜'),
+                ...board.value.map(r => h('div', {
+                  class: 'flex between',
+                  style: 'padding:6px 0;font-size:13px;border-bottom:1px dashed var(--line)'
+                }, [
+                  h('span', {}, `${r.rank}. ${r.name}`),
+                  h('span', { class: 'small', style: 'color:' + (r.passed ? 'var(--ok)' : 'var(--text-3)') }, String(r.score))
+                ])),
+                h('div', { class: 'small muted', style: 'margin-top:8px' }, '榜单只显示名次、打码后的昵称与分数，不公开答卷内容')
               ]) : null,
               h('div', { class: 'fill-foot' }, [
                 h('div', {}, '由 '),

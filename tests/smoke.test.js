@@ -2170,6 +2170,107 @@ try {
     assert(JSON.stringify(fields[0].answer) === '["FETCH"]', '答案字母仍然折成了选项值', JSON.stringify(fields[0].answer))
   }
 
+  console.log('\n[58] 成绩排名：同分同名次、下一名跳号、不公布成绩时不泄露')
+  {
+    /*
+     * README 与工作台一直写着「成绩统计与排名」，「排名」却既没有接口也没有页面。
+     * 这一节钉住的是名次口径：并列怎么算、跳不跳号、谁能看、什么情况下不该给。
+     */
+    cookie = await asUser('admin', 'test-pass-123')
+    let r = await req('POST', '/api/forms', {
+      title: '排名口径考试', kind: 'exam',
+      schema: [{ id: 'q1', type: 'radio', label: '一加一', options: ['1', '2', '3'], answer: ['2'], score: 10 }],
+      settings: { passPercent: 60, showResult: true, showRank: true }
+    })
+    const examId = r.json.id
+    await req('PUT', `/api/forms/${examId}`, { status: 'published' })
+
+    const submit = async (data) => (await req('POST', `/api/public/forms/${examId}/submit`, { data })).json
+    const a = await submit({ q1: '2' })   // 10 分
+    const b = await submit({ q1: '2' })   // 10 分（并列）
+    const c = await submit({ q1: '1' })   // 0 分
+    const d = await submit({ q1: '3' })   // 0 分（与 c 并列）
+    const e = await submit({})            // 未答 → 0 分，与 c/d 同分
+
+    assert(a.rank && a.rank.rank === 1, '满分交卷：名次 1', JSON.stringify(a.rank))
+    // 交卷那一刻算的是「到现在为止」的名次：a 交卷时库里还只有它自己
+    assert(a.rank.total === 1 && a.rank.percentile === 100, '交卷即给名次，总人数按当时已交卷的算', JSON.stringify(a.rank))
+    assert(b.rank.rank === 1, '同分并列同名次，不因为晚交就排到第 2', JSON.stringify(b.rank))
+
+    // 榜单：1,1,3,3,3 —— 两个 10 分并列第 1，下一名从第 3 开始
+    r = await req('GET', `/api/forms/${examId}/ranking?limit=10`)
+    const top = r.json.data.top
+    assert(top.length === 5, '榜单给出全部有成绩的答卷', String(top.length))
+    assert(top.map(x => x.rank).join(',') === '1,1,3,3,3', '并列同名次、下一名跳号（1,1,3,3,3）', top.map(x => x.rank).join(','))
+    assert(top[0].score === 10 && top[4].score === 0, '榜单按分数倒序', JSON.stringify(top.map(x => x.score)))
+    // 主观题没批完的卷子可判分总分更低、及格线也低，榜单必须标出来，否则读者会以为判错了
+    assert(top.every(x => x.pending === 0), '全客观题的卷子没有「待批阅」标记', JSON.stringify(top.map(x => x.pending)))
+    const dist = r.json.data.distribution
+    assert(dist.buckets.length === 10, '分数分布切成 10 档', String(dist.buckets?.length))
+    assert(dist.buckets.reduce((x, y) => x + y.count, 0) === 5, '各档人数加起来等于总人数', JSON.stringify(dist.buckets.map(x => x.count)))
+
+    // 限量：前 2 名只返回 2 行，但名次口径照旧
+    r = await req('GET', `/api/forms/${examId}/ranking?limit=2`)
+    assert(r.json.data.top.length === 2 && r.json.data.total === 5, '按需取前 N 名，总数照给', JSON.stringify([r.json.data.top.length, r.json.data.total]))
+
+    // 提交时未开排行榜，公开榜单必须 403
+    r = await req('GET', `/api/public/forms/${examId}/ranking`)
+    assert(r.status === 403, '没开「公开成绩榜」时公开接口拒绝', String(r.status))
+    // 交卷返回里也只有名次，不含任何人名
+    assert(!JSON.stringify(a.rank).includes('匿名'), '交卷返回的名次只有数字，不含他人信息', JSON.stringify(a.rank))
+
+    // 打开排行榜：名字必须打码，不能把账号昵称原样贴到匿名页面上
+    await req('PUT', `/api/forms/${examId}`, { settings: { passPercent: 60, showResult: true, showRank: true, showRanking: true } })
+    r = await req('GET', `/api/public/forms/${examId}/ranking?limit=10`)
+    assert(r.status === 200 && r.json.data.length === 5, '开了之后公开榜单可用', String(r.status))
+    // 测试里所有提交都带着同一个登录会话，所以昵称来自那个账号；关键是它被打码了，不是原样贴出去
+    assert(r.json.data.every(x => /^[^*]\*{1,3}$/.test(x.name) || x.name === '匿名考生'),
+      '公开榜单上的名字一律打码（真名只留首字）', JSON.stringify(r.json.data.map(x => x.name)))
+    assert(r.json.data.every(x => x.score !== undefined && x.publicId), '榜单带分数与答卷编号', JSON.stringify(r.json.data[0]))
+
+    // 关掉「逐题对错」= 不公布成绩，名次也不能从这个缝里漏出去
+    await req('PUT', `/api/forms/${examId}`, { settings: { passPercent: 60, showResult: false, showRank: true } })
+    const hidden = await submit({ q1: '2' })
+    assert(hidden.rank === null, '不公布成绩时不返回名次（否则第 1 名等于告知满分）', JSON.stringify(hidden.rank))
+
+    // 主观题未批阅：榜单要标 pending，交卷返回里也要能看出还有几题没批
+    r = await req('POST', '/api/forms', {
+      title: '主观题排名考试', kind: 'exam',
+      schema: [
+        { id: 'o1', type: 'radio', label: '客观题', options: ['A', 'B'], answer: ['A'], score: 10 },
+        { id: 'sub1', type: 'textarea', label: '主观题', score: 20 }
+      ],
+      settings: { passPercent: 60, showResult: true, showRank: true }
+    })
+    const subExamId = r.json.id
+    await req('PUT', `/api/forms/${subExamId}`, { status: 'published' })
+    const s1 = await req('POST', `/api/public/forms/${subExamId}/submit`, { data: { o1: 'A', sub1: '我的答案' } })
+    assert(s1.json.ungraded === 1, '交卷时告知还有 1 道主观题待批', String(s1.json.ungraded))
+    r = await req('GET', `/api/forms/${subExamId}/ranking?limit=10`)
+    assert(r.json.data.top[0].pending === 1, '榜单标出「还有 1 题待批」', JSON.stringify(r.json.data.top[0]))
+
+    // 问卷类表单没有排名
+    r = await req('POST', '/api/forms', { title: '排名测试问卷', kind: 'survey', schema: [{ id: 's1', type: 'text', label: '想法' }] })
+    const surveyId = r.json.id
+    const rep = await req('GET', `/api/forms/${surveyId}/report`)
+    assert(!rep.json.data.questions.some(q => q.id === 'rank'), '问卷报表不掺排名数据')
+    r = await req('GET', `/api/forms/${surveyId}/ranking`)
+    assert(r.status === 200 && r.json.data.total === 0, '问卷也能查排名接口，只是没有成绩', String(r.status))
+
+    // 权限：别人的考试不能查排名
+    await req('POST', '/api/users', { username: 'rank-out', password: 'rank-pass-1', nickname: '外人' })
+    const other = await asUser('rank-out', 'rank-pass-1')
+    const denied = await call(other, 'GET', `/api/forms/${examId}/ranking`)
+    assert(denied.status === 403 || denied.status === 400, '别人的考试查不到排名', String(denied.status))
+
+    // 名字打码本身
+    const { maskName } = await import('../server/lib/ranking.js')
+    assert(maskName('张三') === '张*', '两字名只留姓', maskName('张三'))
+    assert(maskName('欧阳修文') === '欧***', '长名字打码长度封顶 3', maskName('欧阳修文'))
+    assert(maskName('') === '匿名考生' && maskName('  ') === '匿名考生', '空名字统一「匿名考生」', JSON.stringify([maskName(''), maskName('  ')]))
+    assert(maskName('13800138000') === '匿名考生', '纯数字（手机号当昵称）直接匿名', maskName('13800138000'))
+  }
+
   console.log('\n[44] 前端静态资源')
 
   for (const p of ['/', '/js/main.js', '/css/app.css', '/js/views/Logs.js', '/assets/eqs-mark.svg', '/vendor/echarts.min.js']) {

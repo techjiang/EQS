@@ -211,6 +211,12 @@ CREATE INDEX IF NOT EXISTS idx_forms_kind ON forms(kind, deleted_at);
 CREATE INDEX IF NOT EXISTS idx_sub_created ON submissions(created_at);
 /* 按表单 + 时间取数（时间范围筛选）走这条，省掉回表 */
 CREATE INDEX IF NOT EXISTS idx_sub_form_created ON submissions(form_id, created_at);
+/*
+ * 成绩排名按 (表单, 分数倒序) 取前 N 名。
+ * 没有这条索引时，SQLite 要把这个表单的全部答卷读出来排一遍才能给出前 20 名——
+ * 一份 10 万人的考试，每刷一次排行榜就是一次全量排序。
+ */
+CREATE INDEX IF NOT EXISTS idx_sub_form_score ON submissions(form_id, score);
 `)
 
 // 老库补列：SQLite 没有 ADD COLUMN IF NOT EXISTS，先查再补

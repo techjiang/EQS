@@ -95,7 +95,8 @@
 
 `GET /api/public/forms/:id` 返回的 `settings` 已按白名单裁剪：只含外观与开关
 （`submitText`、`buttonText`、`redirectUrl`、`headerImage`、`bgImage`、`bgColor`、`buttonColor`、
-`allowQuery`、`onlyWechat`、`recordWechat`、`needPassword`、`passPercent`、`showResult`、`duration`），
+`allowQuery`、`onlyWechat`、`recordWechat`、`needPassword`、`passPercent`、`showResult`、
+`showRank`、`showRanking`、`duration`），
 访问密码、白名单、通知邮箱等敏感字段不会下发到浏览器。
 
 ## 答卷
@@ -123,6 +124,29 @@ PUT /api/submissions/:id/review
 保存后按「客观题自动分 + 主观题人工分」重算总分，写回 `score` 并记录
 `reviewed_at` / `reviewed_by` / `review_note`，同时触发 `update` WebHook。
 未出现在 `scores` 里的主观题保留原有分数，因此可以分批批阅、随时调整。
+
+### 成绩排名
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/api/forms/:id/ranking?limit=20` | 管理端榜单：`top[]`（含 `rank`、`score`、`name`）、`total`、`distribution` |
+| GET | `/api/public/forms/:id/ranking?limit=10` | 公开榜单，需表单开启 `showRanking`，名字打码 |
+
+名次口径：**同分同名次，下一名跳号**（1,1,3,3,3），而不是「第几行」。
+名次 = 「比我分高的人数 + 1」，所以同一个考生在榜单和查询页上拿到的名次一定一致。
+
+榜单只读前 N 行（SQL 排序，走 `(form_id, score)` 索引），内存与耗时跟 N 有关，
+与答卷总量无关；`distribution` 是 10 档分数分布，用于判断「这个分数算什么水平」。
+
+交卷返回体里带 `rank: {rank, total, percentile, score}`，
+`percentile` 是「超过百分之多少的考生」。以下情况一律不给名次：
+
+- 表单 `showResult: false`（不公布成绩——第 1 名配满分等于把满分告诉了所有人）
+- 表单 `showRank: false`
+- 非考试类表单
+
+公开榜单只给 `rank` / `name` / `score` / `passed` / `publicId`，不含任何答卷内容。
+`name` 取微信昵称、账号昵称，打码成「张*」；空名或纯数字（手机号当昵称）统一「匿名考生」。
 
 ## 题库与组卷
 

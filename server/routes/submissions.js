@@ -2,7 +2,7 @@ import crypto from 'node:crypto'
 import { get, all, run, each, now, log } from '../lib/db.js'
 import { readJson, fail, sendJson, clientIp } from '../lib/http.js'
 import { requireUser, requirePerm, currentUser, can } from '../lib/auth.js'
-import { pickForm, validateSubmission, gradeSubmission, computeStats, createStatsAccumulator, submissionData, paginate, fieldVisible, passLineOf, manualScoresOf, passHintOf, captchaChallenge, safeJson, isAnswerCorrect, answerText } from '../lib/forms.js'
+import { pickForm, validateSubmission, isSubjective, pendingLeft, gradeSubmission, computeStats, createStatsAccumulator, submissionData, paginate, fieldVisible, passLineOf, manualScoresOf, passHintOf, captchaChallenge, safeJson, isAnswerCorrect, answerText } from '../lib/forms.js'
 
 /** 对外答卷编号：不可猜、无业务含义，只给提交者本人用 */
 export function newPublicId() {
@@ -26,6 +26,7 @@ function findSubmission(formId, raw) {
 }
 
 import { notifySubmission, dispatchWebhooks } from '../lib/notify.js'
+import { rankingTop, rankOf, publicRanking, distributionOf } from '../lib/ranking.js'
 import { submissionsXlsx, submissionsHead, submissionRow } from '../lib/sheet.js'
 import { writeXlsxStream } from '../lib/xlsx.js'
 
@@ -103,29 +104,6 @@ export function checkLimit(form, req, extra = {}) {
     if (!/MicroMessenger/i.test(ua)) fail(403, '请在微信中打开此问卷')
   }
   return fp
-}
-
-/** 验证码是防机器人的，不是题目；哪怕误填了分值也不该进阅卷队列 */
-const NO_GRADE_TYPES = new Set(['captcha', 'divider', 'richtext', 'html', 'image'])
-
-/** 需要人工给分的题：有分值、无标准答案、不是说明类组件 */
-export function isSubjective(f) {
-  return Number(f?.score) > 0 && !(f?.answer?.length) && !NO_GRADE_TYPES.has(f?.type)
-}
-
-/**
- * 这份答卷还剩几道主观题没给分。
- * 与 gradeSubmission 同口径：有分值、无标准答案、当前可见、且没出现在 manual_scores 里。
- */
-export function pendingLeft(form, row) {
-  if (!form || form.kind !== 'exam') return 0
-  const data = safeJson(row.data, {})
-  const manual = manualScoresOf(row)
-  // 直接查库拿到的是未解析的行，schema 还是 JSON 字符串
-  const schema = Array.isArray(form.schema) ? form.schema : safeJson(form.schema, [])
-  return schema.filter(f =>
-    isSubjective(f) && fieldVisible(f, data) && !Object.prototype.hasOwnProperty.call(manual, f.id)
-  ).length
 }
 
 /**
@@ -248,7 +226,13 @@ export default function register(r) {
       passed: passed === 1,
       review,
       message: form.settings?.submitText || '提交成功，感谢您的参与！',
-      redirect: form.settings?.redirectUrl || ''
+      redirect: form.settings?.redirectUrl || '',
+      // 交卷那一刻就能看到自己的名次：这是考试类表单最想立刻知道的一件事，
+      // 而以前要等管理员导出 Excel 才能算出来。
+      // 但名次本身透露分数（第 1 名配满分就是满分），所以「不公布成绩」时也不能给名次。
+      rank: form.kind === 'exam' && form.settings?.showResult !== false && form.settings?.showRank !== false
+        ? rankOf(form.id, id)
+        : null
     })
 
     // 异步通知，失败不影响提交
@@ -329,7 +313,11 @@ export default function register(r) {
       ok: true,
       data: {
         id: row.id, publicId: row.public_id || String(row.id), data: JSON.parse(row.data), score: row.score,
-        passed: row.passed === 1, reviewed: !!row.reviewed_at, review, createdAt: row.created_at
+        passed: row.passed === 1, reviewed: !!row.reviewed_at, review, createdAt: row.created_at,
+        // 与交卷同一口径：不公布成绩的表单，连名次也不该从查询接口漏出去
+        rank: form?.kind === 'exam' && form?.settings?.showResult !== false && form?.settings?.showRank !== false
+          ? rankOf(row.form_id, row.id)
+          : null
       }
     })
   })
@@ -559,6 +547,41 @@ export default function register(r) {
   })
 
   /**
+   * 成绩排名（管理端）。
+   * 榜单只读前 N 名，SQL 排序 + 索引，与答卷总量无关；并列同名次、下一名跳号。
+   */
+  r.get('/api/forms/:id/ranking', async (req, res, { params }) => {
+    const user = requirePerm(req, 'report:read')
+    const form = pickForm(params.id)
+    if (!form) fail(404, '表单不存在')
+    if (!can(user, '*') && form.created_by !== user.id) fail(403, '无权查看排名')
+    const url = new URL(req.url, 'http://x')
+    const limit = Number(url.searchParams.get('limit')) || 20
+    const top = rankingTop(form.id, limit, form)
+    const total = get('SELECT COUNT(*) c FROM submissions WHERE form_id = ? AND deleted_at IS NULL AND score IS NOT NULL', form.id).c
+    sendJson(res, 200, {
+      ok: true,
+      data: {
+        form: { id: form.id, title: form.title, kind: form.kind },
+        total,
+        top,
+        // 分数分布按分数档（满分 100 制给 10 档，否则按实际分差均分），用来判断「这个排名有没有意义」
+        distribution: distributionOf(form, total)
+      }
+    })
+  })
+
+  /** 公开榜单：匿名入口，名字打码、只给前 N 名，且必须由表单开关显式打开 */
+  r.get('/api/public/forms/:id/ranking', async (req, res, { params }) => {
+    const form = pickForm(params.id)
+    if (!form) fail(404, '表单不存在')
+    if (form.status !== 'published') fail(403, '表单未发布')
+    if (form.settings?.showRanking !== true) fail(403, '该表单未开放排行榜')
+    const url = new URL(req.url, 'http://x')
+    sendJson(res, 200, { ok: true, data: publicRanking(form, Number(url.searchParams.get('limit')) || 10) })
+  })
+
+  /**
    * 导出答卷为 xlsx（当前筛选条件下的全部，不只是当前页）。
    * 之前只有前端拿当前页拼 CSV：翻到第 2 页再导出，导出的还是第 1 页。
    */
@@ -640,7 +663,8 @@ export default function register(r) {
 /** 公开填写页只需要外观与开关，访问密码、白名单、通知邮箱一律不下发 */
 const PUBLIC_SETTING_KEYS = [
   'submitText', 'buttonText', 'redirectUrl', 'headerImage', 'bgImage', 'bgColor', 'buttonColor',
-  'allowQuery', 'onlyWechat', 'recordWechat', 'needPassword', 'passPercent', 'showResult', 'duration'
+  'allowQuery', 'onlyWechat', 'recordWechat', 'needPassword', 'passPercent', 'showResult', 'duration',
+  'showRank', 'showRanking'
 ]
 
 /** 作答需要的 props 白名单；标准答案常藏在自定义属性里，一律不下发 */
