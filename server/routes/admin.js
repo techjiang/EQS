@@ -65,7 +65,7 @@ function mergeMasked(prev, next) {
 export default function register(r) {
   /* ---------------- 用户 ---------------- */
   r.get('/api/users', async (req, res) => {
-    requirePerm(req, 'form:read')
+    const me = requirePerm(req, 'form:read')
     const url = new URL(req.url, 'http://x')
     const keyword = url.searchParams.get('keyword')
     const where = []
@@ -75,6 +75,9 @@ export default function register(r) {
       r.name AS role_name, d.name AS dept_name
       FROM users u LEFT JOIN roles r ON r.id = u.role_id LEFT JOIN depts d ON d.id = u.dept_id
       ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY u.id ASC`, ...args)
+    // 通讯录不是公开资料。普通用户带 form:read 就能拿到全站账号、邮箱、手机号，
+    // 前端那一栏明明写着「用户与权限（仅管理员）」——非管理员只回自己这一条。
+    if (!can(me, '*')) return sendJson(res, 200, { ok: true, data: rows.filter(u => u.id === me.id), self: true })
     sendJson(res, 200, { ok: true, data: rows })
   })
 
@@ -132,8 +135,13 @@ export default function register(r) {
 
   /* ---------------- 角色 / 部门 ---------------- */
   r.get('/api/roles', async (req, res) => {
-    requirePerm(req, 'form:read')
-    sendJson(res, 200, { ok: true, data: all('SELECT * FROM roles ORDER BY id').map(x => ({ ...x, perms: safeJson(x.perms, []) })) })
+    const me = requirePerm(req, 'form:read')
+    const rows = all(`SELECT r.*, (SELECT COUNT(*) FROM users u WHERE u.role_id = r.id) AS user_count
+      FROM roles r ORDER BY r.id`).map(x => ({ ...x, perms: safeJson(x.perms, []) }))
+    // 角色表是权限模型本身。非管理员拿不到别人的权限位，也不需要：
+    // 只回自己那一个，前端下拉框不至于空着，越权面也不再外扩。
+    if (!can(me, '*')) return sendJson(res, 200, { ok: true, data: rows.filter(r2 => r2.id === me.role_id) })
+    sendJson(res, 200, { ok: true, data: rows })
   })
 
   r.post('/api/roles', async (req, res) => {
@@ -152,6 +160,15 @@ export default function register(r) {
     const role = get('SELECT * FROM roles WHERE id = ?', Number(params.id))
     if (!role) fail(404, '角色不存在')
     const body = await readJson(req)
+    /*
+     * 内置 admin 的 ['*'] 是「唯一还能改回来」的那把钥匙：
+     * 勾掉它保存一次，全站立刻没有管理员，而这把钥匙本身也再没人改得回来——
+     * 只能进数据库手动改。所以它只允许改名，权限位锁死。
+     */
+    if (role.code === 'admin' && body.perms !== undefined) {
+      const next = Array.isArray(body.perms) ? body.perms : []
+      if (!next.includes('*')) fail(400, '内置「超级管理员」角色的权限不可移除，否则将无人能再管理系统')
+    }
     run('UPDATE roles SET name = ?, perms = ? WHERE id = ?',
       body.name ?? role.name, JSON.stringify(body.perms ?? safeJson(role.perms, [])), role.id)
     sendJson(res, 200, { ok: true })
@@ -163,6 +180,10 @@ export default function register(r) {
     const role = get('SELECT * FROM roles WHERE id = ?', Number(params.id))
     if (!role) fail(404, '角色不存在')
     if (role.builtin) fail(400, '内置角色不可删除')
+    // 删角色不检查占用：用户会留在一个不存在的 role_id 上，权限全空，
+    // 登录后每个按钮都「权限不足」，而他自己的资料页看不出任何原因。
+    const used = get('SELECT COUNT(*) c FROM users WHERE role_id = ?', role.id).c
+    if (used) fail(400, `还有 ${used} 个用户属于该角色，请先把他们改到其他角色`)
     run('DELETE FROM roles WHERE id = ?', role.id)
     sendJson(res, 200, { ok: true })
   })

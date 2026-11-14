@@ -98,6 +98,9 @@ export default function register(r) {
     const user = requirePerm(req, 'form:update')
     const form = pickForm(params.id, { withDeleted: true })
     if (!form) fail(404, '表单不存在')
+    // 恢复也是「改」：删/改都有归属校验，唯独恢复漏了。
+    // 别人在回收站里的问卷，换个 id 就能捞回自己的列表里。
+    if (!can(user, '*') && form.created_by !== user.id) fail(403, '无权恢复该表单')
     run('UPDATE forms SET deleted_at = NULL, updated_at = ? WHERE id = ?', now(), form.id)
     log(user, '恢复表单', `${form.title} #${form.id}`)
     sendJson(res, 200, { ok: true })
@@ -107,6 +110,7 @@ export default function register(r) {
     const user = requirePerm(req, 'form:delete')
     const form = pickForm(params.id, { withDeleted: true })
     if (!form) fail(404, '表单不存在')
+    if (!can(user, '*') && form.created_by !== user.id) fail(403, '无权删除该表单')
     // 只有已经进了回收站的表单才允许彻底删除：直接对在用表单调 purge 的话，
     // 一次误点就是「问卷连同全部答卷消失」，而回收中心根本没机会接住它。
     if (!form.deleted_at) fail(400, '请先把表单移入回收中心，再彻底删除')
@@ -131,6 +135,8 @@ export default function register(r) {
     const user = requirePerm(req, 'form:create')
     const form = pickForm(params.id, { withDeleted: true })
     if (!form) fail(404, '表单不存在')
+    // 复制等于「把这张卷子的题目连答案抄一份」，读都读不到的表单不能被复制
+    if (!can(user, '*') && form.created_by !== user.id && !form.is_template) fail(403, '无权复制该表单')
     const ts = now()
     const result = run(
       'INSERT INTO forms(title, description, kind, schema, settings, status, is_template, category, created_by, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
@@ -145,6 +151,7 @@ export default function register(r) {
     const user = requirePerm(req, 'form:update')
     const form = pickForm(params.id)
     if (!form) fail(404, '表单不存在')
+    if (!can(user, '*') && form.created_by !== user.id) fail(403, '无权修改该表单')
     const { text } = await readJson(req)
     if (!text) fail(400, '请粘贴题目文本')
     const fields = parseTextToFields(String(text))
@@ -161,6 +168,7 @@ export default function register(r) {
     const user = requirePerm(req, 'form:update')
     const form = pickForm(params.id)
     if (!form) fail(404, '表单不存在')
+    if (!can(user, '*') && form.created_by !== user.id) fail(403, '无权修改该表单')
     const buf = await readXlsxUpload(req)
     if (!buf?.length) fail(400, '请上传 xlsx 文件')
     const rows = parseXlsx(buf)

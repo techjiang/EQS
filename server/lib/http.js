@@ -72,10 +72,20 @@ export function serveStatic(root, req, res, urlPath) {
   const ext = path.extname(file).slice(1).toLowerCase()
   const stat = fs.statSync(file)
   const etag = `W/"${stat.size}-${Number(stat.mtimeMs).toString(36)}"`
+  /*
+   * 前端是没有构建步骤的 ESM：js/css 一改，文件名不变。
+   * 给它们 max-age=86400，等于「升级完还要等一天才生效」——用户看到的是
+   * 改好的后端配旧的前端，报的错一个都对不上。所以代码类资源一律 no-cache，
+   * 靠 ETag 走 304，代价只是几十字节的往返；图片、字体、vendor 才长缓存。
+   */
+  const LONG_CACHE = ['svg', 'png', 'jpg', 'jpeg', 'webp', 'ico', 'woff', 'woff2', 'ttf', 'gif']
   const headers = {
     'Content-Type': MIME[ext] || 'application/octet-stream',
     ETag: etag,
-    'Cache-Control': ext === 'html' ? 'no-cache' : 'public, max-age=86400'
+    // vendor 是第三方库，本项目从不改它，可以放心长缓存
+    'Cache-Control': rel.startsWith('vendor/') || LONG_CACHE.includes(ext)
+      ? 'public, max-age=86400'
+      : 'no-cache'
   }
   if (req.headers['if-none-match'] === etag) { res.writeHead(304, headers); res.end(); return true }
   const accept = req.headers['accept-encoding'] || ''

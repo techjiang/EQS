@@ -93,6 +93,14 @@ export default {
       try { const r = await api.post(`/api/webhooks/${h.id}/test`); ok('测试已发送') } catch (e) { err(e.message) }
     }
 
+    const saveDefaultLang = async () => {
+      if (!cfg.value.i18n) return
+      try {
+        await api.put('/api/settings/i18n', cfg.value.i18n)
+        ok('默认语言已保存')
+      } catch (e) { err(e.message) }
+    }
+
     const saveI18n = async () => {
       try { await api.put(`/api/i18n/${lang.value}`, i18nData.value); ok('语言资源已保存') } catch (e) { err(e.message) }
     }
@@ -278,11 +286,17 @@ export default {
           ])
         }
         case 'i18n': {
+          const i18 = ensure('i18n')
           return h('div', {}, [
-            h('div', { class: 'flex mb' }, [
+            field('站点默认语言', h('select', {
+              class: 'select', style: 'max-width:220px', value: i18.defaultLang || 'zh',
+              onChange: e => { i18.defaultLang = e.target.value; saveDefaultLang() }
+            }), '新访客看到的界面语言；用户自己切过之后以他的选择为准'),
+            h('div', { class: 'flex mb', style: 'margin-top:16px' }, [
+              h('div', { class: 'small muted', style: 'flex:1;align-self:center' }, '下面是选中语言的词条，改完点保存即刻生效'),
               h('select', { class: 'select', style: 'max-width:160px', value: lang.value, onChange: async e => { lang.value = e.target.value; await loadI18n() } },
                 [h('option', { value: 'zh' }, '简体中文'), h('option', { value: 'en' }, 'English')]),
-              h('button', { class: 'btn', onClick: saveI18n }, '保存')
+              h('button', { class: 'btn', onClick: saveI18n }, '保存词条')
             ]),
             h('div', { style: 'max-height:420px;overflow:auto' }, Object.entries(i18nData.value).map(([k, v]) => h('div', { class: 'field' }, [
               h('label', { class: 'mono' }, k),

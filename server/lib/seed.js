@@ -88,23 +88,40 @@ export function seedSettings() {
     setSetting('site', { name: 'EQS', slogan: '一体化问卷 · 考试 · 刷题平台', icp: '' })
     setSetting('i18n', { defaultLang: 'zh', enabled: ['zh', 'en'] })
   }
-  const i18nCount = get('SELECT COUNT(*) c FROM i18n').c
-  if (!i18nCount) {
+  // 用 ON CONFLICT DO NOTHING 而不是「库里有就不管」：
+  // 老库留着旧键名的词典，界面上取不到，多语言页看起来像坏的。
+  // 补上新键、保留用户改过的值。
+  {
+    // 键名必须和界面里真正取的那一批对齐，否则「多语言」页面编辑得再热闹，
+    // 页面上一个字都不会变——上一版就是自说自话的另一套键名。
     const zh = {
-      'app.name': 'EQS', 'nav.dashboard': '工作台', 'nav.forms': '表单', 'nav.templates': '模板中心',
-      'nav.exams': '考试', 'nav.banks': '题库', 'nav.data': '数据', 'nav.reports': '报表',
-      'nav.recycle': '回收站', 'nav.settings': '系统设置', 'action.save': '保存', 'action.publish': '发布',
-      'action.preview': '预览', 'action.export': '导出', 'action.delete': '删除', 'action.edit': '编辑',
-      'action.create': '新建', 'common.submit': '提交', 'common.cancel': '取消'
+      'app.name': 'EQS',
+      'nav.dashboard': '工作台', 'nav.forms': '问卷表单', 'nav.exams': '在线考试',
+      'nav.banks': '题库刷题', 'nav.templates': '模板中心', 'nav.data': '答卷数据',
+      'nav.report': '统计分析', 'nav.screen': '数据大屏', 'nav.users': '用户权限',
+      'nav.recycle': '回收中心', 'nav.settings': '系统设置',
+      'group.work': '工作', 'group.data': '数据', 'group.system': '系统',
+      'action.save': '保存', 'action.publish': '发布', 'action.preview': '预览',
+      'action.export': '导出', 'action.delete': '删除', 'action.edit': '编辑',
+      'action.create': '新建', 'action.newForm': '新建表单', 'action.logout': '退出',
+      'theme.dark': '深色模式', 'theme.light': '浅色模式',
+      'common.submit': '提交', 'common.cancel': '取消'
     }
     const en = {
-      'app.name': 'EQS', 'nav.dashboard': 'Dashboard', 'nav.forms': 'Forms', 'nav.templates': 'Templates',
-      'nav.exams': 'Exams', 'nav.banks': 'Question Banks', 'nav.data': 'Data', 'nav.reports': 'Reports',
-      'nav.recycle': 'Recycle Bin', 'nav.settings': 'Settings', 'action.save': 'Save', 'action.publish': 'Publish',
-      'action.preview': 'Preview', 'action.export': 'Export', 'action.delete': 'Delete', 'action.edit': 'Edit',
-      'action.create': 'Create', 'common.submit': 'Submit', 'common.cancel': 'Cancel'
+      'app.name': 'EQS',
+      'nav.dashboard': 'Dashboard', 'nav.forms': 'Forms', 'nav.exams': 'Exams',
+      'nav.banks': 'Question Banks', 'nav.templates': 'Templates', 'nav.data': 'Responses',
+      'nav.report': 'Analytics', 'nav.screen': 'Data Wall', 'nav.users': 'Users & Roles',
+      'nav.recycle': 'Recycle Bin', 'nav.settings': 'Settings',
+      'group.work': 'Work', 'group.data': 'Data', 'group.system': 'System',
+      'action.save': 'Save', 'action.publish': 'Publish', 'action.preview': 'Preview',
+      'action.export': 'Export', 'action.delete': 'Delete', 'action.edit': 'Edit',
+      'action.create': 'Create', 'action.newForm': 'New form', 'action.logout': 'Sign out',
+      'theme.dark': 'Dark mode', 'theme.light': 'Light mode',
+      'common.submit': 'Submit', 'common.cancel': 'Cancel'
     }
-    for (const [k, v] of Object.entries(zh)) run('INSERT INTO i18n(lang, key, value) VALUES(?,?,?)', 'zh', k, v)
-    for (const [k, v] of Object.entries(en)) run('INSERT INTO i18n(lang, key, value) VALUES(?,?,?)', 'en', k, v)
+    const upsert = (lang, k, v) => run('INSERT INTO i18n(lang, key, value) VALUES(?,?,?) ON CONFLICT(lang, key) DO NOTHING', lang, k, v)
+    for (const [k, v] of Object.entries(zh)) upsert('zh', k, v)
+    for (const [k, v] of Object.entries(en)) upsert('en', k, v)
   }
 }

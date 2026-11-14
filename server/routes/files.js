@@ -2,7 +2,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { get, all, run, now, DATA_DIR, db } from '../lib/db.js'
 import { readBody, sendJson, fail, send, clientIp } from '../lib/http.js'
-import { requireUser, requirePerm, currentUser } from '../lib/auth.js'
+import { requireUser, requirePerm, currentUser, can } from '../lib/auth.js'
 import { upload, localPath, storageConfig, DRIVERS } from '../lib/storage.js'
 import { safeJson } from '../lib/forms.js'
 import { buildZip, extractZip } from '../lib/zip.js'
@@ -109,8 +109,8 @@ export default function register(r) {
     const maxMb = 100
     if (data.length > maxMb * 1024 * 1024) fail(413, `文件超过 ${maxMb}MB`)
     const stored = await upload({ name, buf: data, mime, formId, submissionId })
-    const result = run('INSERT INTO files(name, stored, size, mime, form_id, submission_id, driver, url, created_at) VALUES(?,?,?,?,?,?,?,?,?)',
-      stored.name, stored.stored, stored.size, stored.mime, stored.formId, stored.submissionId, stored.driver, stored.url, now())
+    const result = run('INSERT INTO files(name, stored, size, mime, form_id, submission_id, owner_id, driver, url, created_at) VALUES(?,?,?,?,?,?,?,?,?,?)',
+      stored.name, stored.stored, stored.size, stored.mime, stored.formId, stored.submissionId, user?.id || 0, stored.driver, stored.url, now())
     sendJson(res, 201, {
       ok: true,
       id: Number(result.lastInsertRowid),
@@ -137,19 +137,28 @@ export default function register(r) {
   })
 
   r.get('/api/files', async (req, res) => {
-    requirePerm(req, 'data:read')
+    const me = requirePerm(req, 'data:read')
     const url = new URL(req.url, 'http://x')
     const where = []
     const args = []
     if (url.searchParams.get('formId')) { where.push('form_id = ?'); args.push(Number(url.searchParams.get('formId'))) }
+    // 附件挂在表单上，可见性就该跟表单一致：之前任何带 data:read 的账号
+    // 都能列出全站附件（含别人的表单 id、原始文件名、存储路径）。
+    if (!can(me, '*')) { where.push('form_id IN (SELECT id FROM forms WHERE created_by = ?)'); args.push(me.id) }
     const rows = all(`SELECT * FROM files ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY id DESC LIMIT 500`, ...args)
     sendJson(res, 200, { ok: true, data: rows })
   })
 
   r.delete('/api/files/:id', async (req, res, { params }) => {
-    requirePerm(req, 'data:write')
+    const me = requirePerm(req, 'data:write')
     const row = get('SELECT * FROM files WHERE id = ?', Number(params.id))
     if (!row) fail(404, '文件不存在')
+    // 删文件比删表单更狠：磁盘上的文件当场没了，回收中心接不住。
+    // 之前只校验 data:write，换一个 id 就能删掉别人整个问卷的附件。
+    if (!can(me, '*')) {
+      const form = row.form_id ? get('SELECT created_by FROM forms WHERE id = ?', row.form_id) : null
+      if (form?.created_by !== me.id) fail(403, '无权删除该文件')
+    }
     if (row.driver === 'local') {
       const f = localPath(row.stored)
       if (f) fs.rmSync(f, { force: true })
@@ -161,7 +170,9 @@ export default function register(r) {
   /** 打包下载某表单所有附件（zip，store 模式无需依赖） */
   r.get('/api/forms/:id/attachments.zip', async (req, res, { params }) => {
     const user = requirePerm(req, 'data:read')
-    const form = get('SELECT id, title FROM forms WHERE id = ?', Number(params.id)) || { id: params.id, title: '' }
+    const form = get('SELECT id, title, created_by FROM forms WHERE id = ?', Number(params.id))
+    if (!form) fail(404, '表单不存在')
+    if (!can(user, '*') && form.created_by !== user.id) fail(403, '无权导出该表单的附件')
     const rows = all(`SELECT fl.* FROM files fl JOIN submissions s ON s.id = fl.submission_id
       WHERE s.form_id = ? AND s.deleted_at IS NULL AND fl.driver = 'local'`, Number(params.id))
     // 文件可能已经从磁盘上被删或在别处丢失，一个 readFileSync 抛异常就会让整包下载 500——

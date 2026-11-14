@@ -72,6 +72,9 @@ export default {
       try { await api.put(`/api/users/${u.id}`, { password: pwd }); ok('密码已重置') } catch (e) { err(e.message) }
     }
 
+    // 内置 admin 角色只允许改名：权限位锁死
+    const locked = computed(() => roleEditing.value?.code === 'admin')
+
     return () => h('div', {}, [
       h('div', { class: 'page-head' }, [
         h('div', {}, [h('h1', {}, '用户与权限'), h('div', { class: 'sub' }, '用户、角色、部门与 RBAC 权限控制')]),
@@ -107,13 +110,16 @@ export default {
           ])) : h(Empty, { text: '暂无用户' })) : null,
 
       tab.value === 'roles' ? h('div', { class: 'card', style: 'overflow:hidden' }, h('table', { class: 'table' }, [
-        h('thead', {}, h('tr', {}, ['角色', '标识', '权限', '操作'].map(t => h('th', {}, t)))),
+        h('thead', {}, h('tr', {}, ['角色', '标识', '权限', '使用中', '操作'].map(t => h('th', {}, t)))),
         h('tbody', {}, roles.value.map(r => h('tr', {}, [
           h('td', { style: 'font-weight:540' }, r.name),
           h('td', { class: 'mono' }, r.code),
           h('td', {}, h('div', { class: 'flex wrap', style: 'gap:4px' }, r.perms.includes('*')
             ? [h('span', { class: 'tag ok' }, '全部权限')]
             : r.perms.map(p => h('span', { class: 'tag' }, PERMS.find(x => x[0] === p)?.[1] || p)))),
+          // 有人在用的角色不能删：删完这些用户会挂在一个不存在的 role_id 上，
+          // 权限全空，登录后每个按钮都「权限不足」，而他自己的资料页看不出原因。
+          h('td', {}, h('span', { class: 'tag' }, r.user_count ? `${r.user_count} 人` : '未使用')),
           h('td', {}, isAdmin.value ? h('button', { class: 'btn ghost sm', onClick: () => roleEditing.value = { ...r, perms: [...r.perms] } }, '编辑') : null)
         ])))
       ])) : null,
@@ -166,20 +172,28 @@ export default {
           h('div', { class: 'field' }, [h('label', {}, '角色名称'), h('input', {
             class: 'input', value: roleEditing.value.name, onInput: e => roleEditing.value.name = e.target.value
           })]),
-          h('div', { class: 'field' }, [h('label', {}, '权限'), h('div', { class: 'grid c2' }, PERMS.map(([p, l]) => h('label', {
-            class: 'flex small', style: 'cursor:pointer'
-          }, [
-            h('input', {
-              type: 'checkbox', style: 'accent-color:var(--brand)',
-              checked: roleEditing.value.perms.includes(p) || roleEditing.value.perms.includes('*'),
-              onChange: e => {
-                const set = new Set(roleEditing.value.perms.filter(x => x !== '*'))
-                e.target.checked ? set.add(p) : set.delete(p)
-                roleEditing.value.perms = [...set]
-              }
-            }),
-            h('span', {}, l)
-          ])))])
+          locked ? h('div', { class: 'hint' }, '内置「超级管理员」的权限位不可修改——勾掉它，就再没有人能改回来了。') : null,
+          locked
+            // 锁死的角色不摆一长串禁用勾选框（看着像「勾了但点不动」，比「不给你碰」更让人困惑），
+            // 直接说明它就是全部权限。
+            ? h('div', { class: 'field' }, [h('label', {}, '权限'), h('div', { class: 'flex wrap', style: 'gap:6px' }, [
+                h('span', { class: 'tag ok' }, '全部权限'),
+                h('span', { class: 'tag' }, '含用户、角色、设置、日志')
+              ])])
+            : h('div', { class: 'field' }, [h('label', {}, '权限'), h('div', { class: 'grid c2' }, PERMS.map(([p, l]) => h('label', {
+                class: 'flex small', style: 'cursor:pointer'
+              }, [
+                h('input', {
+                  type: 'checkbox', style: 'accent-color:var(--brand)',
+                  checked: roleEditing.value.perms.includes(p) || roleEditing.value.perms.includes('*'),
+                  onChange: e => {
+                    const set = new Set(roleEditing.value.perms.filter(x => x !== '*'))
+                    e.target.checked ? set.add(p) : set.delete(p)
+                    roleEditing.value.perms = [...set]
+                  }
+                }),
+                h('span', {}, l)
+              ])))])
         ],
         footer: [h('button', { class: 'btn', onClick: () => roleEditing.value = null }, '取消'), h('button', { class: 'btn primary', onClick: saveRole }, '保存')]
       }) : null

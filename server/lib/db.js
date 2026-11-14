@@ -124,6 +124,7 @@ CREATE TABLE IF NOT EXISTS files (
   mime TEXT DEFAULT '',
   form_id INTEGER DEFAULT 0,
   submission_id INTEGER DEFAULT 0,
+  owner_id INTEGER NOT NULL DEFAULT 0,
   driver TEXT NOT NULL DEFAULT 'local',
   url TEXT DEFAULT '',
   created_at TEXT NOT NULL
@@ -175,6 +176,10 @@ function ensureColumns(table, columns) {
     if (!have.has(name)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${ddl}`)
   }
 }
+
+// 附件归属：设计器里传的头图、背景图并不挂在答卷上（form_id / submission_id 都是 0），
+// 没有 owner 就只能所有人可见或者所有人不可见，两种都不对。
+ensureColumns('files', { owner_id: 'INTEGER NOT NULL DEFAULT 0' })
 
 ensureColumns('submissions', {
   manual_scores: "TEXT NOT NULL DEFAULT '{}'",

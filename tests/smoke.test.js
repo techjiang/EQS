@@ -1350,6 +1350,89 @@ try {
     assert(nps.average === 9.5, 'NPS 仍然算平均分', String(nps.average))
   }
 
+  console.log('\n[45] 权限边界：普通用户不该摸到别人的东西')
+  {
+    const saved = cookie
+    // 普通用户会用自己的 cookie，这里另起一套，避免污染全局会话
+    const asUser = async (username, password) => {
+      const res = await fetch(BASE + '/api/auth/login', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password })
+      })
+      return res.headers.get('set-cookie').split(';')[0]
+    }
+    const call = async (ck, method, url, body) => {
+      const res = await fetch(BASE + url, {
+        method, headers: { 'Content-Type': 'application/json', Cookie: ck },
+        body: body === undefined ? undefined : JSON.stringify(body)
+      })
+      const ct = res.headers.get('content-type') || ''
+      return { status: res.status, json: ct.includes('json') ? await res.json() : null, res }
+    }
+
+    // 管理员建一张私有问卷 + 挂一个附件
+    cookie = saved
+    const mine = await req('POST', '/api/forms', { title: '只有管理员能看的问卷', schema: [] })
+    const myForm = mine.json.id
+    const fd5 = new FormData()
+    fd5.append('file', new Blob([Buffer.from('机密内容')], { type: 'text/plain' }), '机密.txt')
+    fd5.append('formId', String(myForm))
+    const upMe = await fetch(BASE + '/api/upload', { method: 'POST', body: fd5, headers: { Cookie: cookie } })
+    const myFile = (await upMe.json()).id
+    await req('PUT', '/api/forms/' + myForm, { status: 'published' })
+    const mySub = (await req('POST', '/api/submissions', { formId: myForm, data: {} })).json.id
+    const fd6 = new FormData()
+    fd6.append('file', new Blob([Buffer.from('答卷附件')], { type: 'text/plain' }), '答卷附件.txt')
+    fd6.append('formId', String(myForm))
+    fd6.append('submissionId', String(mySub))
+    await fetch(BASE + '/api/upload', { method: 'POST', body: fd6, headers: { Cookie: cookie } })
+
+    // 普通用户
+    await req('POST', '/api/auth/register', { username: 'peeker', password: 'peeker-123', nickname: '偷看的人' })
+    const ck = await asUser('peeker', 'peeker-123')
+
+    let p = await call(ck, 'GET', '/api/users')
+    assert(p.json.data.length === 1 && p.json.data[0].username === 'peeker', '用户列表只回自己，不外泄邮箱手机号', JSON.stringify(p.json.data))
+    p = await call(ck, 'GET', '/api/roles')
+    assert(p.json.data.length === 1, '角色表只回自己的角色，不下发权限模型', JSON.stringify(p.json.data.map(x => x.code)))
+    p = await call(ck, 'GET', '/api/files')
+    assert(!p.json.data.some(f => f.id === myFile), '附件列表看不到别人的文件', JSON.stringify(p.json.data))
+    p = await call(ck, 'DELETE', '/api/files/' + myFile)
+    assert(p.status === 403, '删不掉别人的附件（磁盘文件删了回收中心接不住）', p.status + ' ' + JSON.stringify(p.json))
+    p = await call(ck, 'GET', '/api/forms/' + myForm + '/attachments.zip')
+    assert(p.status === 403, '打不了别人表单的附件包', p.status + ' ' + JSON.stringify(p.json))
+    p = await call(ck, 'POST', '/api/forms/' + myForm + '/import-text', { text: '1. 入侵 [单选]\nA. 是\nB. 否\n答案：A' })
+    assert(p.status === 403, '不能往别人表单里灌题', p.status + ' ' + JSON.stringify(p.json))
+    p = await call(ck, 'POST', '/api/forms/' + myForm + '/duplicate', {})
+    assert(p.status === 403, '不能复制别人表单（等于抄走题目连答案）', p.status + ' ' + JSON.stringify(p.json))
+    await req('DELETE', '/api/forms/' + myForm)
+    p = await call(ck, 'POST', '/api/forms/' + myForm + '/restore', {})
+    assert(p.status === 403, '不能把别人回收站里的问卷捞回来', p.status + ' ' + JSON.stringify(p.json))
+    p = await call(ck, 'DELETE', '/api/forms/' + myForm + '/purge', {})
+    assert(p.status === 403, '不能彻底删除别人的问卷', p.status + ' ' + JSON.stringify(p.json))
+    await req('POST', '/api/forms/' + myForm + '/restore', {})
+    cookie = saved
+    const kept = await req('GET', '/api/forms/' + myForm)
+    assert(kept.json.data?.title === '只有管理员能看的问卷', '越权的几次尝试都没动到问卷本体')
+
+    // 管理员自锁：内置 admin 权限位不许清空
+    p = await req('PUT', '/api/roles/1', { name: '超级管理员', perms: [] })
+    assert(p.status === 400, '内置超级管理员的权限不可被移除（否则没人能改回来）', p.status + ' ' + JSON.stringify(p.json))
+    p = await req('GET', '/api/roles')
+    assert(p.json.data.find(x => x.code === 'admin').perms.includes('*'), '清空请求被拒后，admin 权限位原样还在')
+
+    // 删角色先检查占用
+    await req('POST', '/api/roles', { name: '临时角色', code: 'tmp_role', perms: ['form:read'] })
+    const tmpRole = (await req('GET', '/api/roles')).json.data.find(x => x.code === 'tmp_role')
+    await req('POST', '/api/users', { username: 'hangon', password: 'hangon-123', role_id: tmpRole.id })
+    p = await req('DELETE', '/api/roles/' + tmpRole.id)
+    assert(p.status === 400, '有人在用的角色不允许删（否则用户挂在不存在的角色上）', p.status + ' ' + JSON.stringify(p.json))
+    const hangon = (await req('GET', '/api/users')).json.data.find(u => u.username === 'hangon')
+    await req('PUT', '/api/users/' + hangon.id, { role_id: 2 })
+    p = await req('DELETE', '/api/roles/' + tmpRole.id)
+    assert(p.status === 200, '角色空出来之后可以正常删除')
+  }
+
   console.log('\n[44] 前端静态资源')
 
   for (const p of ['/', '/js/main.js', '/css/app.css', '/assets/eqs-mark.svg', '/vendor/echarts.min.js']) {
