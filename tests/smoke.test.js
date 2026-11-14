@@ -3288,6 +3288,166 @@ try {
     await req('DELETE', `/api/depts/${d1}`)
   }
 
+  console.log('\n[65] 组织架构取人 + 手工挑题组卷')
+  {
+    const { cascadeFlatLabels } = await import('../web/js/cascade.js')
+
+    // ---- 平铺：单选 / 多选只能放一层，摊平时必须把路径写进选项文字
+    const tree = [
+      { label: '技术中心', value: 'd1', parent: '', kind: 'dept' },
+      { label: '后端组', value: 'd2', parent: 'd1', kind: 'dept' },
+      { label: '张三', value: 'u1', parent: 'd2', kind: 'user' },
+      { label: '李四', value: 'u2', parent: 'd1', kind: 'user' }
+    ]
+    const flat = cascadeFlatLabels(tree)
+    assert(flat.map(o => o.label).join('|') === '技术中心|技术中心 / 后端组|技术中心 / 后端组 / 张三|技术中心 / 李四',
+      '平铺时带完整路径（两行同名也分得清）', flat.map(o => o.label).join('|'))
+    assert(flat.find(o => o.value === 'u1').short === '张三', '另存本级名字，供改名比对用')
+    assert(flat.find(o => o.value === 'u1').depth === 2, '层级深度随路径给出')
+
+    // ---- 接口：组织架构（部门 + 人）
+    const dA = (await req('POST', '/api/depts', { name: '冒烟·运维中心' })).json.id
+    const dB = (await req('POST', '/api/depts', { name: '冒烟·值班组', parent_id: dA })).json.id
+    // 同名两个人：选项文字必须能区分，否则「选了哪个张伟」永远说不清
+    await req('POST', '/api/users', { username: 'org-a', password: 'org-a-pass', nickname: '冒烟·张伟', dept_id: dB })
+    await req('POST', '/api/users', { username: 'org-b', password: 'org-b-pass', nickname: '冒烟·张伟', dept_id: dA })
+    await req('POST', '/api/users', { username: 'org-off', password: 'org-off-pass', nickname: '冒烟·离职的', dept_id: dA, status: 0 })
+
+    const anonOrg = await fetch(BASE + '/api/options/org')
+    assert(anonOrg.status === 401, '未登录读不到组织架构（人员名单不是公开信息）', String(anonOrg.status))
+
+    const org = await req('GET', '/api/options/org')
+    assert(org.status === 200, '组织架构接口可读')
+    const orgList = org.json.data
+    const deptNode = orgList.find(o => o.value === 'd' + dB)
+    assert(deptNode && deptNode.parent === 'd' + dA, '部门层级照旧带 parent', JSON.stringify(deptNode))
+    const dups = orgList.filter(o => String(o.label).startsWith('冒烟·张伟'))
+    assert(dups.length === 2 && dups.every(o => /（@org-[ab]）$/.test(o.label)), '同名的人自动带上 @账号 区分', JSON.stringify(dups.map(o => o.label)))
+    assert(!orgList.some(o => String(o.label).includes('离职的')), '停用账号不进选项名单')
+    // 部门和人各有自增 id，撞号时不能变成同一个值
+    assert(orgList.every(o => /^[du]\d+$/.test(String(o.value))), 'value 带 d / u 前缀，人和部门不会撞号')
+
+    // ---- 表单：单选从组织架构取人，公开页拿到带路径的选项
+    const of = await req('POST', '/api/forms', {
+      title: '冒烟·值班人登记', kind: 'survey', status: 'published',
+      schema: [{ id: 'who', type: 'select', label: '值班人', options: [{ label: '冒烟·张伟', value: 'u2' }], props: { source: 'org' } }]
+    })
+    assert(of.status === 201, '绑组织架构来源的表单创建成功')
+    const ofid = of.json.id
+    const orgSync = await req('POST', `/api/forms/${ofid}/sync-org`, {})
+    assert(orgSync.status === 200, '同步组织架构成功')
+    const who = orgSync.json.schema.find(f => f.id === 'who')
+    assert(who.options.some(o => o.label.includes('冒烟·运维中心 / 冒烟·值班组')), '单选同步后选项带完整路径', JSON.stringify(who.options.slice(-3)))
+    assert(who.options.every(o => !o.parent), '单选不写 parent（只有一层）')
+
+    const orgAgain = await req('POST', `/api/forms/${ofid}/sync-org`, {})
+    assert(orgAgain.json.changed === 0, '没有变化时如实回报 0，不写库')
+
+    // 改名同步成「改名」而不是「删了又加」：历史答卷里的 id 要对得上
+    const users = (await req('GET', '/api/users')).json.data
+    const target = users.find(u => u.username === 'org-a')
+    await req('PUT', `/api/users/${target.id}`, { nickname: '冒烟·张伟（组长）' })
+    const orgRename = await req('POST', `/api/forms/${ofid}/sync-org`, {})
+    const renamedOrg = orgRename.json.changes[0]
+    // 只报「改名」不报「删了又加」：按 value 认项，改个昵称不该让历史答卷失去对应项。
+    // （另一个人同时从「张伟（@org-b）」回到「张伟」——重名消失，去重后缀自然撤掉，也是改名）
+    assert(renamedOrg && renamedOrg.relabeled.length && !renamedOrg.added.length && !renamedOrg.removed.length,
+      '改名同步成「改名」而不是增删', JSON.stringify(renamedOrg))
+    assert(renamedOrg.relabeled.find(r => r.to.includes('冒烟·张伟（组长）'))?.value === 'u' + target.id,
+      '改名的那一项按 value 认出来', JSON.stringify(renamedOrg.relabeled))
+
+    // 停用一个人：选项跟着消失，但已收上来的答卷不该因为名单变了而失效
+    await req('PUT', `/api/users/${target.id}`, { status: 0 })
+    const orgOff = await req('POST', `/api/forms/${ofid}/sync-org`, {})
+    const offField = orgOff.json.schema.find(f => f.id === 'who')
+    assert(!offField.options.some(o => o.value === 'u' + target.id), '停用的人从选项里移除', JSON.stringify(offField.options.length))
+
+    // 公开页仍不下发内部来源标记
+    const pubOrg = await (await fetch(BASE + `/api/public/forms/${ofid}`)).json()
+    assert(pubOrg.data.schema[0].props?.source === undefined, '内部来源标记不下发给浏览器')
+
+    const denyOrgSync = await fetch(BASE + `/api/forms/${ofid}/sync-org`, { method: 'POST', headers: { Cookie: await asUser('org-a', 'org-a-pass'), 'Content-Type': 'application/json' }, body: '{}' })
+    assert(denyOrgSync.status === 403 || denyOrgSync.status === 404 || denyOrgSync.status === 401,
+      '停用账号 / 无权限账号不能同步他人表单', String(denyOrgSync.status))
+
+    // 「选人」的题只列人：选到「技术中心」算选了谁？部门只留在路径里
+    const onlyUsers = await req('POST', '/api/forms', {
+      title: '冒烟·只列人', kind: 'survey', status: 'published',
+      schema: [{ id: 'who2', type: 'radio', label: '值班人', options: [], props: { source: 'org', orgScope: 'users' } }]
+    })
+    const uSync = await req('POST', `/api/forms/${onlyUsers.json.id}/sync-org`, {})
+    const uField = uSync.json.schema.find(f => f.id === 'who2')
+    assert(uField.options.length > 0 && uField.options.every(o => String(o.value).startsWith('u')),
+      'orgScope=users 时只列人，不列部门', JSON.stringify(uField.options.map(o => o.value)))
+    // 没有部门的人（例如管理员）只有一级路径，写不出「/」；有部门的必须写全
+    assert(uField.options.some(o => o.label.includes('冒烟·运维中心 / 冒烟·张伟')),
+      '有部门的人选项文字带完整部门路径', JSON.stringify(uField.options.map(o => o.label).slice(-4)))
+
+    // ---- 挑题检索
+    const pb = await req('POST', '/api/banks', { name: '冒烟·挑题库' })
+    const pbid = pb.json.id
+    await req('POST', `/api/banks/${pbid}/import-text`, { text: '1. 冒烟·HTTP 404 表示资源不存在。 [判断]\n答案：对\n分值：5\n标签：网络\n2. 冒烟·哪些属于 HTTP 方法？ [多选]\nA. GET\nB. POST\nC. TCP\n答案：A,B\n分值：10\n标签：网络\n3. 冒烟·关系型数据库是？ [单选]\nA. Redis\nB. MySQL\n答案：B\n分值：5\n标签：数据库\n' })
+    const gotQs = await req('GET', `/api/banks/${pbid}/questions`)
+    const qIds = gotQs.json.data.map(q => q.id)
+    assert(qIds.length === 3, '三道题都在题库里')
+
+    const search = await req('GET', `/api/questions/search?keyword=HTTP&bankIds=${pbid}`)
+    assert(search.status === 200, '挑题检索接口可读')
+    assert(search.json.total === 2, '关键字命中两题', String(search.json.total))
+    assert(search.json.data.every(q => q.type_label), '带题型文字标签（判断题不会显示成单选）')
+    assert(search.json.data.some(q => q.type_label === '判断题'), '判断题识别成「判断题」')
+    assert(search.json.data.every(q => q.has_answer === true), '带「有没有标准答案」的标记')
+    assert(!('answer' in search.json.data[0]), '检索结果不下发标准答案', JSON.stringify(Object.keys(search.json.data[0])))
+
+    const byTag = await req('GET', `/api/questions/search?tag=数据库&bankIds=${pbid}`)
+    assert(byTag.json.total === 1, '按标签整词筛', String(byTag.json.total))
+    const byType = await req('GET', `/api/questions/search?type=checkbox&bankIds=${pbid}`)
+    assert(byType.json.total === 1 && byType.json.data[0].type === 'checkbox', '按题型筛')
+    const noBank = await req('GET', '/api/questions/search?bankIds=999999')
+    assert(noBank.status === 400, '点名了无权题库时明确拒绝，不偷偷退化成全库', String(noBank.status))
+    const paged = await req('GET', `/api/questions/search?bankIds=${pbid}&pageSize=2`)
+    assert(paged.json.pageSize === 2 && paged.json.totalPages === 2 && paged.json.data.length === 2, '分页可用')
+    const anonSearch = await fetch(BASE + '/api/questions/search')
+    assert(anonSearch.status === 401, '未登录不能跨库检索题目', String(anonSearch.status))
+
+    // ---- 手工挑题组卷
+    const picked = await req('POST', '/api/banks/paper/pick', {
+      title: '冒烟·手工卷', questionIds: [qIds[2], qIds[0]], duration: 45, passPercent: 70
+    })
+    assert(picked.status === 201, '手工组卷成功', JSON.stringify(picked.json).slice(0, 120))
+    assert(picked.json.count === 2, '卷面题数等于勾选数')
+    assert(picked.json.total === 10, '卷面总分按勾选的题算', String(picked.json.total))
+    assert(picked.json.settings.passPercent === 70, '及格线按百分比写进设置')
+    const paperForm = await req('GET', `/api/forms/${picked.json.id}`)
+    const paperSchema = paperForm.json.data.schema
+    // 顺序就是勾选顺序：抽题靠随机，挑题靠的是老师的教学进度
+    assert(paperSchema[0].label === '冒烟·关系型数据库是？' && paperSchema[1].label === '冒烟·HTTP 404 表示资源不存在。',
+      '卷面顺序 = 勾选顺序', paperSchema.map(f => f.label).join('|'))
+    assert(paperSchema[0].answer.length === 1 && paperSchema[0].answer[0] === 'MySQL', '标准答案跟着题一起搬进卷面', JSON.stringify(paperSchema[0].answer))
+    assert(paperSchema[1].type === 'radio' && paperSchema[1].options.map(o => o.value).join() === '正确,错误', '判断题在卷面上仍是正确/错误两项')
+
+    const dupPick = await req('POST', '/api/banks/paper/pick', { questionIds: [qIds[0], qIds[0]] })
+    assert(dupPick.json.count === 1, '重复勾同一题只出一份')
+    const emptyPick = await req('POST', '/api/banks/paper/pick', { questionIds: [] })
+    assert(emptyPick.status === 400, '一道都不选时明确报错', String(emptyPick.status))
+    const missingPick = await req('POST', '/api/banks/paper/pick', { questionIds: [999999] })
+    assert(missingPick.status === 400, '题目已被删除时明确报错', String(missingPick.status))
+
+    // 只读协作者的题库不能拿来出卷（用的还是别人的题）
+    const reader = await asUser('org-b', 'org-b-pass')
+    const readPaper = await call(reader, 'POST', '/api/banks/paper/pick', { questionIds: [qIds[0]] })
+    assert(readPaper.status === 403 || readPaper.status === 404, '无写作权限不能组卷', String(readPaper.status))
+
+    // 没有标准答案的题要提前说明，不要等学生交卷才发现「谁答都错」
+    await req('PUT', `/api/questions/${qIds[1]}`, { answer: [] })
+    const noAns = await req('POST', '/api/banks/paper/pick', { questionIds: [qIds[1]] })
+    assert(noAns.status === 201 && noAns.json.noAnswer.length === 1, '没有标准答案的题在出卷时点出来', JSON.stringify(noAns.json.noAnswer))
+
+    await req('DELETE', `/api/users/${target.id}`)
+    await req('DELETE', `/api/depts/${dB}`)
+    await req('DELETE', `/api/depts/${dA}`)
+  }
+
   console.log('\n[44] 前端静态资源')
 
   for (const p of ['/', '/js/main.js', '/css/app.css', '/js/views/Logs.js', '/js/views/Dicts.js', '/assets/eqs-mark.svg', '/vendor/echarts.min.js']) {

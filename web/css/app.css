@@ -407,3 +407,20 @@ table.table{width:100%;border-collapse:collapse;font-size:13.5px}
   .cas-row-path{white-space:normal}
   .cas-panel{max-height:220px}
 }
+
+/* ============ 挑题组卷 ============
+   几百道题的列表里翻页找题、记题号，等于让人用眼睛做数据库。
+   一行一题，勾选即加入卷面；勾中的行整行变色，序号就是卷面顺序。 */
+.pick-row{
+  display:flex;align-items:flex-start;gap:10px;padding:10px 14px;cursor:pointer;
+  border-bottom:1px solid var(--line-2);
+}
+.pick-row:last-child{border-bottom:none}
+.pick-row:hover{background:var(--panel-2)}
+.pick-row.sel{background:rgba(91,124,250,.07)}
+.pick-row.sel .tag{flex:none}
+/* 窄屏：选项预览本来就长，和序号挤在一行会被压成一条竖线 */
+@media (max-width:560px){
+  .pick-row{padding:10px}
+  .pick-row .tag{margin-left:0}
+}

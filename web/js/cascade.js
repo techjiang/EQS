@@ -265,3 +265,42 @@ export function cascadeMode(field, options) {
   const list = options || normalizeCascade(field?.options)
   return list.length >= 24 ? 'search' : 'select'
 }
+
+/**
+ * 把一棵选项树摊成「一行一个完整路径」的平铺列表。
+ *
+ * 单选 / 多选 / 下拉这类只能放一层选项的组件，也要能「从组织架构取人」——
+ * 但直接把树的节点摊平，选项字面上只剩「张三」，两行同名就分不清是哪个部门的张三。
+ * 所以平铺时把路径写进 label：「技术中心 / 后端组 / 张三」。
+ * value 仍是末级值，判分与统计口径不变。
+ */
+export function cascadeFlatLabels(options, sep = ' / ') {
+  const list = normalizeCascade(options)
+  const byValue = new Map(list.map(o => [o.value, o]))
+  const out = []
+  for (const o of cascadeFlatLabelsOrder(list)) {
+    const node = byValue.get(o.value)
+    if (!node) continue
+    const path = cascadePathOf(list, node.value).map(v => byValue.get(v)?.label || v)
+    out.push({ ...node, label: path.join(sep), short: node.label, depth: path.length - 1 })
+  }
+  return out
+}
+
+/** 深度优先的稳定顺序：父级在前、同级按原顺序，和设计器里看到的一致 */
+function cascadeFlatLabelsOrder(list) {
+  const out = []
+  const used = new Set()
+  const walk = (parent, guard) => {
+    if (guard > 20) return
+    for (const o of cascadeChildren(list, parent)) {
+      if (used.has(o.value)) continue
+      used.add(o.value)
+      out.push(o)
+      walk(o.value, guard + 1)
+    }
+  }
+  walk('', 0)
+  for (const o of list) if (!used.has(o.value)) out.push(o)
+  return out
+}

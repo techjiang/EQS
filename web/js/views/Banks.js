@@ -1,6 +1,6 @@
 import { h, ref, onMounted } from '/vendor/vue.esm.js'
 import { api } from '../api.js'
-import { navigate } from '../router.js'
+import { navigate, route } from '../router.js'
 import { ok, err, confirmBox, Empty, Modal, promptBox, fmtDate } from '../ui.js'
 import { renderControl } from '../renderer.js'
 import { blankField, fieldMeta } from '../fields.js'
@@ -24,6 +24,15 @@ export default {
     const qTag = ref('')
     const memberOpen = ref(false)
     const memberData = ref(null)
+    /*
+     * 手工挑题。
+     *
+     * 「随机抽 10 道」解决的是「给我一份卷子」，可老师真正在做的常常是
+     * 「这次只考这几道」。几百道题的列表里翻页找题、记题号，等于让人用眼睛做数据库。
+     * 这里给一个可搜索、可按题型/标签/题库收窄的多选面板，勾中的顺序就是卷面顺序。
+     */
+    const pickOpen = ref(false)
+    const pick = ref({ keyword: '', type: '', tag: '', bankIds: [], page: 1, chosen: [], total: 0, totalPages: 1, rows: [], title: '', duration: 30, passPercent: 60, loading: false })
     /*
      * my_role 决定这一屏露出哪些按钮。
      * 只读协作者点了才知道不行，比按钮干脆不在更让人恼火；
@@ -111,7 +120,12 @@ export default {
       allTags.value = [...count.entries()].sort((a, b) => b[1] - a[1]).map(([name, n]) => ({ name, n }))
     }
 
-    onMounted(load)
+    onMounted(async () => {
+      await load()
+      // 从「在线考试」点「挑题组卷」进来时直接把这个面板打开：
+      // 让人再找一次入口，等于把上一个页面那颗按钮白点了
+      if (route.value.query?.pick === '1') openPick()
+    })
 
     const createBank = async () => {
       if (!newBank.value.name.trim()) return err('请填写题库名称')
@@ -203,6 +217,66 @@ export default {
     }
     const typeLabelOf = (q) => (isJudgeQ(q) ? '判断题' : fieldMeta(q.type).label)
 
+    /** 搜一页题目（跨题库），已勾选的项不会因为翻页丢失 */
+    const loadPick = async () => {
+      pick.value.loading = true
+      try {
+        const qs = new URLSearchParams({ page: String(pick.value.page), pageSize: '20' })
+        if (pick.value.keyword.trim()) qs.set('keyword', pick.value.keyword.trim())
+        if (pick.value.type) qs.set('type', pick.value.type)
+        if (pick.value.tag) qs.set('tag', pick.value.tag)
+        if (pick.value.bankIds.length) qs.set('bankIds', pick.value.bankIds.join(','))
+        const r = await api.get('/api/questions/search?' + qs)
+        pick.value.rows = r.data
+        pick.value.total = r.total
+        pick.value.totalPages = r.totalPages
+      } catch (e) { err(e.message) } finally { pick.value.loading = false }
+    }
+
+    const openPick = () => {
+      // 默认把当前题库收进范围：人在某个题库里点「挑题」，想的是先看这里面的题
+      pick.value = {
+        ...pick.value, keyword: '', type: '', tag: '', page: 1,
+        bankIds: active.value ? [active.value.id] : [],
+        chosen: [], rows: [], title: (active.value?.name || '') + ' - 手工组卷'
+      }
+      pickOpen.value = true
+      loadPick()
+    }
+
+    /** 勾选就是加进来，取消勾选就是移出去；顺序按勾选先后 */
+    const togglePick = (q) => {
+      const list = pick.value.chosen
+      const at = list.findIndex(x => x.id === q.id)
+      if (at >= 0) list.splice(at, 1)
+      else list.push(q)
+    }
+    const isPicked = (q) => pick.value.chosen.some(x => x.id === q.id)
+    const togglePickBank = (id) => {
+      const set = new Set(pick.value.bankIds)
+      set.has(id) ? set.delete(id) : set.add(id)
+      pick.value.bankIds = [...set]
+      pick.value.page = 1
+      loadPick()
+    }
+
+    const submitPick = async () => {
+      if (!pick.value.chosen.length) return err('请至少勾选一道题')
+      try {
+        const r = await api.post('/api/banks/paper/pick', {
+          title: pick.value.title || '手工组卷',
+          questionIds: pick.value.chosen.map(q => q.id),
+          duration: pick.value.duration,
+          passPercent: pick.value.passPercent
+        })
+        pickOpen.value = false
+        // 没有标准答案的题在自动判分里永远算错：出卷时就说明，不要等学生交卷才发现
+        ok(`已组卷，共 ${r.count} 题，卷面 ${r.total} 分`
+          + (r.noAnswer?.length ? `；其中 ${r.noAnswer.length} 道题没有标准答案，将永远判错：${r.noAnswer.slice(0, 2).join('、')}` : ''))
+        navigate(`/forms/${r.id}/design`)
+      } catch (e) { err(e.message) }
+    }
+
     const makePaper = async () => {
       try {
         const r = await api.post(`/api/banks/${active.value.id}/paper`, paper.value)
@@ -273,6 +347,10 @@ export default {
                 canWrite.value ? h('button', { class: 'btn sm', onClick: addQuestion }, '+ 添加题目') : null,
                 canWrite.value
                   ? h('button', { class: 'btn sm', onClick: () => { paper.value = { ...paper.value, title: active.value?.name + ' - 试卷' }; paperOpen.value = true } }, '智能组卷')
+                  : null,
+                // 随机抽题解决「给我一份 10 题」，挑题解决「这次只考这几道」
+                canWrite.value
+                  ? h('button', { class: 'btn sm', onClick: openPick }, '挑题组卷')
                   : null,
                 h('button', { class: 'btn sm primary', onClick: () => practice('sequence') }, '开始刷题')
               ])
@@ -444,6 +522,111 @@ export default {
         footer: importTab.value === 'text'
           ? [h('button', { class: 'btn', onClick: () => importOpen.value = false }, '取消'), h('button', { class: 'btn primary', onClick: doImport }, '导入')]
           : [h('button', { class: 'btn', onClick: () => importOpen.value = false }, '关闭')]
+      }) : null,
+
+      pickOpen.value ? Modal({
+        title: '挑题组卷', modelValue: true, onClose: () => pickOpen.value = false, wide: true,
+        children: [
+          h('div', { class: 'hint mb' }, '勾选的顺序就是卷面顺序。翻页、改筛选都不会丢掉已勾的题。'),
+          h('div', { class: 'flex wrap', style: 'gap:8px;align-items:flex-end;margin-bottom:10px' }, [
+            h('div', { class: 'field', style: 'margin:0;flex:1;min-width:180px' }, [
+              h('label', {}, '搜题干或标签'),
+              h('input', {
+                class: 'input', value: pick.value.keyword, placeholder: '例如：HTTP',
+                onInput: e => pick.value.keyword = e.target.value,
+                onKeydown: e => { if (e.key === 'Enter') { pick.value.page = 1; loadPick() } }
+              })
+            ]),
+            h('div', { class: 'field', style: 'margin:0' }, [
+              h('label', {}, '题型'),
+              h('select', {
+                class: 'select', value: pick.value.type,
+                onChange: e => { pick.value.type = e.target.value; pick.value.page = 1; loadPick() }
+              }, [
+                h('option', { value: '' }, '全部题型'),
+                // 判断题在库里存成「单选 + 正确/错误」，按 radio 筛就能把它们一起筛出来
+                ...['radio', 'checkbox', 'text', 'textarea'].map(t => h('option', { value: t }, fieldMeta(t).label))
+              ])
+            ]),
+            h('button', { class: 'btn', onClick: () => { pick.value.page = 1; loadPick() } }, '搜索')
+          ]),
+          pick.value.bankIds.length || banks.value.length ? h('div', { class: 'flex wrap', style: 'gap:6px;margin-bottom:10px' }, [
+            h('span', { class: 'small muted', style: 'line-height:28px' }, '题库：'),
+            ...banks.value.filter(b => b.my_role !== 'viewer').map(b => h('button', {
+              class: ['btn', 'sm', pick.value.bankIds.includes(b.id) ? 'primary' : ''],
+              onClick: () => togglePickBank(b.id)
+            }, `${b.name}（${b.question_count}）`)),
+            pick.value.bankIds.length ? h('button', {
+              class: 'btn sm ghost', onClick: () => { pick.value.bankIds = []; pick.value.page = 1; loadPick() }
+            }, '全部题库') : null
+          ]) : null,
+          h('div', { style: 'max-height:340px;overflow:auto;border:1px solid var(--line);border-radius:10px' },
+            pick.value.loading
+              ? h('div', { class: 'center muted', style: 'padding:30px' }, '搜索中…')
+              : pick.value.rows.length
+                ? pick.value.rows.map(q => h('label', {
+                    class: 'pick-row' + (isPicked(q) ? ' sel' : ''), key: q.id
+                  }, [
+                    h('input', {
+                      type: 'checkbox', checked: isPicked(q),
+                      onChange: () => togglePick({ ...q }),
+                      style: 'margin-top:3px;accent-color:var(--brand)'
+                    }),
+                    h('div', { style: 'flex:1;min-width:0' }, [
+                      h('div', { style: 'font-weight:520;margin-bottom:2px' }, q.title),
+                      h('div', { class: 'small muted' }, [
+                        q.bank_name, ' · ', q.type_label, ' · ', `${q.score} 分`,
+                        q.has_answer ? '' : ' · 无标准答案'
+                      ].join('')),
+                      q.options?.length ? h('div', { class: 'small muted truncate' }, q.options.join(' / ')) : null
+                    ]),
+                    // 已勾的题在列表里显示序号：顺序就是卷面顺序，得能看见
+                    isPicked(q) ? h('span', { class: 'tag brand' }, String(pick.value.chosen.findIndex(x => x.id === q.id) + 1)) : null
+                  ]))
+                : h('div', { class: 'center muted', style: 'padding:30px' }, '没有匹配的题目，换个关键字或放开题库范围')
+          ),
+          pick.value.totalPages > 1 ? h('div', { class: 'flex', style: 'justify-content:center;gap:6px;padding:10px' }, [
+            h('button', {
+              class: 'btn sm', disabled: pick.value.page <= 1,
+              onClick: () => { pick.value.page--; loadPick() }
+            }, '上一页'),
+            h('span', { class: 'small muted', style: 'padding:0 8px;line-height:28px' }, `${pick.value.page} / ${pick.value.totalPages}`),
+            h('button', {
+              class: 'btn sm', disabled: pick.value.page >= pick.value.totalPages,
+              onClick: () => { pick.value.page++; loadPick() }
+            }, '下一页')
+          ]) : null,
+          // 已勾选的题排在上面：翻了五六页之后，人需要确认自己到底选了哪些
+          pick.value.chosen.length ? h('div', { class: 'field', style: 'margin-top:12px' }, [
+            h('label', {}, `已选 ${pick.value.chosen.length} 道（合计 ${pick.value.chosen.reduce((a, q) => a + (Number(q.score) || 0), 0)} 分）`),
+            h('div', { class: 'flex wrap', style: 'gap:6px' }, pick.value.chosen.map((q, i) => h('span', {
+              class: 'tag brand', style: 'height:26px;cursor:default'
+            }, [
+              `${i + 1}. ${q.title.length > 16 ? q.title.slice(0, 16) + '…' : q.title}`,
+              h('span', {
+                style: 'cursor:pointer;margin-left:4px', title: '移出',
+                onClick: () => togglePick(q)
+              }, '×')
+            ])))
+          ]) : null,
+          h('div', { class: 'row', style: 'margin-top:12px' }, [
+            h('div', { class: 'field' }, [h('label', {}, '试卷标题'), h('input', {
+              class: 'input', value: pick.value.title, onInput: e => pick.value.title = e.target.value
+            })]),
+            h('div', { class: 'field' }, [h('label', {}, '时长（分钟）'), h('input', {
+              class: 'input', type: 'number', value: pick.value.duration, onInput: e => pick.value.duration = Number(e.target.value)
+            })]),
+            h('div', { class: 'field' }, [h('label', {}, '及格线（%）'), h('input', {
+              class: 'input', type: 'number', min: 1, max: 100, value: pick.value.passPercent,
+              onInput: e => pick.value.passPercent = Number(e.target.value)
+            })])
+          ])
+        ],
+        footer: [
+          h('button', { class: 'btn', onClick: () => pickOpen.value = false }, '取消'),
+          h('button', { class: 'btn primary', onClick: submitPick, disabled: !pick.value.chosen.length },
+            `生成试卷（${pick.value.chosen.length} 题）`)
+        ]
       }) : null,
 
       paperOpen.value ? Modal({

@@ -341,6 +341,69 @@ export default function register(r) {
    * 拿着别人的题库 id 就能往里塞题、改题、删题 —— 实测把管理员题库的题删干净了，
    * 而写接口比读接口更该守门：读丢的是信息，写丢的是数据。
    */
+  /**
+   * 挑题（手工组卷用）。
+   *
+   * 随机抽题解决的是「给我一份 10 题的卷子」，可老师真正在做的往往是
+   * 「这次只考这几道」——几百道题的列表里翻页找，再记下题号，等于让人用眼睛做数据库。
+   * 这里给一个跨题库的检索口：关键字、题型、标签、题库范围，都能一起收窄。
+   *
+   * 不返回标准答案：挑题是「先看清题干再决定」，答案在这一屏没有用处，
+   * 而一旦下发，任何一次挑题都等于把整库答案发到浏览器一次。
+   */
+  r.get('/api/questions/search', async (req, res) => {
+    const user = requireUser(req)
+    const url = new URL(req.url, 'http://x')
+    const vis = visibleBankWhere(user)
+    const allVisible = all(`SELECT b.* FROM banks b WHERE b.deleted_at IS NULL${vis.sql}`, ...vis.args)
+    const visible = allVisible.filter(b => bankRole(user, b) !== 'viewer')
+    const byId = new Map(visible.map(b => [b.id, b]))
+    if (!visible.length) return sendJson(res, 200, { ok: true, data: [], total: 0, banks: [] })
+
+    const where = ['q.deleted_at IS NULL']
+    const args = []
+    const bankParam = url.searchParams.get('bankIds')
+    const asked = bankParam ? bankParam.split(',').map(Number).filter(id => byId.has(id)) : []
+    // 显式点名了题库却一个都不可用：不要静默退化成「全库」
+    if (bankParam && !asked.length) fail(400, '所选题库不存在或无权访问')
+    const ids = asked.length ? asked : [...byId.keys()]
+    where.push(`q.bank_id IN (${ids.map(() => '?').join(',')})`)
+    args.push(...ids)
+
+    const keyword = (url.searchParams.get('keyword') || '').trim()
+    // 题干和标签一起搜：搜「网络」时，题干里没这两个字、但标签写了的题也该出来
+    if (keyword) { where.push('(q.title LIKE ? OR q.tags LIKE ?)'); args.push(`%${keyword}%`, `%${keyword}%`) }
+    const type = url.searchParams.get('type')
+    if (type) { where.push('q.type = ?'); args.push(type) }
+    const tag = (url.searchParams.get('tag') || '').trim()
+    // 标签整词匹配：`LIKE %基础%` 会把「计算机基础」也算进来
+    if (tag) { where.push("(',' || q.tags || ',') LIKE ?"); args.push(`%,${tag},%`) }
+
+    const total = get(`SELECT COUNT(*) c FROM questions q WHERE ${where.join(' AND ')}`, ...args).c
+    const pg = paginate(req, total)
+    const rows = all(`SELECT q.id, q.bank_id, q.type, q.title, q.options, q.answer, q.score, q.tags, q.analysis
+      FROM questions q WHERE ${where.join(' AND ')} ORDER BY q.bank_id, q.id LIMIT ? OFFSET ?`,
+      ...args, pg.pageSize, pg.offset).map(parseQ)
+    sendJson(res, 200, {
+      ok: true,
+      data: rows.map(q => ({
+        id: q.id, bank_id: q.bank_id, bank_name: byId.get(q.bank_id)?.name || '',
+        type: q.type, type_label: isJudgeQuestion(q) ? '判断题' : typeLabelOf(q.type),
+        title: q.title, options: q.options.map(o => o.label), score: q.score, tags: q.tags,
+        // 挑题时要能看出「这题有没有标准答案」：一道没有答案的题进了卷子，谁答都算错
+        has_answer: Array.isArray(q.answer) && q.answer.length > 0
+      })),
+      page: pg.page, pageSize: pg.pageSize, total, totalPages: pg.totalPages,
+      banks: visible.map(b => ({ id: b.id, name: b.name }))
+    })
+  })
+
+  /** 判断题在库里存成 radio + 正确/错误：列表里照 type 显示就是「单选题」 */
+  function isJudgeQuestion(q) {
+    const vals = (q.options || []).map(o => String(o.value ?? o.label))
+    return q.type === 'radio' && vals.length === 2 && vals.includes('正确') && vals.includes('错误')
+  }
+
   r.post('/api/banks/:id/questions', async (req, res, { params }) => {
     const user = requirePerm(req, 'bank:write')
     const bank = writableBank(user, params.id)
@@ -506,6 +569,63 @@ export default function register(r) {
       String(body.title || `${bank.name} - 试卷`).slice(0, 200), body.description || '由题库智能组卷生成', 'exam', JSON.stringify(schema),
       JSON.stringify(settings), 'draft', user.id, ts, ts)
     sendJson(res, 201, { ok: true, id: Number(result.lastInsertRowid), count: schema.length, settings })
+  })
+
+  /**
+   * 手工组卷：按题目 id 出卷。
+   *
+   * 与随机组卷共用同一套「题库 → 卷面」的换算（normalizeField + coerceAnswerToField），
+   * 否则手工挑的题会出现「标准答案是 A、选项是选项一」这种随机组卷已经修过的错。
+   * 顺序就是老师勾选的顺序：抽题靠随机，挑题靠的是他自己的教学进度。
+   */
+  r.post('/api/banks/paper/pick', async (req, res) => {
+    const user = requirePerm(req, 'bank:write')
+    const body = await readJson(req)
+    const ids = [...new Set((Array.isArray(body.questionIds) ? body.questionIds : []).map(Number).filter(Number.isFinite))]
+    if (!ids.length) fail(400, '请至少选择一道题目')
+    if (ids.length > 200) fail(400, '一份卷子最多 200 道题')
+
+    const rows = all(`SELECT * FROM questions WHERE deleted_at IS NULL AND id IN (${ids.map(() => '?').join(',')})`, ...ids)
+    if (!rows.length) fail(400, '所选的题目已被删除')
+    // 按勾选顺序排回去；题库权限逐个校验——只读协作者的题库不能拿来出卷
+    const byId = new Map(rows.map(q => [Number(q.id), q]))
+    const ordered = []
+    const denied = []
+    const missing = []
+    for (const id of ids) {
+      const q = byId.get(id)
+      if (!q) { missing.push(id); continue }
+      const bank = readableBank(user, q.bank_id)
+      if (!bank || bankRole(user, bank) === 'viewer') { denied.push(id); continue }
+      ordered.push(q)
+    }
+    if (denied.length) fail(403, `所选题目中有 ${denied.length} 道来自「只读」题库，无法组卷`)
+    if (!ordered.length) fail(400, '所选的题目已被删除')
+
+    const schema = ordered.map(q => {
+      const p = parseQ(q)
+      const f = normalizeField({ type: p.type, label: p.title, options: p.options, answer: p.answer, analysis: p.analysis, score: p.score, props: p.props })
+      if (!f.answer.length && p.answer?.length) f.answer = p.answer
+      coerceAnswerToField(f)
+      return f
+    })
+    const noAnswer = schema.filter(f => !(f.answer || []).length && Number(f.score) > 0)
+    const settings = { passPercent: clampPercent(body.passPercent), duration: Math.max(0, Number(body.duration) || 0) }
+    const ts = now()
+    const result = run('INSERT INTO forms(title, description, kind, schema, settings, status, created_by, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?)',
+      String(body.title || '手工组卷').slice(0, 200),
+      body.description || `手工挑选 ${schema.length} 道题组卷生成`,
+      'exam', JSON.stringify(schema), JSON.stringify(settings), 'draft', user.id, ts, ts)
+    sendJson(res, 201, {
+      ok: true,
+      id: Number(result.lastInsertRowid),
+      count: schema.length,
+      // 没有标准答案的题在自动判分里永远算错：出卷时就告诉人，不要等学生交卷才发现
+      noAnswer: noAnswer.map(f => f.label),
+      missing,
+      total: schema.reduce((a, f) => a + (Number(f.score) || 0), 0),
+      settings
+    })
   })
 
   /** 跨题库组卷：多个题库按比例抽题，或全库随机 */

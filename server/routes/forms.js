@@ -7,7 +7,8 @@ import { formRole, formVisibleScope, submissionVisibleScope, requireFormRole, me
 import { readXlsxUpload } from './files.js'
 import { parseXlsx, rowsToFields } from '../lib/sheet.js'
 import { itemsToOptions, listItems } from '../lib/dict.js'
-import { deptOptions, deptLabelOf } from '../lib/org.js'
+import { cascadeFlatLabels } from '../../web/js/cascade.js'
+import { deptOptions, deptLabelOf, orgOptions } from '../lib/org.js'
 import fs from 'node:fs'
 import { log } from '../lib/db.js'
 
@@ -302,38 +303,68 @@ export default function register(r) {
     })
   })
 
-  /** 把绑定了部门树的题目按当前组织架构重同步一遍（口径与字典同步一致：按 value 认项） */
-  r.post('/api/forms/:id/sync-depts', async (req, res, { params }) => {
-    const user = requirePerm(req, 'form:update')
-    const form = pickForm(params.id)
-    if (!form) fail(404, '表单不存在')
-    requireFormRole(user, form, 'edit')
-    const opts = deptOptions()
-    const byValue = new Map(opts.map(o => [String(o.value), o]))
+  /** 组织架构（部门 + 人）：单选 / 多选 / 下拉 / 级联都能用 */
+  r.get('/api/options/org', async (req, res) => {
+    requireUser(req)
+    const options = orgOptions()
+    const users = options.filter(o => o.kind === 'user').length
+    // 人的名单是内部信息：只给登录用户看（和部门一致），未登录一律 401
+    sendJson(res, 200, { ok: true, data: options, count: options.length, depts: options.length - users, users })
+  })
+
+  /**
+   * 一道题「取用某个来源」之后，options 该长什么样。
+   *
+   * 级联题要的是树本身（label 只写本级名，parent 串起层级）；
+   * 单选 / 多选 / 下拉只能放一层，直接摊平会把「技术中心 / 后端组 / 张三」
+   * 变成一行「张三」——两行同名就分不清是谁。所以平铺时把完整路径写进 label，
+   * value 仍是末级值，判分、统计、导出口径一个字不变。
+   */
+  function fieldOptionsOf(f, tree, source) {
+    if (f?.type === 'cascader') {
+      return tree.map(o => (o.parent
+        ? { label: o.label, value: String(o.value), parent: String(o.parent) }
+        : { label: o.label, value: String(o.value) }))
+    }
+    /*
+     * 「选人」的题不该把部门也摆成可选项：选到「技术中心」算选了谁？
+     * 所以单选 / 多选 / 下拉支持 orgScope='users'——只列人，部门只出现在路径里。
+     * 路径还是要靠完整树才算得出来，所以先摊平再筛，不是先筛再摊平。
+     */
+    const onlyUsers = source === 'org' && f?.props?.orgScope === 'users'
+    return cascadeFlatLabels(tree)
+      .filter(o => !onlyUsers || String(o.value).startsWith('u'))
+      .map(o => ({ label: o.label, value: String(o.value) }))
+  }
+
+  /** 绑定了某个来源（部门树 / 组织架构）的题目，按来源当前的样子重同步一遍 */
+  function syncSourceOptions(user, form, source) {
+    const opts = source === 'org' ? orgOptions() : deptOptions()
     const schema = JSON.parse(JSON.stringify(form.schema || []))
     const changes = []
     for (const f of schema) {
-      if (f?.props?.source !== 'dept') continue
+      if (f?.props?.source !== source) continue
       const oldOpts = Array.isArray(f.options) ? f.options : []
-      const kept = []
+      const next = fieldOptionsOf(f, opts, source)
+      const nextByValue = new Map(next.map(o => [String(o.value), o]))
+      // 「改名」必须拿**卷面口径**的新选项和旧选项比：单选摊平时 label 是完整路径，
+      // 用来源树上的本级名字去比，每一次同步都会被判成「改名」，人一点同步就看到一堆假变化
+      const relabeled = []
       const removed = []
       for (const o of oldOpts) {
-        // 部门被删掉时，选项跟着消失——留着就是一个「选不到的部门」，
+        // 部门 / 账号被删掉时，选项跟着消失——留着就是一个「选不到的人」，
         // 而历史答卷里的那个 id 仍然认得出来（报表按 id 计数，不按选项列表）
-        const hit = byValue.get(String(o.value))
-        if (hit) kept.push(hit.parent ? { label: hit.label, value: hit.value, parent: hit.parent } : { label: hit.label, value: hit.value })
-        else removed.push(o.label)
+        const hit = nextByValue.get(String(o.value))
+        if (!hit) { removed.push(o.label); continue }
+        if (hit.label !== o.label) relabeled.push({ value: String(o.value), from: o.label, to: hit.label })
       }
       const oldValues = new Set(oldOpts.map(o => String(o.value)))
-      const added = opts.filter(o => !oldValues.has(String(o.value))).map(o => o.label)
-      const relabeled = kept.filter(k => {
-        const before = oldOpts.find(o => String(o.value) === k.value)
-        return before && before.label !== k.label
-      }).map(k => ({ value: k.value, from: oldOpts.find(o => o.value === k.value).label, to: k.label }))
-      const validValues = new Set(opts.map(o => String(o.value)))
+      // 新增项也只报「卷面里新出现的那个名字」
+      const added = next.filter(o => !oldValues.has(String(o.value))).map(o => o.label)
+      const validValues = new Set(next.map(o => String(o.value)))
       const beforeAnswer = Array.isArray(f.answer) ? f.answer.map(String) : []
       const answer = beforeAnswer.filter(v => validValues.has(v))
-      f.options = opts
+      f.options = next
       f.answer = answer
       if (added.length || removed.length || relabeled.length || answer.length !== beforeAnswer.length) {
         changes.push({ field: f.label, added, removed, relabeled, droppedAnswers: beforeAnswer.filter(v => !validValues.has(v)) })
@@ -341,9 +372,29 @@ export default function register(r) {
     }
     if (changes.length) {
       run('UPDATE forms SET schema = ?, updated_at = ? WHERE id = ?', JSON.stringify(schema), now(), form.id)
-      log(user, '同步部门选项', `${form.title} #${form.id}，${changes.length} 道题`)
+      log(user, source === 'org' ? '同步组织架构选项' : '同步部门选项', `${form.title} #${form.id}，${changes.length} 道题`)
     }
-    sendJson(res, 200, { ok: true, changed: changes.length, changes, schema, total: opts.length })
+    return { changes, schema, total: opts.length }
+  }
+
+  /** 把绑定了部门树的题目按当前组织架构重同步一遍（口径与字典同步一致：按 value 认项） */
+  r.post('/api/forms/:id/sync-depts', async (req, res, { params }) => {
+    const user = requirePerm(req, 'form:update')
+    const form = pickForm(params.id)
+    if (!form) fail(404, '表单不存在')
+    requireFormRole(user, form, 'edit')
+    const { changes, schema, total } = syncSourceOptions(user, form, 'dept')
+    sendJson(res, 200, { ok: true, changed: changes.length, changes, schema, total })
+  })
+
+  /** 组织架构（含人）的同步：口径与部门同步一致 */
+  r.post('/api/forms/:id/sync-org', async (req, res, { params }) => {
+    const user = requirePerm(req, 'form:update')
+    const form = pickForm(params.id)
+    if (!form) fail(404, '表单不存在')
+    requireFormRole(user, form, 'edit')
+    const { changes, schema, total } = syncSourceOptions(user, form, 'org')
+    sendJson(res, 200, { ok: true, changed: changes.length, changes, schema, total })
   })
 
   /* ---------------- 表单协作 ---------------- */

@@ -6,7 +6,7 @@ import { ok, err, confirmBox, promptBox } from '../ui.js'
 import { FIELD_GROUPS, blankField, fieldMeta, hasOptions, defaultData, uid } from '../fields.js'
 import { renderControl, FormRenderer, fieldVisible } from '../renderer.js'
 import { OP_LABELS } from '../flow.js'
-import { cascadeFlat, cascadeChildren, cascadeDepth, pruneCascade, deptTreeToOptions } from '../cascade.js'
+import { cascadeFlat, cascadeChildren, cascadeDepth, pruneCascade, deptTreeToOptions, cascadeFlatLabels } from '../cascade.js'
 import { state } from '../store.js'
 
 
@@ -48,6 +48,8 @@ export default {
     const dictPick = ref('')
     // 部门树：级联题的另一个选项来源。部门本身在用户管理里维护，这里只读取
     const depts = ref([])
+    // 组织架构（部门 + 人）：部门树只到「哪个部门」，很多题真正要选的是「谁」
+    const org = ref([])
 
     const load = async () => {
       try {
@@ -64,6 +66,8 @@ export default {
       // 拿不到部门不该挡住设计器：和字典一样，这是「少写一遍」的便利，不是必需能力
       const d = await api.get('/api/options/depts').catch(() => ({ data: [] }))
       depts.value = d.data || []
+      const o = await api.get('/api/options/org').catch(() => ({ data: [] }))
+      org.value = o.data || []
     })
 
     const active = computed(() => form.value.schema[activeIdx.value] || null)
@@ -376,6 +380,87 @@ export default {
       } catch (e) { err(e.message) }
     }
 
+    /**
+     * 从组织架构取用（部门 + 人）。
+     *
+     * 上一轮做到「能按部门报事」，可很多题真正要选的是具体的人：值班人、审批人、被评价的同事。
+     * 人早就挂在部门树下（用户管理里的 dept_id），不该在问卷里再手敲一遍名单。
+     *
+     * 取舍与字典、部门一致：**写快照，不写引用**。
+     * 人员调动、离职、改名都不该静默改动一张已经收回来几千份的问卷。
+     */
+    const applyOrg = async ({ silent = false } = {}) => {
+      const f = active.value
+      if (!f) return
+      if (!org.value.length) return err('组织架构里还没有人，先去「用户权限」建一个账号')
+      const tree = org.value
+      const old = new Set((f.answer || []).map(String))
+      if (f.type === 'cascader') {
+        f.options = tree.map(o => (o.parent
+          ? { label: o.label, value: String(o.value), parent: String(o.parent) }
+          : { label: o.label, value: String(o.value) }))
+      } else {
+        // 单选 / 多选 / 下拉只有一层：摊平的时候把完整路径写进选项文字，
+        // 否则两行「张伟」谁也分不清是哪个部门的
+        f.options = cascadeFlatLabels(tree)
+          .filter(o => f.props?.orgScope !== 'users' || String(o.value).startsWith('u'))
+          .map(o => ({ label: o.label, value: String(o.value) }))
+      }
+      f.answer = (f.answer || []).filter(a => f.options.some(o => String(o.value) === String(a)))
+      f.props = { ...(f.props || {}), source: 'org' }
+      const who = f.options.filter(o => String(o.value).startsWith('u')).length
+      if (silent) return
+      // 一百多人摊成一屏单选，比手填还难用：超过 20 项直接建议改用「级联选择 + 搜索式」
+      const many = f.type !== 'cascader' && f.options.length > 20
+      ok(`已从组织架构取用 ${f.options.length} 项（${f.options.length - who} 个部门 / ${who} 个人）`
+        + (many ? '；选项较多，建议换成「级联选择」并选搜索式控件，作答时可直接搜名字' : '')
+        + (old.size && f.answer.length !== old.size ? '；有标准答案的人已不存在，已清空' : ''))
+    }
+
+    const syncOrg = async () => {
+      try {
+        const r = await api.post(`/api/forms/${id}/sync-org`, {})
+        if (!r.changed) return ok('组织架构和卷面已经一致，没有需要同步的')
+        const c = r.changes[0] || {}
+        const bits = []
+        if (c.added?.length) bits.push(`新增 ${c.added.length} 项`)
+        if (c.removed?.length) bits.push(`移除 ${c.removed.length} 项`)
+        if (c.relabeled?.length) bits.push(`改名 ${c.relabeled.length} 项`)
+        if (c.droppedAnswers?.length) bits.push(`${c.droppedAnswers.length} 个标准答案已失效`)
+        ok('已同步：' + bits.join('，'))
+        form.value.schema = r.schema
+      } catch (e) { err(e.message) }
+    }
+
+    /** 「来源：部门树 / 组织架构」这一条提示条，两处检查器共用 */
+    const sourceBadge = (f) => {
+      const src = f.props?.source
+      if (src !== 'dept' && src !== 'org') return null
+      const orgMode = src === 'org'
+      /*
+       * 「选人」的题不该把部门也摆成可选项：选到「技术中心」算选了谁？
+       * 但「报事」的题又确实只想选部门——所以给一个开关，而不是替人决定。
+       * 级联题不需要它：那一题本来就是「层级里选一个」，部门是路径上的必经之站。
+       */
+      const scopeSwitch = orgMode && f.type !== 'cascader'
+        ? h('button', {
+            class: 'btn ghost sm',
+            title: '开启后单选 / 多选 / 下拉里只出现具体的人，部门只留在路径中',
+            onClick: () => {
+              const only = f.props?.orgScope === 'users'
+              f.props = { ...(f.props || {}), orgScope: only ? undefined : 'users' }
+              applyOrg({ silent: true })
+            }
+          }, f.props?.orgScope === 'users' ? '只列人 ✓' : '只列人')
+        : null
+      return h('div', { class: 'dict-badge', style: 'margin-bottom:8px' }, [
+        h('span', { class: 'tag brand' }, orgMode ? '来源：组织架构' : '来源：部门树'),
+        h('button', { class: 'btn ghost sm', onClick: () => (orgMode ? syncOrg() : syncDepts()) }, '同步'),
+        scopeSwitch,
+        h('button', { class: 'btn ghost sm', onClick: () => unbindSource(f) }, '解除')
+      ])
+    }
+
     const unbindSource = (f) => {
       const p = { ...(f.props || {}) }
       delete p.source
@@ -414,15 +499,17 @@ export default {
         f.options.push({ label: `${base} ${n}`, value: `${base} ${n}`, parent: item ? item.value : '' })
       }
       return h('div', { class: 'field' }, [
-        h('label', { class: 'flex between' }, [
-          h('span', {}, `级联选项${depth ? `（${depth} 层）` : ''}`),
-          h('div', { class: 'flex', style: 'gap:4px' }, [
+        h('label', { class: 'flex between wrap', style: 'gap:6px' }, [
+          h('span', { style: 'flex:none' }, `级联选项${depth ? `（${depth} 层）` : ''}`),
+          h('div', { class: 'flex wrap', style: 'gap:4px' }, [
             dicts.value.length ? h('select', {
               class: 'select', style: 'height:26px;width:auto;font-size:12px;padding:0 6px',
               value: '', onChange: e => { const c = e.target.value; e.target.value = ''; if (c) applyDict(c) }
             }, [h('option', { value: '' }, '从字典取用…'), ...dicts.value.map(d => h('option', { value: d.code }, d.name))]) : null,
             // 部门树是系统里已经存在的组织结构，不该为了「选部门」在问卷里再手工敲一遍
             h('button', { class: 'btn ghost sm', onClick: () => applyDepts() }, '从部门取用'),
+            // 级联里的「人」是叶子：技术中心 / 后端组 / 张三，选到人就是最末一级
+            h('button', { class: 'btn ghost sm', onClick: () => applyOrg() }, '从组织架构取人'),
             h('button', { class: 'btn ghost sm', onClick: () => addChild(null) }, '+ 顶级')
           ])
         ]),
@@ -439,11 +526,7 @@ export default {
           ]),
           h('div', { class: 'hint' }, '四级以上、几百个节点时下拉翻不动；搜索式输入关键字可直接落到某一级，作答仍只存末级值。')
         ]),
-        f.props?.source === 'dept' ? h('div', { class: 'dict-badge', style: 'margin-bottom:8px' }, [
-          h('span', { class: 'tag brand' }, '来源：部门树'),
-          h('button', { class: 'btn ghost sm', onClick: () => syncDepts() }, '同步'),
-          h('button', { class: 'btn ghost sm', onClick: () => unbindSource(f) }, '解除')
-        ]) : null,
+        sourceBadge(f),
         f.props?.dict ? h('div', { class: 'dict-badge', style: 'margin-bottom:8px' }, [
           h('span', { class: 'tag brand' }, '字典：' + (dicts.value.find(d => d.code === f.props.dict)?.name || f.props.dict)),
           h('button', { class: 'btn ghost sm', onClick: () => syncDict(f) }, '同步'),
@@ -492,9 +575,11 @@ export default {
         row('说明', h('input', { class: 'input', value: f.description, placeholder: '题目下方的说明', onInput: e => f.description = e.target.value })),
         f.type === 'cascader' ? cascaderInspector(f) : null,
         hasOptions(f.type) && f.type !== 'matrix' && f.type !== 'cascader' ? h('div', { class: 'field' }, [
-          h('label', { class: 'flex between' }, [
-            h('span', {}, '选项'),
-            h('div', { class: 'flex', style: 'gap:4px' }, [
+          // 三个来源按钮（字典 / 部门 / 组织架构）放在 300px 宽的检查器里会挤出边框，
+          // 允许换行：挤出去的那半个按钮，等于这个功能不存在
+          h('label', { class: 'flex between wrap', style: 'gap:6px' }, [
+            h('span', { style: 'flex:none' }, '选项'),
+            h('div', { class: 'flex wrap', style: 'gap:4px' }, [
               dicts.value.length ? h('select', {
                 class: 'select', style: 'height:26px;width:auto;font-size:12px;padding:0 6px',
                 value: '', onChange: e => { const c = e.target.value; e.target.value = ''; if (c) applyDict(c) }
@@ -502,14 +587,12 @@ export default {
               // 单选 / 下拉里也常要「按部门选」，同样不该手工抄一遍组织架构
               ['radio', 'select', 'checkbox'].includes(f.type)
                 ? h('button', { class: 'btn ghost sm', onClick: () => applyDepts() }, '从部门取用') : null,
+              ['radio', 'select', 'checkbox'].includes(f.type)
+                ? h('button', { class: 'btn ghost sm', onClick: () => applyOrg() }, '从组织架构取人') : null,
               h('button', { class: 'btn ghost sm', onClick: addOption }, '+ 添加')
             ])
           ]),
-          f.props?.source === 'dept' ? h('div', { class: 'dict-badge', style: 'margin-bottom:8px' }, [
-            h('span', { class: 'tag brand' }, '来源：部门树'),
-            h('button', { class: 'btn ghost sm', onClick: () => syncDepts() }, '同步'),
-            h('button', { class: 'btn ghost sm', onClick: () => unbindSource(f) }, '解除')
-          ]) : null,
+          sourceBadge(f),
           f.props?.dict ? h('div', { class: 'dict-badge', style: 'margin-bottom:8px' }, [
             h('span', { class: 'tag brand' }, '字典：' + (dicts.value.find(d => d.code === f.props.dict)?.name || f.props.dict)),
             h('button', { class: 'btn ghost sm', onClick: () => syncDict(f) }, '同步'),

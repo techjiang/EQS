@@ -97,6 +97,8 @@ export default {
         h('div', {}, [h('h1', {}, '在线考试'), h('div', { class: 'sub' }, '题库组卷、自动评分、成绩统计与排名')]),
         h('div', { class: 'flex' }, [
           h('button', { class: 'btn', onClick: () => navigate('/banks') }, '管理题库'),
+          // 「这次只考这几道」比「随机抽 10 道」更常见，入口放在这里，不用先想「题库里有没有」
+          h('button', { class: 'btn', onClick: () => navigate('/banks?pick=1') }, '挑题组卷'),
           h('button', { class: 'btn primary', onClick: () => showNew.value = true }, '+ 新建考试')
         ])
       ]),
