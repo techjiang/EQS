@@ -3186,6 +3186,108 @@ try {
     assert(gzAfter && gzAfter.parent === 'gd', '字典同步后层级仍在（不会塌成平铺）', JSON.stringify(gzAfter))
   }
 
+  console.log('\n[64] 搜索式级联 + 部门树作为选项来源')
+  {
+    const { cascadeSearch, cascadeMode, deptTreeToOptions } = await import('../web/js/cascade.js')
+
+    const tree = [
+      { label: '浙江省', value: 'zj' },
+      { label: '杭州市', value: 'hz', parent: 'zj' },
+      { label: '西湖区', value: 'xh', parent: 'hz' },
+      { label: '拱墅区', value: 'gs', parent: 'hz' },
+      { label: '江苏省', value: 'js' },
+      { label: '南京市', value: 'nj', parent: 'js' }
+    ]
+    // 搜「杭州」要能连它下面的区一起找到：人找东西是按「杭州市下面的区」想的
+    const hitHz = cascadeSearch(tree, '杭州')
+    assert(hitHz.map(h => h.value).join() === 'hz,xh,gs', '搜索命中该层及其所有下级', hitHz.map(h => h.value).join())
+    assert(hitHz[0].path.join('/') === '浙江省/杭州市', '结果带完整路径（不然「西湖区」看不出是哪儿）')
+    // 命中层级浅的排前面：搜「浙江」时省本身第一，而不是它的区县顶上来
+    const hitZj = cascadeSearch(tree, '浙江')
+    assert(hitZj[0].value === 'zj', '命中层级越浅排越前', hitZj.map(h => h.value).join())
+    assert(cascadeSearch(tree, '').length === 0, '空关键字不返回一堆结果')
+    assert(cascadeSearch(tree, '不存在的地方').length === 0, '无匹配时返回空')
+    // value 也要能搜：字典里的存储值常是英文短码
+    assert(cascadeSearch(tree, 'xh').map(h => h.value).join() === 'xh', '存储值也能被搜到')
+    const limited = cascadeSearch(tree, '区', { limit: 1 })
+    assert(limited.length === 1, 'limit 生效')
+    // 搜到的是中间层时，要能告诉人「它下面还有 N 级」
+    const mid = cascadeSearch(tree, '杭州市')[0]
+    assert(mid.depth === 1 && mid.children === 2, '结果里带「下面还有几个子项」', JSON.stringify(mid))
+    const leafHit = cascadeSearch(tree, '西湖')[0]
+    assert(leafHit.children === 0, '末级项不带子项计数')
+
+    // 控件按规模自动选：选项少时下拉本来就好用，塞个搜索框只是让人多点一次
+    assert(cascadeMode({ props: {} }, tree) === 'select', '选项少时默认层级下拉')
+    const big = Array.from({ length: 30 }, (_, i) => ({ label: '项 ' + i, value: 'v' + i }))
+    assert(cascadeMode({ props: {} }, big) === 'search', '选项多时自动换成搜索式')
+    assert(cascadeMode({ props: { picker: 'select' } }, big) === 'select', '显式配置优先于规模判断')
+    assert(cascadeMode({ props: { picker: 'search' } }, tree) === 'search', '显式搜索配置在小树上也生效')
+
+    // 部门树 → 级联选项：value 用 id，部门改名不该让历史答卷失去对应项
+    const opts = deptTreeToOptions([
+      { id: 1, name: '技术中心', parent_id: 0, sort: 0 },
+      { id: 2, name: '后端组', parent_id: 1, sort: 0 },
+      { id: 3, name: '孤儿部门', parent_id: 99, sort: 0 }
+    ])
+    assert(opts.length === 3, '部门一个不丢')
+    assert(opts.find(o => o.value === '2').parent === '1', '部门层级换算成 parent')
+    assert(opts.find(o => o.value === '3').parent === '', '上级已不存在的部门退化成顶级')
+
+    // ---- 接口：部门选项来源
+    const deptOpts = await req('GET', '/api/options/depts')
+    assert(deptOpts.status === 200, '部门选项接口可读', String(deptOpts.status))
+    const anonDept = await fetch(BASE + '/api/options/depts')
+    assert(anonDept.status === 401, '未登录不能读部门选项（组织架构不是公开信息）')
+
+    const d1 = (await req('POST', '/api/depts', { name: '冒烟·研发中心' })).json.id
+    const d2 = (await req('POST', '/api/depts', { name: '冒烟·平台组', parent_id: d1 })).json.id
+    const gotDept = await req('GET', '/api/options/depts')
+    assert(gotDept.json.data.some(o => o.value === String(d2) && o.parent === String(d1)), '部门选项带层级', JSON.stringify(gotDept.json.data.slice(-3)))
+
+    // ---- 表单：绑部门来源的题，同步后跟着组织架构走
+    const df = await req('POST', '/api/forms', {
+      title: '按部门报名', kind: 'survey', status: 'published',
+      schema: [{
+        id: 'dp', type: 'cascader', label: '所属部门', required: true,
+        options: [{ label: '冒烟·研发中心', value: String(d1) }],
+        props: { source: 'dept' }
+      }]
+    })
+    assert(df.status === 201, '绑部门来源的表单创建成功')
+    const dfid = df.json.id
+    const sync1 = await req('POST', `/api/forms/${dfid}/sync-depts`, {})
+    assert(sync1.status === 200, '同步部门选项成功')
+    const dpField = sync1.json.schema.find(f => f.id === 'dp')
+    assert(dpField.options.some(o => o.value === String(d2) && o.parent === String(d1)), '同步后新增的下级部门带层级进来', JSON.stringify(dpField.options))
+    const sync2 = await req('POST', `/api/forms/${dfid}/sync-depts`, {})
+    assert(sync2.json.changed === 0, '没有变化时不再写库、如实回报')
+
+    // 改名：按 value 认项，只改显示名
+    await req('PUT', `/api/depts/${d2}`, { name: '冒烟·平台组（改名）' })
+    const sync3 = await req('POST', `/api/forms/${dfid}/sync-depts`, {})
+    const renamed = sync3.json.changes[0]
+    assert(renamed && renamed.relabeled.length === 1 && renamed.relabeled[0].from === '冒烟·平台组', '部门改名同步成「改名」而不是「增删」', JSON.stringify(renamed))
+
+    // 公开页下发的 props 要带 picker，否则设计器配了搜索、填写页还是下拉
+    await req('PUT', `/api/forms/${dfid}`, {
+      schema: [{ ...dpField, props: { ...dpField.props, picker: 'search' } }]
+    })
+    const pubDf = await (await fetch(BASE + `/api/public/forms/${dfid}`)).json()
+    const pubDp = pubDf.data.schema.find(f => f.id === 'dp')
+    assert(pubDp.props?.picker === 'search', '公开页拿到作答控件配置', JSON.stringify(pubDp.props))
+    // 部门来源这类标记不该跟着下发到浏览器：内部口径，与作答无关
+    assert(pubDp.props?.source === undefined, '内部来源标记不下发给浏览器')
+
+    // 普通用户不能改别人的表单（同步接口同样要走表单权限）
+    const ck3 = await asUser('dictuser', 'dict-pass-123')
+    const denySync = await fetch(BASE + `/api/forms/${dfid}/sync-depts`, { method: 'POST', headers: { Cookie: ck3, 'Content-Type': 'application/json' }, body: '{}' })
+    assert(denySync.status === 403 || denySync.status === 404, '普通用户不能同步他人的表单部门选项', String(denySync.status))
+
+    await req('DELETE', `/api/depts/${d2}`)
+    await req('DELETE', `/api/depts/${d1}`)
+  }
+
   console.log('\n[44] 前端静态资源')
 
   for (const p of ['/', '/js/main.js', '/css/app.css', '/js/views/Logs.js', '/js/views/Dicts.js', '/assets/eqs-mark.svg', '/vendor/echarts.min.js']) {

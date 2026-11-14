@@ -168,3 +168,100 @@ export function pruneCascade(options) {
   })
   return normalizeCascade(kept)
 }
+
+/* ------------------------------------------------------------------
+ * 搜索式选择。
+ *
+ * 三级下拉（省 / 市 / 区）翻起来还行，四级以上就不好用了：行业分类动辄几百个节点，
+ * 用户知道自己要「西湖区」，却得先在下拉里翻到浙江省、再翻到杭州市——
+ * 也就是说，他把答案打在输入框里的那两秒，比在下拉里翻三层快得多。
+ *
+ * 所以搜索在这里不是「加个过滤框」，而是另一条完整的作答路径：
+ * 输入关键字 → 直接给出可点的完整路径 → 一次点击选中末级值。
+ * 作答仍然只存末级那个 value，判分、必填、条件逻辑、统计口径一个字没变。
+ * ------------------------------------------------------------------ */
+
+/** 关键字归一：全角空格、大小写都不该影响搜索 */
+const normKw = (s) => String(s ?? '').trim().toLowerCase()
+
+/**
+ * 在选项树里搜。
+ *
+ * 命中范围包括**路径上的任何一层**：搜「杭州」要能找到「杭州市 / 西湖区」，
+ * 因为「杭州市下面的区」正是人找东西的方式。命中的那一级用 hit 标出来，
+ * 前端据此把人搜的那个词高亮，否则一屏都是完整路径，看不出为什么这条会出现。
+ *
+ * 结果按「匹配层级浅的在前、同层按原顺序」排：搜「浙江」时省本身排第一，
+ * 而不是把它的二十个区县顶到前面。
+ */
+export function cascadeSearch(options, keyword, { limit = 20 } = {}) {
+  const kw = normKw(keyword)
+  if (!kw) return []
+  const list = normalizeCascade(options)
+  const byValue = new Map(list.map(o => [o.value, o]))
+  const hits = []
+  for (const o of list) {
+    const path = cascadePathOf(list, o.value)
+    if (!path.length) continue
+    const nodes = path.map(v => byValue.get(v)).filter(Boolean)
+    const at = nodes.findIndex(n => String(n.label || '').toLowerCase().includes(kw))
+    // 也认 value：从字典导入时 value 往往是英文短码（zhejiang / xihu），
+    // 只认 label 的话「xihu」一个字都搜不到
+    if (at < 0 && !String(o.value).toLowerCase().includes(kw)) continue
+    hits.push({
+      value: o.value,
+      label: o.label,
+      path: nodes.map(n => n.label || n.value),
+      depth: nodes.length - 1,
+      // 这条下面还有几个子项：命中的是「杭州市」而不是「西湖区」时，
+      // 界面上要说一句「含 2 个下级」，否则人以为自己选到了区
+      children: cascadeChildren(list, o.value).length,
+      hit: at >= 0 ? at : nodes.length - 1,
+      // 命中越浅排越前：搜「浙江」时省本身第一，而不是它的区县
+      rank: at >= 0 ? at : nodes.length
+    })
+  }
+  hits.sort((a, b) => (a.rank - b.rank) || (a.depth - b.depth))
+  return limit > 0 ? hits.slice(0, limit) : hits
+}
+
+/**
+ * 部门树 → 级联选项。
+ *
+ * 「按部门选人」这件事以前只能手填，而部门树早就在系统里维护着了：
+ * 一份组织架构既要在用户管理里管，又要在问卷里再抄一遍，迟早两份不一样。
+ *
+ * value 用部门 id 的字符串：部门改名不该让历史答卷里的值失去对应项，
+ * 而 id 是唯一稳定的东西（改名在字典那一轮已经踩过一次「改个错别字把答卷弄丢」）。
+ */
+export function deptTreeToOptions(depts) {
+  const rows = (depts || []).filter(d => d && d.id !== undefined && d.id !== null)
+  const ids = new Set(rows.map(d => String(d.id)))
+  const options = rows.map(d => {
+    const parent = String(d.parent_id ?? d.parentId ?? 0)
+    // 上级已经不在列表里（部门被删了）就落到顶级：宁可少一层缩进，不能让部门在选择器里消失
+    return { label: String(d.name ?? d.label ?? d.id), value: String(d.id), parent: parent === '0' || !ids.has(parent) ? '' : parent }
+  })
+  return normalizeCascade(options)
+}
+
+/** 一个值在部门树里的完整路径（导出、详情里给人看） */
+export function deptLabelPath(depts, value) {
+  return cascadeLabelPath(deptTreeToOptions(depts), value)
+}
+
+/**
+ * 这道题该用哪种作答控件。
+ *
+ * 不是「新功能默认打开」：选项很少时（性别、学历三级）下拉本来就好用，
+ * 硬塞一个搜索框只会让人多点一次。所以按规模走：
+ *   - 显式配了 picker 就听配置（设计器里的开关）；
+ *   - 否则节点数到 24 就换搜索——24 是一屏下拉翻到底的临界点，
+ *     再多就得靠输入关键字，而不是靠往下滚。
+ */
+export function cascadeMode(field, options) {
+  const want = field?.props?.picker
+  if (want === 'search' || want === 'select') return want
+  const list = options || normalizeCascade(field?.options)
+  return list.length >= 24 ? 'search' : 'select'
+}

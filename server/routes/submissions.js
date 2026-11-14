@@ -774,7 +774,10 @@ const PUBLIC_PROP_KEYS = [
   'minLength', 'maxLength', 'unit', 'precision', 'labels', 'placeholder',
   // 计算题的公式要下发：浏览器要在答题过程中实时算给用户看。
   // 公式本身不含答案（引用的是别的题），但服务端仍会重算一遍再入库，不采信客户端算的数
-  'formula'
+  'formula',
+  // 级联的作答控件（层级下拉 / 搜索式）是外观选择，与答案无关；
+  // 不下发的话，设计器里配成搜索、公开页还是一排下拉
+  'picker'
 ]
 
 export function publicFieldProps(field = {}) {

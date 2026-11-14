@@ -51,6 +51,10 @@ export default {
         if (!q.series?.length) continue
         const el = document.getElementById('chart_' + q.id)
         if (!el) continue
+        // 横向条形图的高度得跟着类目数长：固定 280px 时十几项会挤成一条条线
+        const rowCount = q.series.length
+        const wantHorizontal = chartType.value === 'bar' && rowCount > 7
+        el.style.height = wantHorizontal ? Math.max(260, rowCount * 26 + 44) + 'px' : '280px'
         const chart = window.echarts.init(el, null, { renderer: 'canvas' })
         charts.push(chart)
         // 级联这类「完整路径很长」的题，图上用短名，悬停给全路径
@@ -59,6 +63,13 @@ export default {
         const values = q.series.map(s => s.value)
         const isPie = ['radio', 'select', 'carousel', 'checkbox'].includes(q.type) && q.series.length <= 8
         const hasData = q.series.some(s2 => Number(s2.value) > 0)
+        /*
+         * 类目一多，竖着画就没法看了：级联题（末级选项十几二十个）在卡片宽度里
+         * 标签只能斜到 38 度，然后互相压成一团黑——「企业管」和「数据」叠在一起，
+         * 谁也不知道哪根柱子是哪一项。类目多时换成横向条形图，
+         * 标签横着写、从左边留出宽度，一眼就能读完。
+         */
+        const horizontal = chartType.value === 'bar' && names.length > 7
         // 全零时饼图画出来是空白，退回柱状图让人看出「这一题还没人选」
         const type = chartType.value === 'pie' && isPie && hasData ? 'pie' : chartType.value === 'line' ? 'line' : 'bar'
         const opt = type === 'pie'
@@ -70,6 +81,24 @@ export default {
                 type: 'pie', radius: ['42%', '68%'], center: ['50%', '44%'],
                 data: q.series.filter(s2 => s2.value > 0).map(s2 => ({ name: s2.name, value: s2.value, full: s2.full || s2.name, itemStyle: { color: PALETTE[q.series.indexOf(s2) % PALETTE.length] } })),
                 label: { color: axisColor, fontSize: 11 }
+              }]
+            }
+          : horizontal
+          ? {
+              color: [PALETTE[0]],
+              // 横向条形图的类目轴在 y 上，标签横着写不用旋：高度随类目数长，
+              // 每项至少 22px，否则十几项挤在 200px 里等于没画
+              grid: { left: 8, right: 28, top: 12, bottom: 8, containLabel: true },
+              tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' }, formatter: (ps) => ps.map(p => `${fullNames[p.dataIndex] ?? p.name}: ${p.value}`).join('<br/>') },
+              xAxis: { type: 'value', minInterval: 1, axisLabel: { color: axisColor, fontSize: 11 }, splitLine: { lineStyle: { color: splitColor } } },
+              yAxis: {
+                type: 'category', data: names, inverse: true,
+                axisLabel: { color: axisColor, fontSize: 11, interval: 0, width: 96, overflow: 'truncate' },
+                axisLine: { lineStyle: { color: splitColor } }
+              },
+              series: [{
+                type: 'bar', data: values, barMaxWidth: 16,
+                itemStyle: { borderRadius: [0, 6, 6, 0], color: PALETTE[0] }
               }]
             }
           : {

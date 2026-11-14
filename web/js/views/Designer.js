@@ -6,7 +6,7 @@ import { ok, err, confirmBox, promptBox } from '../ui.js'
 import { FIELD_GROUPS, blankField, fieldMeta, hasOptions, defaultData, uid } from '../fields.js'
 import { renderControl, FormRenderer, fieldVisible } from '../renderer.js'
 import { OP_LABELS } from '../flow.js'
-import { cascadeFlat, cascadeChildren, cascadeDepth, pruneCascade } from '../cascade.js'
+import { cascadeFlat, cascadeChildren, cascadeDepth, pruneCascade, deptTreeToOptions } from '../cascade.js'
 import { state } from '../store.js'
 
 
@@ -46,6 +46,8 @@ export default {
     // 字典选项：设计器里给选择题绑定一套字典，绑定时把选项写成快照
     const dicts = ref([])
     const dictPick = ref('')
+    // 部门树：级联题的另一个选项来源。部门本身在用户管理里维护，这里只读取
+    const depts = ref([])
 
     const load = async () => {
       try {
@@ -59,6 +61,9 @@ export default {
       // 字典拿不到不该挡住设计器本身：这只是「选项少写几遍」的便利，不是必需能力
       const r = await api.get('/api/dicts').catch(() => ({ data: [] }))
       dicts.value = r.data || []
+      // 拿不到部门不该挡住设计器：和字典一样，这是「少写一遍」的便利，不是必需能力
+      const d = await api.get('/api/options/depts').catch(() => ({ data: [] }))
+      depts.value = d.data || []
     })
 
     const active = computed(() => form.value.schema[activeIdx.value] || null)
@@ -336,6 +341,47 @@ export default {
       f.props = p
     }
 
+    /**
+     * 从部门树取用选项。
+     *
+     * 和字典同一套取舍：写的是**快照**，不是引用。部门调整（合并、改名、撤销）
+     * 不该静默改动一张已经收回来几千份的问卷——历史答卷里的部门 id 要对得上，
+     * 报表里那一档不能凭空消失。什么时候同步由人点。
+     */
+    const applyDepts = async () => {
+      const f = active.value
+      if (!f) return
+      const opts = deptTreeToOptions(depts.value)
+      if (!opts.length) return err('还没有部门，先去「用户管理 → 部门」建一个')
+      const old = new Set((f.answer || []).map(String))
+      const keep = opts.filter(o => old.has(String(o.value))).length
+      f.options = opts
+      f.answer = (f.answer || []).filter(a => opts.some(o => String(o.value) === String(a)))
+      f.props = { ...(f.props || {}), source: 'dept' }
+      ok(`已从部门取用 ${opts.length} 个选项` + (keep !== old.size ? '；有标准答案的部门已不存在，已清空' : ''))
+    }
+
+    const syncDepts = async () => {
+      try {
+        const r = await api.post(`/api/forms/${id}/sync-depts`, {})
+        if (!r.changed) return ok('部门和卷面已经一致，没有需要同步的')
+        const c = r.changes[0] || {}
+        const bits = []
+        if (c.added?.length) bits.push(`新增 ${c.added.length} 项`)
+        if (c.removed?.length) bits.push(`移除 ${c.removed.length} 项`)
+        if (c.relabeled?.length) bits.push(`改名 ${c.relabeled.length} 项`)
+        if (c.droppedAnswers?.length) bits.push(`${c.droppedAnswers.length} 个标准答案已失效`)
+        ok('已同步：' + bits.join('，'))
+        form.value.schema = r.schema
+      } catch (e) { err(e.message) }
+    }
+
+    const unbindSource = (f) => {
+      const p = { ...(f.props || {}) }
+      delete p.source
+      f.props = p
+    }
+
     /* ---------- 右侧检查器 ---------- */
     /**
      * 级联选择的选项编辑器。
@@ -375,9 +421,29 @@ export default {
               class: 'select', style: 'height:26px;width:auto;font-size:12px;padding:0 6px',
               value: '', onChange: e => { const c = e.target.value; e.target.value = ''; if (c) applyDict(c) }
             }, [h('option', { value: '' }, '从字典取用…'), ...dicts.value.map(d => h('option', { value: d.code }, d.name))]) : null,
+            // 部门树是系统里已经存在的组织结构，不该为了「选部门」在问卷里再手工敲一遍
+            h('button', { class: 'btn ghost sm', onClick: () => applyDepts() }, '从部门取用'),
             h('button', { class: 'btn ghost sm', onClick: () => addChild(null) }, '+ 顶级')
           ])
         ]),
+        h('div', { class: 'field', style: 'margin-bottom:8px' }, [
+          h('label', {}, '作答控件'),
+          h('select', {
+            class: 'select', style: 'height:30px',
+            value: f.props?.picker || 'auto',
+            onChange: e => { f.props = { ...(f.props || {}), picker: e.target.value === 'auto' ? undefined : e.target.value } }
+          }, [
+            h('option', { value: 'auto' }, '自动（选项≥24 个时用搜索）'),
+            h('option', { value: 'select' }, '层级下拉'),
+            h('option', { value: 'search' }, '搜索式选择')
+          ]),
+          h('div', { class: 'hint' }, '四级以上、几百个节点时下拉翻不动；搜索式输入关键字可直接落到某一级，作答仍只存末级值。')
+        ]),
+        f.props?.source === 'dept' ? h('div', { class: 'dict-badge', style: 'margin-bottom:8px' }, [
+          h('span', { class: 'tag brand' }, '来源：部门树'),
+          h('button', { class: 'btn ghost sm', onClick: () => syncDepts() }, '同步'),
+          h('button', { class: 'btn ghost sm', onClick: () => unbindSource(f) }, '解除')
+        ]) : null,
         f.props?.dict ? h('div', { class: 'dict-badge', style: 'margin-bottom:8px' }, [
           h('span', { class: 'tag brand' }, '字典：' + (dicts.value.find(d => d.code === f.props.dict)?.name || f.props.dict)),
           h('button', { class: 'btn ghost sm', onClick: () => syncDict(f) }, '同步'),
@@ -433,9 +499,17 @@ export default {
                 class: 'select', style: 'height:26px;width:auto;font-size:12px;padding:0 6px',
                 value: '', onChange: e => { const c = e.target.value; e.target.value = ''; if (c) applyDict(c) }
               }, [h('option', { value: '' }, '从字典取用…'), ...dicts.value.map(d => h('option', { value: d.code }, d.name))]) : null,
+              // 单选 / 下拉里也常要「按部门选」，同样不该手工抄一遍组织架构
+              ['radio', 'select', 'checkbox'].includes(f.type)
+                ? h('button', { class: 'btn ghost sm', onClick: () => applyDepts() }, '从部门取用') : null,
               h('button', { class: 'btn ghost sm', onClick: addOption }, '+ 添加')
             ])
           ]),
+          f.props?.source === 'dept' ? h('div', { class: 'dict-badge', style: 'margin-bottom:8px' }, [
+            h('span', { class: 'tag brand' }, '来源：部门树'),
+            h('button', { class: 'btn ghost sm', onClick: () => syncDepts() }, '同步'),
+            h('button', { class: 'btn ghost sm', onClick: () => unbindSource(f) }, '解除')
+          ]) : null,
           f.props?.dict ? h('div', { class: 'dict-badge', style: 'margin-bottom:8px' }, [
             h('span', { class: 'tag brand' }, '字典：' + (dicts.value.find(d => d.code === f.props.dict)?.name || f.props.dict)),
             h('button', { class: 'btn ghost sm', onClick: () => syncDict(f) }, '同步'),

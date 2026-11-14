@@ -7,6 +7,7 @@ import { formRole, formVisibleScope, submissionVisibleScope, requireFormRole, me
 import { readXlsxUpload } from './files.js'
 import { parseXlsx, rowsToFields } from '../lib/sheet.js'
 import { itemsToOptions, listItems } from '../lib/dict.js'
+import { deptOptions, deptLabelOf } from '../lib/org.js'
 import fs from 'node:fs'
 import { log } from '../lib/db.js'
 
@@ -280,6 +281,69 @@ export default function register(r) {
       log(user, '同步字典选项', `${form.title} #${form.id}，${touched.length} 道题，字典：${[...codes].join(', ')}`)
     }
     sendJson(res, 200, { ok: true, changed: touched.length, changes, schema })
+  })
+
+  /*
+   * 选项来源：部门树。
+   *
+   * 「按部门选人 / 报事」这类题以前只能手填一串部门名，而部门树早在用户管理里维护着——
+   * 同一套组织架构抄两遍，迟早两份不一样。设计器里取用时把部门树写成**快照**选项
+   * （和字典同一套取舍：部门调整不该静默改动一张已经收回来几千份的问卷），
+   * 想更新由人点「同步」。
+   */
+  r.get('/api/options/depts', async (req, res) => {
+    requireUser(req)
+    const options = deptOptions()
+    sendJson(res, 200, {
+      ok: true,
+      data: options,
+      // 顺带把「有哪些表单绑着部门题」算出来没意义（部门题不占用任何部门），这里只给树本身
+      count: options.length
+    })
+  })
+
+  /** 把绑定了部门树的题目按当前组织架构重同步一遍（口径与字典同步一致：按 value 认项） */
+  r.post('/api/forms/:id/sync-depts', async (req, res, { params }) => {
+    const user = requirePerm(req, 'form:update')
+    const form = pickForm(params.id)
+    if (!form) fail(404, '表单不存在')
+    requireFormRole(user, form, 'edit')
+    const opts = deptOptions()
+    const byValue = new Map(opts.map(o => [String(o.value), o]))
+    const schema = JSON.parse(JSON.stringify(form.schema || []))
+    const changes = []
+    for (const f of schema) {
+      if (f?.props?.source !== 'dept') continue
+      const oldOpts = Array.isArray(f.options) ? f.options : []
+      const kept = []
+      const removed = []
+      for (const o of oldOpts) {
+        // 部门被删掉时，选项跟着消失——留着就是一个「选不到的部门」，
+        // 而历史答卷里的那个 id 仍然认得出来（报表按 id 计数，不按选项列表）
+        const hit = byValue.get(String(o.value))
+        if (hit) kept.push(hit.parent ? { label: hit.label, value: hit.value, parent: hit.parent } : { label: hit.label, value: hit.value })
+        else removed.push(o.label)
+      }
+      const oldValues = new Set(oldOpts.map(o => String(o.value)))
+      const added = opts.filter(o => !oldValues.has(String(o.value))).map(o => o.label)
+      const relabeled = kept.filter(k => {
+        const before = oldOpts.find(o => String(o.value) === k.value)
+        return before && before.label !== k.label
+      }).map(k => ({ value: k.value, from: oldOpts.find(o => o.value === k.value).label, to: k.label }))
+      const validValues = new Set(opts.map(o => String(o.value)))
+      const beforeAnswer = Array.isArray(f.answer) ? f.answer.map(String) : []
+      const answer = beforeAnswer.filter(v => validValues.has(v))
+      f.options = opts
+      f.answer = answer
+      if (added.length || removed.length || relabeled.length || answer.length !== beforeAnswer.length) {
+        changes.push({ field: f.label, added, removed, relabeled, droppedAnswers: beforeAnswer.filter(v => !validValues.has(v)) })
+      }
+    }
+    if (changes.length) {
+      run('UPDATE forms SET schema = ?, updated_at = ? WHERE id = ?', JSON.stringify(schema), now(), form.id)
+      log(user, '同步部门选项', `${form.title} #${form.id}，${changes.length} 道题`)
+    }
+    sendJson(res, 200, { ok: true, changed: changes.length, changes, schema, total: opts.length })
   })
 
   /* ---------------- 表单协作 ---------------- */

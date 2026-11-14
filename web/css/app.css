@@ -378,3 +378,32 @@ table.table{width:100%;border-collapse:collapse;font-size:13.5px}
   .dict-table th:nth-child(3),.dict-table td:nth-child(3){display:none}
   .dict-table th,.dict-table td{padding:10px 8px}
 }
+
+/* ============ 级联搜索式选择 ============
+   几百个节点的选项树（行业分类、四级行政区）靠下拉翻是不可能翻到的。
+   这里是一个「打字 → 直接看到完整路径 → 一次点到底」的控件。
+   面板用绝对定位盖在下面的题目上，必须比普通卡片多一层阴影，否则看着像挤在流里。 */
+.cas-search{position:relative}
+.cas-search-bar{display:flex;gap:6px;align-items:center}
+.cas-search-bar .input{flex:1}
+.cas-chosen{margin-top:7px;font-size:12.5px;color:var(--text-2);display:flex;gap:4px;flex-wrap:wrap}
+.cas-readonly{font-size:13.5px;color:var(--text-2)}
+.cas-panel{
+  position:absolute;left:0;right:0;top:calc(100% + 4px);z-index:40;
+  max-height:260px;overflow:auto;padding:4px;
+  background:var(--panel);border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow);
+}
+.cas-row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px 10px;border-radius:8px;cursor:pointer;font-size:13px}
+.cas-row:hover{background:var(--panel-2)}
+.cas-row.sel{background:rgba(91,124,250,.09);color:var(--brand);font-weight:560}
+.cas-row-path{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cas-sep{color:var(--text-3);padding:0 1px}
+.cas-hit{color:var(--brand);background:rgba(91,124,250,.13);border-radius:3px;padding:0 1px}
+.cas-row-note{flex:none;font-size:11px;color:var(--text-3)}
+.cas-empty{padding:12px;text-align:center;font-size:12.5px;color:var(--text-3)}
+/* 窄屏：路径本来就要换行，别让它横着滚出屏幕 */
+@media (max-width:560px){
+  .cas-row{flex-direction:column;align-items:flex-start;gap:2px}
+  .cas-row-path{white-space:normal}
+  .cas-panel{max-height:220px}
+}

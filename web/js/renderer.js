@@ -1,9 +1,9 @@
-import { h } from '/vendor/vue.esm.js'
+import { h, reactive } from '/vendor/vue.esm.js'
 import { escapeHtml } from './ui.js'
 // 逻辑规则的唯一实现，服务端 import 的是同一个文件
 import { buildFlow, renderText, OP_LABELS, evalFormula, roundTo } from './flow.js'
 // 级联的层级计算也放在共享文件里：渲染、判分、统计、导出必须是同一套父子关系
-import { cascadeChildren, cascadePathOf, cascadeLabelPath, normalizeCascade } from './cascade.js'
+import { cascadeChildren, cascadePathOf, cascadeLabelPath, normalizeCascade, cascadeSearch, cascadeMode } from './cascade.js'
 
 const findMeta = (type) => type
 
@@ -47,6 +47,99 @@ function modelValue(props) {
       if (el.value !== String(props.value ?? '')) el.value = props.value ?? ''
     }
   }
+}
+
+/**
+ * 搜索式级联。
+ *
+ * 几百个节点的行业分类、四级以上的行政区，用下拉一层层翻是不可用的——
+ * 用户心里已经有答案（「西湖区」），却要先找到浙江省、再找到杭州市。
+ * 这里给他一个输入框：打字，直接看到可点的完整路径，一次点击落到底。
+ *
+ * 搜索状态存在 WeakMap 里以题对象为键：renderControl 是每次渲染都重新调用的普通函数，
+ * 把 text 放进闭包变量会在下一次渲染时丢掉（打字打一半，字没了）。
+ */
+const cascadeSearchState = new WeakMap()
+
+function searchStateOf(field) {
+  let st = cascadeSearchState.get(field)
+  if (!st) { st = reactive({ text: '', open: false }); cascadeSearchState.set(field, st) }
+  return st
+}
+
+/** 把命中的那个词从路径里切出来高亮：一屏都是完整路径，不高亮就看不出为什么这条会出现 */
+function highlight(text, kw) {
+  const src = String(text ?? '')
+  const k = String(kw || '').trim()
+  if (!k) return [src]
+  const at = src.toLowerCase().indexOf(k.toLowerCase())
+  if (at < 0) return [src]
+  return [src.slice(0, at), h('b', { class: 'cas-hit' }, src.slice(at, at + k.length)), src.slice(at + k.length)]
+}
+
+function renderCascadeSearch(field, opts, val, { readonly, set }) {
+  const st = searchStateOf(field)
+  const chosen = val ? (cascadeLabelPath(opts, val) || String(val)) : ''
+  const kw = st.text.trim()
+  // 没打字时给第一层做「可浏览」的兜底：不是所有人一上来就知道该搜什么
+  const rows = kw
+    ? cascadeSearch(opts, kw, { limit: 30 })
+    : cascadeChildren(opts, '').slice(0, 30).map(o => ({ value: o.value, label: o.label, path: [o.label], hit: -1, depth: 0 }))
+
+  if (readonly) {
+    return h('div', { class: 'cas-readonly' }, chosen || '未作答')
+  }
+
+  const pick = (row) => {
+    set(row.value)
+    st.text = ''
+    st.open = false
+  }
+
+  return h('div', { class: 'cas-search' }, [
+    h('div', { class: 'cas-search-bar' }, [
+      h('input', {
+        class: 'input',
+        value: st.text,
+        placeholder: field.placeholder || '输入关键字搜索，例如：西湖',
+        onFocus: () => { st.open = true },
+        // 失焦就收起面板：两份「候选列表」同时摊在页面上，人分不清哪个属于哪一题。
+        // 面板行的点击走 mousedown + preventDefault，所以这里不会抢在选中之前把面板关掉
+        onBlur: () => { setTimeout(() => { st.open = false }, 120) },
+        onInput: e => { st.text = e.target.value; st.open = true },
+        onKeydown: e => {
+          if (e.key === 'Escape') { st.open = false; e.target.blur() }
+          // 回车取第一条：搜索结果按「命中层级浅的在前」排过，第一条就是最可能的那个
+          if (e.key === 'Enter' && st.open && rows.length) { e.preventDefault(); pick(rows[0]) }
+        }
+      }),
+      chosen ? h('button', {
+        class: 'btn ghost sm', type: 'button', title: '清除本题作答',
+        onClick: () => { set(''); st.text = '' }
+      }, '清除') : null
+    ]),
+    chosen ? h('div', { class: 'cas-chosen' }, [
+      h('span', { class: 'small muted' }, '已选：'),
+      h('span', {}, chosen)
+    ]) : null,
+    st.open && rows.length ? h('div', { class: 'cas-panel' }, rows.map(row =>
+      h('div', {
+        class: ['cas-row', String(val) === String(row.value) ? 'sel' : ''],
+        key: row.value,
+        // mousedown 而不是 click：输入框 blur 会让面板先消失，click 到时候已经不在了
+        onMousedown: e => { e.preventDefault(); pick(row) }
+      }, [
+        h('div', { class: 'cas-row-path' }, row.path.flatMap((seg, i) => (i
+          ? [h('span', { class: 'cas-sep' }, ' / '), ...highlight(seg, kw)]
+          : highlight(seg, kw)))),
+        // 这条下面还有子项时说明一句：不然点了「杭州市」，人以为自己选到了区
+        row.children ? h('span', { class: 'cas-row-note' }, '含 ' + row.children + ' 个下级') : null
+      ])
+    )) : null,
+    st.open && !rows.length ? h('div', { class: 'cas-panel' }, [
+      h('div', { class: 'cas-empty' }, kw ? `没有匹配「${kw}」的选项` : '这道题还没有设置级联选项')
+    ]) : null
+  ])
 }
 
 /** 渲染单个组件的作答控件 */
@@ -263,6 +356,15 @@ export function renderControl(field, model, opts = {}) {
       ])
     }
     case 'cascader': {
+      /*
+       * 两条作答路径，按选项规模自动选：
+       *   select —— 层级下拉（选项少时最好用）
+       *   search —— 输入关键字直接落到某一级（四级以上、几百个节点时的唯一办法）
+       * 口径见 cascade.js 的 cascadeMode。
+       */
+      const copts = normalizeCascade(field.options)
+      if (cascadeMode(field, copts) === 'search') return renderCascadeSearch(field, copts, val, { readonly: dis, set })
+
       /*
        * 真的级联：按层级渲染 N 个下拉，第 N 个只列「上一个已选项的子项」。
        * 以前这里和普通下拉完全一样，三个选项目的地 / 省份 / 城市并排放着，
