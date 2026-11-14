@@ -6,6 +6,9 @@ import { buildFlow, resolveAnswers, renderText, evalFormula } from '../../web/js
 // 级联的父子关系同样只有一份：渲染、判分、统计、导出都按它算路径
 import { cascadeLabelPath, cascadeLabelTail, cascadeValuePath, normalizeCascade } from '../../web/js/cascade.js'
 
+/** 单题分值上限：不设上限时，一道题填 1e9 就能把整份卷子的平均分和排名彻底搅乱 */
+export const MAX_SCORE = 1000
+
 export const FIELD_TYPES = [
   'text', 'textarea', 'number', 'date', 'datetime', 'time', 'select', 'radio', 'checkbox',
   'switch', 'rate', 'nps', 'slider', 'upload', 'file', 'sort', 'cascader', 'carousel',
@@ -123,6 +126,9 @@ export function coerceAnswerToField(field) {
   const isJudge = opts.length === 2 && values.has('正确') && values.has('错误')
 
   const mapped = []
+  // 折算不了的值单独记下来：调用方（导入、建题接口）要能告诉用户「哪个答案被丢掉了」，
+  // 而折算本身会把 'A' 变成选项值 'A.x'，事后比前后集合分不清「被折算」和「被丢掉」
+  const unmatched = []
   for (const raw of field.answer) {
     const tok = String(raw).trim()
     if (!tok) continue
@@ -138,17 +144,63 @@ export function coerceAnswerToField(field) {
       const opt = opts[tok.toUpperCase().charCodeAt(0) - 65]
       if (opt) { mapped.push(String(opt.value)); continue }
     }
+    // 走到这里说明既不是选项值、也不是选项文字、也不是序号：选择题里它就是越界答案
+    if (CHOICE.has(field.type) && opts.length) unmatched.push(tok)
     mapped.push(tok)
   }
   // 判分逻辑对单选/多选都按数组比较，这里保持数组，只保证元素是选项值。
   // 排序题尤其不能去重后重排：数组顺序就是答案本身。
   field.answer = perRow ? mapped : [...new Set(mapped)]
+  // 剔除的越界答案回传出去，导入接口才有依据提示「这几题的答案不在选项里」
+  field.unmatched = unmatched
+  // 剔除「指向不存在的选项」的标准答案。
+  // 以前只清理文本/Excel 导入那条路，接口直接建题时 `答案：Z` 而选项只有 A/B 照样入库 ——
+  // 这题从此谁答都算错，而且页面上看不出来。选择题的答案必须是选项表里的值（矩阵按行容忍重复）。
+  if (CHOICE.has(field.type) && field.answer.length && field.options.length) {
+    const values = new Set(field.options.map(o => String(o.value)))
+    const labels = new Set(field.options.map(o => String(o.label)))
+    field.answer = field.answer.filter(a => values.has(String(a)) || labels.has(String(a)))
+  }
   return field
 }
 
+/**
+ * 卷面 schema 的规范化。
+ *
+ * 除了逐题 normalizeField，还要管「题与题之间」的关系，这些都是打接口才看得见的：
+ *  - 字段 id 重复：两份「同名」作答，逻辑规则和统计全指不确定的那一个。重复的直接重发新 id。
+ *  - 分值：负数、Infinity、1e9 一律压回 [0, MAX_SCORE]。
+ *  - 逻辑 / 跳转引用了不存在的字段：规则永远不成立，看起来像「条件逻辑没生效」。
+ */
 export function normalizeSchema(schema) {
   if (!Array.isArray(schema)) return []
-  return schema.map(normalizeField)
+  const out = schema.map(normalizeField)
+  const seen = new Set()
+  for (const f of out) {
+    if (seen.has(f.id)) f.id = 'f_' + crypto.randomBytes(5).toString('hex')
+    seen.add(f.id)
+  }
+  for (const f of out) {
+    // 标准答案必须是这道题真有的选项：`答案：Z` 而选项只有 A/B 时，这题从此谁答都错，
+    // 页面上还看不出来。矩阵按行允许重复值，判断题的「正确/错误」本身就是选项。
+    if (CHOICE.has(f.type) && f.answer.length && f.options.length) {
+      const values = new Set(f.options.map(o => String(o.value)))
+      const labels = new Set(f.options.map(o => String(o.label)))
+      f.answer = f.answer.filter(a => values.has(String(a)) || labels.has(String(a)))
+    }
+    const n = Number(f.score)
+    f.score = Number.isFinite(n) ? Math.min(MAX_SCORE, Math.max(0, n)) : 0
+    // 三种规则形状不一样：logic/requiredWhen 指向别的字段（fieldId），
+    // jump 是「本题命中就结束」（没有 fieldId，只有 op/value/text），
+    // fill 的来源键叫 from。以前一律按 fieldId 判，jump 规则被整批当成脏数据删掉，
+    // 表现为「条件跳转配了没反应」。
+    const refs = (r) => r && typeof r === 'object' && seen.has(String(r.fieldId))
+    f.logic = f.logic.filter(refs)
+    f.requiredWhen = f.requiredWhen.filter(refs)
+    f.jump = f.jump.filter(r => r && typeof r === 'object')
+    if (f.fill && !(f.fill && typeof f.fill === 'object' && seen.has(String(f.fill.from)))) f.fill = null
+  }
+  return out
 }
 
 export function parseForm(row) {

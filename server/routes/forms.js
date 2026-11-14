@@ -2,6 +2,44 @@ import { get, all, run, now, db } from '../lib/db.js'
 import { readJson, fail, sendJson } from '../lib/http.js'
 import { requireUser, requirePerm, currentUser, can } from '../lib/auth.js'
 import { normalizeSchema, parseForm, pickForm, paginate, safeJson, judgeOptions } from '../lib/forms.js'
+// 富文本清洗与服务端同一份实现：渲染层清过一遍，落库再清一遍。
+// 只靠前端清洗等于「谁都能直接 POST 一份带 onerror 的 richText 进来」。
+import { sanitizeHtml } from '../../web/js/sanitize.js'
+
+/**
+ * 落库前的 schema 清洗：富文本组件的 HTML 走白名单。
+ * richtext / html 的 props.html 是唯一会被 innerHTML 渲染的用户输入。
+ */
+function sanitizeSchemaHtml(schema) {
+  for (const f of schema) {
+    if (f && (f.type === 'richtext' || f.type === 'html') && f.props && typeof f.props.html === 'string') {
+      f.props.html = sanitizeHtml(f.props.html)
+    }
+  }
+  return schema
+}
+
+/**
+ * settings 必须是对象。
+ * 以前 `JSON.stringify(body.settings)` 原样入库，传 "not-an-object" 也存进去，
+ * 之后每次 `form.settings.xxx` 都拿到 undefined——表现为「发布后设置全丢了」。
+ */
+function settingsOf(input, fallback = {}) {
+  if (input === undefined) return fallback
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return fallback
+  const out = { ...input }
+  // 及格线：超出 0-100 的百分比没有意义（150% 等于永远不及格，也没人会这么填）
+  if (out.passPercent !== undefined) {
+    const n = Number(out.passPercent)
+    out.passPercent = Number.isFinite(n) ? Math.min(100, Math.max(1, n)) : 60
+  }
+  // 时长：负数会让倒计时立刻到点、自动交卷
+  if (out.duration !== undefined) {
+    const n = Number(out.duration)
+    out.duration = Number.isFinite(n) && n > 0 ? Math.min(600, n) : 0
+  }
+  return out
+}
 import { localPath } from '../lib/storage.js'
 import { formRole, formVisibleScope, submissionVisibleScope, requireFormRole, memberCandidates, listMembers, addMember, FORM_MEMBER_ROLES, ROLE_LABEL } from '../lib/formMembers.js'
 import { readXlsxUpload } from './files.js'
@@ -69,7 +107,7 @@ export default function register(r) {
     const result = run(
       'INSERT INTO forms(title, description, kind, schema, settings, status, is_template, category, created_by, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
       String(body.title).trim(), body.description || '', kind,
-      JSON.stringify(normalizeSchema(body.schema)), JSON.stringify(body.settings || {}),
+      JSON.stringify(sanitizeSchemaHtml(normalizeSchema(body.schema))), JSON.stringify(settingsOf(body.settings)),
       ['draft', 'published', 'closed'].includes(body.status) ? body.status : 'draft',
       body.is_template ? 1 : 0, body.category || '', user.id, ts, ts
     )
@@ -86,11 +124,16 @@ export default function register(r) {
     const body = await readJson(req)
     const sets = []
     const args = []
-    if (body.title !== undefined) { sets.push('title = ?'); args.push(String(body.title).trim()) }
+    // 标题是列表、导出、打印、公开页的第一行字：改成一片空白等于把这张表单变成无名之物
+    if (body.title !== undefined) {
+      const title = String(body.title).trim()
+      if (!title) fail(400, '请填写表单标题')
+      sets.push('title = ?'); args.push(title)
+    }
     if (body.description !== undefined) { sets.push('description = ?'); args.push(String(body.description)) }
     if (body.kind !== undefined && KINDS.includes(body.kind)) { sets.push('kind = ?'); args.push(body.kind) }
-    if (body.schema !== undefined) { sets.push('schema = ?'); args.push(JSON.stringify(normalizeSchema(body.schema))) }
-    if (body.settings !== undefined) { sets.push('settings = ?'); args.push(JSON.stringify(body.settings)) }
+    if (body.schema !== undefined) { sets.push('schema = ?'); args.push(JSON.stringify(sanitizeSchemaHtml(normalizeSchema(body.schema)))) }
+    if (body.settings !== undefined) { sets.push('settings = ?'); args.push(JSON.stringify(settingsOf(body.settings, form.settings))) }
     if (body.status !== undefined) { sets.push('status = ?'); args.push(['draft', 'published', 'closed'].includes(body.status) ? body.status : 'draft') }
     if (body.is_template !== undefined) {
       if (!can(user, '*')) fail(403, '只有管理员可以把表单存为公共模板')

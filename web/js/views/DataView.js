@@ -1,7 +1,7 @@
 import { h, ref, onMounted, onBeforeUnmount, computed, nextTick, watch } from '/vendor/vue.esm.js'
 import { api } from '../api.js'
 import { route } from '../router.js'
-import { ok, err, confirmBox, fmtDate, Empty, Modal, Pagination } from '../ui.js'
+import { ok, err, confirmBox, fmtDate, Empty, Modal, Pagination, escapeHtml } from '../ui.js'
 import { Icon } from '../icons.js'
 import { renderControl, answerDisplay } from '../renderer.js'
 import { buildFlow } from '../flow.js'
@@ -200,20 +200,27 @@ export default {
       } catch (e) { err('导入失败：' + e.message) }
     }
 
+    /**
+     * 打印预览是一段手拼的 HTML —— 里面每一个字都来自答卷内容。
+     * 以前直接 `${r.data[f.id]}` 塞进 document.write，等于把匿名填写者写的东西当成页面代码执行：
+     * 往填空题里填 `<img src=x onerror=alert(1)>`，「打印」那一刻就在本域执行了。
+     * 现在整段（表单标题、题目标题、单元格内容）统一过 escapeHtml。
+     */
     const printRows = () => {
       if (!needForm()) return
       const w = window.open('', '_blank')
       const schema = form.value.schema.filter(f => !['divider', 'richtext', 'html', 'image'].includes(f.type))
-      w.document.write(`<html><head><title>${form.value.title}</title><style>
+      const title = escapeHtml(form.value.title)
+      w.document.write(`<html><head><meta charset="utf-8"><title>${title}</title><style>
         body{font-family:-apple-system,"PingFang SC",sans-serif;padding:24px;color:#141a2e}
         h1{font-size:19px;margin-bottom:4px} p{color:#666;font-size:12px}
         table{width:100%;border-collapse:collapse;font-size:12px;margin-top:14px}
         th,td{border:1px solid #ddd;padding:7px 9px;text-align:left}
         th{background:#f5f7fb}
       </style></head><body>
-      <h1>${form.value.title}</h1><p>导出时间：${new Date().toLocaleString()} · 共 ${rows.value.length} 份</p>
-      <table><thead><tr><th>编号</th><th>提交时间</th>${schema.map(f => `<th>${f.label}</th>`).join('')}<th>得分</th></tr></thead>
-      <tbody>${rows.value.map(r => `<tr><td>${r.id}</td><td>${fmtDate(r.created_at)}</td>${schema.map(f => `<td>${cell({ data: r.data }, f)}</td>`).join('')}<td>${r.score ?? ''}</td></tr>`).join('')}</tbody></table>
+      <h1>${title}</h1><p>导出时间：${new Date().toLocaleString()} · 共 ${rows.value.length} 份</p>
+      <table><thead><tr><th>编号</th><th>提交时间</th>${schema.map(f => `<th>${escapeHtml(f.label)}</th>`).join('')}<th>得分</th></tr></thead>
+      <tbody>${rows.value.map(r => `<tr><td>${escapeHtml(r.id)}</td><td>${escapeHtml(fmtDate(r.created_at))}</td>${schema.map(f => `<td>${escapeHtml(cell({ data: r.data }, f))}</td>`).join('')}<td>${escapeHtml(r.score ?? '')}</td></tr>`).join('')}</tbody></table>
       </body></html>`)
       w.document.close()
       w.print()
@@ -415,8 +422,17 @@ export default {
                   : '-'),
                 h('td', { class: 'nowrap stick-ops' }, h('div', { class: 'flex', style: 'gap:4px' }, [
                   h('button', { class: 'btn ghost sm', onClick: () => openDetail(r) }, '查看'),
-                  // 只有考试答卷需要批阅：问卷也摆一个「批阅」，点下去才弹错误，属于让人白点
-                  r.form_kind === 'exam' ? h('button', { class: 'btn ghost sm', onClick: () => openReview(r) }, '批阅') : null,
+                  // 只有「真的有待批阅主观题」的考试答卷才需要批阅按钮。
+                  // 早先按 kind==='exam' 全摆上，纯客观题的卷子点下去只弹一句
+                  // 「这份卷子没有待批阅的主观题」——白点一次，还得多读一句否定。
+                  // 已批阅过的行保留入口：老师要能回头调整分数。
+                  r.form_kind === 'exam' && (r.pending > 0 || r.reviewed_at)
+                    ? h('button', {
+                        class: 'btn ghost sm',
+                        title: r.pending > 0 ? `还有 ${r.pending} 道主观题待批阅` : `已批阅 ${r.score ?? '-'} 分，可再调整`,
+                        onClick: () => openReview(r)
+                      }, '批阅')
+                    : null,
                   h('button', { class: 'btn ghost sm', onClick: () => openEdit(r) }, '编辑'),
                   h('button', { class: 'btn ghost sm', onClick: () => toggleMark(r) }, r.marked ? '取消标记' : '标记'),
                   h('button', { class: 'btn ghost sm danger', onClick: () => remove(r) }, '删除')

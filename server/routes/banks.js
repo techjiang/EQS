@@ -1,12 +1,21 @@
 import { get, all, run, now, log } from '../lib/db.js'
 import { readJson, fail, sendJson } from '../lib/http.js'
 import { requireUser, requirePerm, can } from '../lib/auth.js'
-import { normalizeField, paginate, safeJson, gradeSubmission, coerceAnswerToField, isAnswerCorrect, answerText } from '../lib/forms.js'
+import { normalizeField, paginate, safeJson, gradeSubmission, coerceAnswerToField, isAnswerCorrect, answerText, MAX_SCORE } from '../lib/forms.js'
 import { parseTextToFields, normalizeTags } from './forms.js'
 import { readXlsxUpload } from './files.js'
 import { parseXlsx, rowsToFields, questionsXlsx, templateXlsx } from '../lib/sheet.js'
 
 const parseQ = q => ({ ...q, options: safeJson(q.options, []), answer: safeJson(q.answer, []), props: safeJson(q.props, {}) })
+
+/**
+ * 剔除指向不存在选项的标准答案，并把被剔掉的那几个值带回去。
+ * 「答案：Z」而选项只有 A/B 时，以前接口一路成功、题目从此谁答都错，页面上还看不出来。
+ */
+function pruneAnswers(field) {
+  coerceAnswerToField(field)
+  return (field.unmatched || []).map(String)
+}
 
 /**
  * 题库是「我的」资源：列表、组卷、删除都按 owner 过滤，
@@ -411,21 +420,25 @@ export default function register(r) {
     const body = await readJson(req)
     const items = Array.isArray(body.items) ? body.items : [body]
     const ids = []
+    const dropped = []
     for (const item of items) {
       const f = normalizeField(item)
       if (!f.label) continue
-      coerceAnswerToField(f)
+      // 越界答案与分值上限，与「编辑题目」走同一道
+      const lost = pruneAnswers(f)
+      if (lost.length) dropped.push(`${f.label}（${lost.join('、')} 不存在）`)
       // 标签：item 自己的优先，请求体上的当默认值。
       // 之前只读 body.tags，批量传 items 时每条自带的标签被整批丢掉。
       const tags = normalizeTags(item.tags ?? item.tag ?? body.tags ?? '')
       // 分值：`f.score || 5` 会把用户明说的「不计分」写成 5 分，
-      // 组卷时它就变成计分题，答错直接扣分
-      const score = item.score === undefined || item.score === '' ? 5 : Math.max(0, Number(f.score) || 0)
+      // 组卷时它就变成计分题，答错直接扣分。
+      // 上限同样要管：一道题填 1e9，整份卷子的平均分和排名就成了笑话。
+      const score = item.score === undefined || item.score === '' ? 5 : Math.min(MAX_SCORE, Math.max(0, Number(f.score) || 0))
       const result = run('INSERT INTO questions(bank_id, type, title, options, answer, analysis, score, tags, props, created_at) VALUES(?,?,?,?,?,?,?,?,?,?)',
         bank.id, f.type, f.label, JSON.stringify(f.options), JSON.stringify(f.answer), f.analysis, score, tags, JSON.stringify(f.props || {}), now())
       ids.push(Number(result.lastInsertRowid))
     }
-    sendJson(res, 201, { ok: true, ids })
+    sendJson(res, 201, { ok: true, ids, droppedAnswers: dropped })
   })
 
   r.put('/api/questions/:id', async (req, res, { params }) => {
@@ -435,11 +448,13 @@ export default function register(r) {
     if (!writableBank(user, q.bank_id)) fail(403, '无权修改该题目')
     const body = await readJson(req)
     const f = normalizeField({ ...parseQ(q), ...body })
-    coerceAnswerToField(f)
+    // 与新建走同一条口径：越界答案剔除、分值压回 [0, MAX_SCORE]
+    const dropped = pruneAnswers(f)
+    const score = Math.min(MAX_SCORE, Math.max(0, Number(f.score) || 0))
     const tags = body.tags === undefined ? q.tags : normalizeTags(body.tags)
     run('UPDATE questions SET type = ?, title = ?, options = ?, answer = ?, analysis = ?, score = ?, tags = ?, props = ? WHERE id = ?',
-      f.type, f.label, JSON.stringify(f.options), JSON.stringify(f.answer), f.analysis, f.score, tags, JSON.stringify(f.props || {}), q.id)
-    sendJson(res, 200, { ok: true })
+      f.type, f.label, JSON.stringify(f.options), JSON.stringify(f.answer), f.analysis, score, tags, JSON.stringify(f.props || {}), q.id)
+    sendJson(res, 200, { ok: true, droppedAnswers: dropped })
   })
 
   r.delete('/api/questions/:id', async (req, res, { params }) => {

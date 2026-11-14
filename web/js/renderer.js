@@ -1,5 +1,6 @@
 import { h, reactive } from '/vendor/vue.esm.js'
 import { escapeHtml } from './ui.js'
+import { sanitizeHtml } from './sanitize.js'
 // 逻辑规则的唯一实现，服务端 import 的是同一个文件
 import { buildFlow, renderText, OP_LABELS, evalFormula, roundTo } from './flow.js'
 // 级联的层级计算也放在共享文件里：渲染、判分、统计、导出必须是同一套父子关系
@@ -578,9 +579,12 @@ function inputHint(type) {
   return { email: 'name@example.com', phone: '请输入 11 位手机号', idcard: '请输入 18 位身份证号', number: '请输入数字' }[type] || '请输入'
 }
 
-function sanitize(html) {
-  return String(html).replace(/<script[\s\S]*?<\/script>/gi, '').replace(/on\w+="[^"]*"/gi, '')
-}
+/**
+ * 富文本清洗只有一份实现（sanitize.js），渲染和服务端落库都用它。
+ * 旧的就地三行正则连 `<img src=x onerror=alert(1)>`（属性没引号）都拦不住，
+ * 而这段 HTML 的下游是公开填写页——任何拿到链接的人都会中招。
+ */
+const sanitize = sanitizeHtml
 
 function initSignature(canvas, onChange) {
   canvas.dataset.init = '1'

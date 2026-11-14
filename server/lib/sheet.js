@@ -154,17 +154,10 @@ export function rowsToFields(rows) {
 
     field.answer = splitAnswer(answerRaw)
     if (field.score < 0 || !Number.isFinite(field.score)) field.score = 0
+    // coerceAnswerToField 自己会剔除越界答案，并把「剔除掉的那几个值」放进 unmatched。
+    // 折算后再拿前后集合做差是错的：'A' 会被折算成选项值 'A.x'，看起来也像「变了」。
     coerceAnswerToField(field)
-    // 答案必须落在选项上：指向不存在的选项等于这题谁答都错
-    if (field.answer.length && field.options.length) {
-      const values = new Set(field.options.map(o => String(o.value)))
-      const kept = field.answer.filter(a => values.has(String(a)))
-      if (kept.length !== field.answer.length) {
-        const lost = field.answer.filter(a => !values.has(String(a)))
-        field.answer = kept
-        field.dropped = lost
-      }
-    }
+    if (field.unmatched?.length) field.dropped = field.unmatched
     fields.push(field)
   }
   return { fields, skipped, unknownColumns }

@@ -2,7 +2,7 @@ import { h, ref, computed, onMounted } from '/vendor/vue.esm.js'
 import { api } from '../api.js'
 import { navigate, route } from '../router.js'
 import { Icon } from '../icons.js'
-import { ok, err, confirmBox, fmtDate, Empty, Modal, Pagination } from '../ui.js'
+import { ok, err, confirmBox, fmtDate, Empty, Modal, Pagination, escapeHtml } from '../ui.js'
 import { state } from '../store.js'
 
 const KIND_LABEL = { survey: '问卷', exam: '考试', practice: '刷题', form: '表单' }
@@ -175,7 +175,9 @@ export default {
         ['复制表单', () => duplicate(f)],
         ...(ro ? [] : [['保存为模板', () => saveTemplate(f)], ['移入回收中心', () => remove(f)]])
       ]
-      overlay.innerHTML = `<div class="modal" style="max-width:340px"><div class="modal-h"><h3>${f.title}</h3></div><div class="modal-b" style="padding:8px"></div></div>`
+      // 标题来自用户输入，写进 innerHTML 前必须转义：曾经表单名叫 `<img src=x onerror=...>`
+      // 时，点「···」就在管理端执行了
+      overlay.innerHTML = `<div class="modal" style="max-width:340px"><div class="modal-h"><h3>${escapeHtml(f.title)}</h3></div><div class="modal-b" style="padding:8px"></div></div>`
       const body = overlay.querySelector('.modal-b')
       for (const [label, fn] of actions) {
         const b = document.createElement('button')

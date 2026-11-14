@@ -3662,6 +3662,114 @@ try {
     await req('DELETE', `/api/forms/${matrixId}/purge`)
   }
 
+  console.log('\n[50] 落库前的清洗：schema 内部一致性 / 富文本 / 指标范围')
+  {
+    // 这一批全部来自「写脚本直接打接口」：页面不会这么传，但改一下请求就能发出来。
+
+    // 1. 富文本白名单：老的 sanitize 只有两条正则，这三种一个都拦不住
+    const { sanitizeHtml } = await import('../web/js/sanitize.js')
+    assert(!/onerror/.test(sanitizeHtml('<img src=x onerror=alert(1)>')), '无引号的事件属性被剥掉')
+    assert(sanitizeHtml('<svg onload=alert(1)>文字</svg>') === '', 'svg 连内容一起丢掉')
+    assert(sanitizeHtml('<a href="javascript:alert(1)">点我</a>') === '<a>点我</a>', 'javascript: 协议被剥掉')
+    assert(/^<a href="https:\/\/example.com"/.test(sanitizeHtml('<a href="https://example.com" target="_blank">ok</a>')), '正常的 https 链接保留')
+    assert(/rel="noopener/.test(sanitizeHtml('<a href="https://example.com" target="_blank">ok</a>')), 'target=_blank 自动补 rel=noopener')
+    assert(sanitizeHtml('<img src="data:text/html;base64,xx">') === '<img>', 'data:text/html 不能当图片地址')
+
+    // 2. 富文本落库也过一遍：只靠前端清洗等于「谁都能直接 POST 一份带 onerror 的 richtext」
+    r = await req('POST', '/api/forms', {
+      title: '冒烟·富文本清洗', kind: 'survey',
+      schema: [{ id: 'rt', type: 'richtext', label: '', props: { html: '<p onclick="x()">说明</p><img src=x onerror=alert(1)>' } }]
+    })
+    const rtId = r.json.id
+    r = await req('GET', `/api/forms/${rtId}`)
+    const rtHtml = r.json.data.schema.find(f => f.id === 'rt').props.html
+    assert(!/onerror|onclick/i.test(rtHtml) && /说明/.test(rtHtml), '富文本落库前已被白名单清洗', rtHtml)
+
+    // 3. schema 内部一致性：id 重复、分值越界、逻辑引用不存在的字段
+    r = await req('PUT', `/api/forms/${rtId}`, {
+      schema: [
+        { id: 'dup', type: 'text', label: 'A', score: -30, logic: [{ fieldId: 'nope', op: 'eq', value: 'x' }] },
+        { id: 'dup', type: 'text', label: 'B', score: 1e9 }
+      ]
+    })
+    const fixed = r.json.data.schema
+    assert(fixed[0].id !== fixed[1].id, '重复的字段 id 会被重新分配', JSON.stringify(fixed.map(f => f.id)))
+    assert(fixed[0].score === 0 && fixed[1].score === 1000, '分值被压回 0 - 1000', JSON.stringify(fixed.map(f => f.score)))
+    assert(fixed[0].logic.length === 0, '引用不存在字段的逻辑规则被剔除（否则永远不成立）', JSON.stringify(fixed[0].logic))
+
+    // 4. jump 规则没有 fieldId，不能当成脏数据删掉
+    r = await req('PUT', `/api/forms/${rtId}`, {
+      schema: [{ id: 'j1', type: 'radio', label: '是否继续', options: ['是', '否'], jump: [{ op: 'eq', value: '否', text: '到此为止' }] }]
+    })
+    assert(r.json.data.schema[0].jump.length === 1, '条件跳转规则被保留', JSON.stringify(r.json.data.schema[0].jump))
+
+    // 5. settings 必须是对象，指标要夹在合理区间
+    r = await req('PUT', `/api/forms/${rtId}`, { settings: 'not-an-object' })
+    assert(r.json.data.settings && typeof r.json.data.settings === 'object', 'settings 传字符串不会入库', JSON.stringify(r.json.data.settings))
+    r = await req('PUT', `/api/forms/${rtId}`, { settings: { passPercent: 150, duration: -5 } })
+    assert(r.json.data.settings.passPercent === 100, '及格线超过 100% 被夹回 100', JSON.stringify(r.json.data.settings))
+    assert(r.json.data.settings.duration === 0, '负时长会让倒计时立刻到点，夹回 0', JSON.stringify(r.json.data.settings))
+
+    // 6. 标题不能改成一片空白
+    r = await req('PUT', `/api/forms/${rtId}`, { title: '   ' })
+    assert(r.status === 400, '空白标题被拒绝', String(r.status))
+
+    // 7. 题库：越界答案要剔除并回报；分值同样有上限
+    r = await req('POST', '/api/banks', { name: '冒烟·题库清洗' })
+    const cleanBank = r.json.id
+    r = await req('POST', `/api/banks/${cleanBank}/questions`, {
+      type: 'radio', title: '答案越界', options: ['A', 'B'], answer: ['Z'], score: 5
+    })
+    assert((r.json.droppedAnswers || []).length === 1, '接口建题时越界答案被回报', JSON.stringify(r.json.droppedAnswers))
+    r = await req('POST', `/api/banks/${cleanBank}/questions`, { type: 'text', title: '天价分值', score: 1e9 })
+    const qid = r.json.ids[0]
+    r = await req('GET', `/api/banks/${cleanBank}/questions`)
+    const q1 = r.json.data.find(x => x.id === qid)
+    assert(q1.score === 1000, '单题分值上限 1000', String(q1.score))
+    const q0 = r.json.data.find(x => x.title === '答案越界')
+    assert(q0 && Array.isArray(q0.answer) && q0.answer.length === 0, '越界答案被剔除后，这道题没有标准答案可说', JSON.stringify(q0 && q0.answer))
+
+    await req('DELETE', `/api/forms/${rtId}`)
+    await req('DELETE', `/api/forms/${rtId}/purge`)
+    await req('DELETE', `/api/banks/${cleanBank}`)
+  }
+
+  console.log('\n[51] 批阅入口只出现在真需要批阅的答卷上')
+  {
+    // 早先前端只按 kind==='exam' 摆「批阅」：纯客观题的卷子每行都有颗按钮，
+    // 点下去才弹「这份卷子没有待批阅的主观题」。列表得自己说清楚还差几题。
+    r = await req('POST', '/api/forms', {
+      title: '冒烟·客观题卷', kind: 'exam',
+      schema: [{ id: 'p_obj', type: 'radio', label: '客观', options: ['A', 'B'], answer: ['A'], score: 10 }]
+    })
+    const objId = r.json.id
+    await req('PUT', `/api/forms/${objId}`, { status: 'published' })
+    r = await req('POST', `/api/public/forms/${objId}/submit`, { data: { p_obj: 'A' } })
+    const objSub = r.json.id
+    r = await req('GET', `/api/submissions?formId=${objId}`)
+    const objRow = r.json.data.find(x => x.id === objSub)
+    assert(objRow && objRow.pending === 0, '没有主观题的卷子 pending 为 0（前端据此不出批阅按钮）', JSON.stringify(objRow && objRow.pending))
+
+    r = await req('POST', '/api/forms', {
+      title: '冒烟·主观题卷', kind: 'exam',
+      schema: [{ id: 'p_sub', type: 'textarea', label: '简答', score: 10 }]
+    })
+    const subId = r.json.id
+    await req('PUT', `/api/forms/${subId}`, { status: 'published' })
+    r = await req('POST', `/api/public/forms/${subId}/submit`, { data: { p_sub: '一段回答' } })
+    const subSub = r.json.id
+    r = await req('GET', `/api/submissions?formId=${subId}`)
+    const subRow = r.json.data.find(x => x.id === subSub)
+    assert(subRow && subRow.pending === 1, '有待批阅主观题时 pending 为 1', JSON.stringify(subRow && subRow.pending))
+    r = await req('PUT', `/api/submissions/${subSub}/review`, { scores: { p_sub: 8 } })
+    assert(r.status === 200, '批阅后成绩重算成功', String(r.status))
+    r = await req('GET', `/api/submissions?formId=${subId}`)
+    assert(r.json.data.find(x => x.id === subSub).pending === 0, '批完之后不再进待批队列')
+
+    await req('DELETE', `/api/forms/${objId}`); await req('DELETE', `/api/forms/${objId}/purge`)
+    await req('DELETE', `/api/forms/${subId}`); await req('DELETE', `/api/forms/${subId}/purge`)
+  }
+
   console.log('\n[45] 前端静态资源')
 
   for (const p of ['/', '/js/main.js', '/css/app.css', '/js/views/Logs.js', '/js/views/Dicts.js', '/assets/eqs-mark.svg', '/vendor/echarts.min.js']) {

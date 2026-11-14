@@ -495,7 +495,20 @@ export default function register(r) {
     // 带上表单类型：前端要按它决定「批阅」按钮出不出。
     // 之前列表里没有这个字段，问卷答卷也摆着「批阅」，点了才弹「只有考试答卷需要批阅」。
     const rows = all(`SELECT s.*, f.title AS form_title, f.kind AS form_kind ${base} ORDER BY s.id ${order} LIMIT ? OFFSET ?`, ...args, p.pageSize, p.offset)
-    sendJson(res, 200, { ok: true, data: rows.map(withManual), total, page: p.page, pageSize: p.pageSize, totalPages: p.totalPages })
+    /*
+     * 带上「还剩几道主观题没批」。
+     * 前端原先只按 kind==='exam' 摆「批阅」，于是一张纯客观题的卷子，每一行都有颗按钮，
+     * 点下去才弹「这份卷子没有待批阅的主观题」——白点一次、还要读懂一句否定。
+     * 表单对象按 id 缓存：一页 20 行常常来自同一张卷子。
+     */
+    const formCache = new Map()
+    const withPending = (row) => {
+      const base2 = withManual(row)
+      if (row.form_kind !== 'exam') return { ...base2, pending: 0 }
+      if (!formCache.has(row.form_id)) formCache.set(row.form_id, pickForm(row.form_id))
+      return { ...base2, pending: pendingLeft(formCache.get(row.form_id), row) }
+    }
+    sendJson(res, 200, { ok: true, data: rows.map(withPending), total, page: p.page, pageSize: p.pageSize, totalPages: p.totalPages })
   })
 
   r.get('/api/submissions/:id', async (req, res, { params }) => {
