@@ -5,6 +5,7 @@ import { get, all, run, now } from './db.js'
 import { buildFlow, resolveAnswers, renderText, evalFormula } from '../../web/js/flow.js'
 // 级联的父子关系同样只有一份：渲染、判分、统计、导出都按它算路径
 import { cascadeLabelPath, cascadeLabelTail, cascadeValuePath, normalizeCascade } from '../../web/js/cascade.js'
+import { normalizeFileUrls } from './fileAccess.js'
 
 /** 单题分值上限：不设上限时，一道题填 1e9 就能把整份卷子的平均分和排名彻底搅乱 */
 export const MAX_SCORE = 1000
@@ -506,7 +507,9 @@ export function sanitizeAnswers(schema, rawData) {
         // 只留「有 url 的文件描述」，其余键一律不进库：这是唯一允许对象形状的作答
         const list = (Array.isArray(v) ? v : [v]).map(x => {
           if (!x || typeof x !== 'object') return null
-          const url = scalar(x.url)
+          // 上传接口回的是带限期票据的地址，票据不能入库：
+          // 答卷可能几年后还有人打开，存进来的票据那时早过期，导出/推送出去的链接全是死的
+          const url = normalizeFileUrls(scalar(x.url))
           if (!url) return null
           return { id: Number(x.id) || 0, name: scalar(x.name).slice(0, 200), url }
         }).filter(Boolean)

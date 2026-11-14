@@ -36,6 +36,7 @@ import { rateLimit, publicLimit } from '../lib/guard.js'
 import { rankingTop, rankOf, publicRanking, distributionOf } from '../lib/ranking.js'
 import { submissionsXlsx, submissionsHead, submissionRow } from '../lib/sheet.js'
 import { writeXlsxStream } from '../lib/xlsx.js'
+import { signFileUrl, signFileUrls, signHtmlFiles, QUERY_FILE_TTL } from '../lib/fileAccess.js'
 
 function fingerprint(req, extra = {}) {
   return {
@@ -203,14 +204,24 @@ export default function register(r) {
         // 逻辑规则必须下发，否则浏览器根本不知道「选了否就别再问下去」
         requiredWhen: f.requiredWhen, jump: f.jump, fill: f.fill
       }
+      // 富文本正文里内嵌的图片也要换签：公开页访客没有会话，原地址一律 401
+      if ((f.type === 'richtext' || f.type === 'html') && typeof out.props?.html === 'string') {
+        out.props = { ...out.props, html: signHtmlFiles(out.props.html) }
+      }
       if (f.type === 'captcha') out.challenge = captchaChallenge(f.id)
       return out
     })
+    /*
+     * 头图 / 背景图是发布出去给人看的，但它同样落在需要鉴权的 /api/files/raw 下。
+     * 公开页的访客没有会话，这里现签一张票给他——票只对这两张图有效、限期而已。
+     */
+    const pub = publicSettings(form.settings)
+    for (const k of ['headerImage', 'bgImage']) if (pub[k]) pub[k] = signFileUrl(pub[k])
     sendJson(res, 200, {
       ok: true,
       data: {
         id: form.id, title: form.title, description: form.description, kind: form.kind,
-        schema, settings: publicSettings(form.settings),
+        schema, settings: pub,
         // 开放时间窗：页面据此把入口换成「尚未开始 / 已结束」，而不是让人白填一场
         window: win,
         seed,
@@ -282,8 +293,11 @@ export default function register(r) {
     const id = Number(result.lastInsertRowid)
     // 附件是先上传后交卷的，交卷时把本次作答里引用到的文件认领到这份答卷上，
     // 否则「打包下载附件」会把它们漏掉。
+    // 只认领「属于这张表单、且还没人认领」的文件：以前只看 id + submission_id=0，
+    // 把别的表单的 file id 写进自己的作答，就能把别人的附件挂到自己的卷子上
+    // （打包下载、导出都会把它算进来）。
     for (const fileId of collectFileIds(data)) {
-      run('UPDATE files SET submission_id = ? WHERE id = ? AND submission_id = 0', id, fileId)
+      run('UPDATE files SET submission_id = ? WHERE id = ? AND submission_id = 0 AND form_id = ?', id, fileId, form.id)
     }
     const submission = get('SELECT * FROM submissions WHERE id = ?', id)
 
@@ -412,10 +426,13 @@ export default function register(r) {
     const review = form?.kind === 'exam' && form.settings?.showResult !== false
       ? buildReview(form.schema, JSON.parse(row.data), form.settings, manualScoresOf(row), row.seed || '')
       : null
+    // 附件地址在这里现签一张短期票：匿名访客刚交完卷要回看自己的附件，
+    // 此刻他没有会话，库里存的又是规范路径（不带票），不签就全是一片裂图
+    const queryData = signFileUrls(safeJson(row.data, {}), QUERY_FILE_TTL)
     sendJson(res, 200, {
       ok: true,
       data: {
-        id: row.id, publicId: row.public_id || String(row.id), data: JSON.parse(row.data), score: row.score,
+        id: row.id, publicId: row.public_id || String(row.id), data: queryData, score: row.score,
         passed: row.passed === 1, reviewed: !!row.reviewed_at, review, createdAt: row.created_at,
         // 与交卷同一口径：不公布成绩的表单，连名次也不该从查询接口漏出去
         rank: form?.kind === 'exam' && form?.settings?.showResult !== false && form?.settings?.showRank !== false

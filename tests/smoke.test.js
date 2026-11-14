@@ -3675,6 +3675,15 @@ try {
     assert(/rel="noopener/.test(sanitizeHtml('<a href="https://example.com" target="_blank">ok</a>')), 'target=_blank 自动补 rel=noopener')
     assert(sanitizeHtml('<img src="data:text/html;base64,xx">') === '<img>', 'data:text/html 不能当图片地址')
 
+    // 清洗必须能重复跑：设计器每保存一次都过一遍白名单，无条件转义 & 会把地址越转越长
+    const once = sanitizeHtml('<p><img src="/api/files/raw/a.png?e=1&amp;s=xx"></p>')
+    assert(sanitizeHtml(once) === once && sanitizeHtml(sanitizeHtml(once)) === once,
+      '白名单是幂等的：同一段富文本存三次，地址不会变成 &amp;amp;amp;', sanitizeHtml(once))
+    assert(/&lt;script&gt;/.test(sanitizeHtml('&lt;script&gt;alert(1)&lt;/script&gt;')),
+      '已经是实体的尖括号不会被二次转义成 &amp;lt;')
+    assert(sanitizeHtml('a & b').includes('&amp;'),
+      '裸 & 仍然转义（不是整个关掉转义）')
+
     // 2. 富文本落库也过一遍：只靠前端清洗等于「谁都能直接 POST 一份带 onerror 的 richtext」
     r = await req('POST', '/api/forms', {
       title: '冒烟·富文本清洗', kind: 'survey',
@@ -3826,6 +3835,7 @@ try {
     up = await tryUpload('a.txt', 'text/plain', 'hello')
     assert(up.status === 201, '普通文本仍可上传', String(up.status))
     const txtId = up.json.id
+    const txtUrl = up.json.url
     // 真的 PNG（1x1），验证图片不会被误伤
     const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==', 'base64')
     up = await tryUpload('dot.png', 'image/png', png)
@@ -3838,7 +3848,8 @@ try {
      * 这层不能省——存量文件可能早于上传校验（升级前传上去的 .html）。
      */
     const txtRow = (await req('GET', '/api/files')).json.data.find(f => f.id === txtId)
-    const rawTxt = await fetch(BASE + '/api/files/raw/' + txtRow.stored)
+    // 带上上传时拿到的票据：匿名可读的时代结束了，无凭据一律 401（见 [53]）
+    const rawTxt = await fetch(BASE + txtUrl)
     assert(rawTxt.ok && /filename\*=UTF-8''/.test(rawTxt.headers.get('content-disposition') || ''),
       '下载头里带 RFC 5987 文件名', String(rawTxt.headers.get('content-disposition')))
     assert(/sandbox/.test(rawTxt.headers.get('content-security-policy') || ''),
@@ -3881,6 +3892,135 @@ try {
     await req('PUT', '/api/settings/site', { rateLimit: { submit: 120, upload: 60, query: 120 } })
     await req('DELETE', `/api/forms/${fRate}`); await req('DELETE', `/api/forms/${fRate}/purge`)
     await req('DELETE', `/api/forms/${fRate2}`); await req('DELETE', `/api/forms/${fRate2}/purge`)
+  }
+
+  console.log('\n[63] 附件下载鉴权')
+  {
+    cookie = await asUser('admin', 'test-pass-123')
+
+    // 建一张已发布表单，匿名访客在它下面传附件
+    const fFile = (await req('POST', '/api/forms', {
+      title: '附件鉴权探针', schema: [{ id: 'up1', type: 'upload', label: '上传附件' }], settings: {}
+    })).json.id
+    await req('PUT', `/api/forms/${fFile}`, { status: 'published' })
+
+    const anonUpload = async (name, body) => {
+      const fd = new FormData()
+      fd.append('file', new Blob([body], { type: 'text/plain' }), name)
+      fd.append('formId', String(fFile))
+      const r2 = await fetch(BASE + '/api/upload', { method: 'POST', body: fd })
+      return { status: r2.status, json: await r2.json().catch(() => ({})) }
+    }
+    let au = await anonUpload('answer.txt', 'secret-content')
+    assert(au.status === 201, '匿名作答可上传附件', String(au.status))
+    const anonUrl = au.json.url
+    const anonStored = au.json.url.split('?')[0].replace('/api/files/raw/', '')
+    assert(/[?&]s=/.test(anonUrl), '上传响应带限期签名票据（否则匿名者连自己传的图都预览不了）', anonUrl)
+
+    // 无凭据：一律 401。以前这里是「谁拿到 key 谁就能下载」（key 猜不到 ≠ 有权限）
+    let r = await fetch(BASE + '/api/files/raw/' + anonStored)
+    assert(r.status === 401, '无凭据、无票据时不能下载附件（不再靠「key 猜不到」保护）', String(r.status))
+
+    // 带票据：放行
+    r = await fetch(BASE + anonUrl)
+    assert(r.ok && (await r.text()) === 'secret-content', '带有效票据可下载自己刚传的附件', String(r.status))
+
+    // 篡改签名 / 改过期时间 / 换 key：都不行
+    const tampered = anonUrl.replace(/s=[^&]+$/, 's=' + 'a'.repeat(32))
+    assert((await fetch(BASE + tampered)).status === 401, '签名被篡改的票据无效')
+    const expired = anonUrl.replace(/e=\d+/, 'e=1')
+    assert((await fetch(BASE + expired)).status === 401, '过期票据无效')
+
+    // 库里存的是规范路径：票据有保质期，答卷没有
+    const sub = await req('POST', `/api/public/forms/${fFile}/submit`, { data: { up1: [{ id: au.json.id, name: 'answer.txt', url: anonUrl }] } })
+    assert(sub.status === 201, '带附件的匿名答卷提交成功', JSON.stringify(sub.json).slice(0, 120))
+    const kept = (await req('GET', `/api/submissions/${sub.json.id}`)).json.data.data.up1[0].url
+    assert(!/[?&][es]=/.test(kept), '认证信息不入库：作答里存的是规范路径，不是会过期的票据', kept)
+
+    // 会话这一路：管理员直接点链接就能取，URL 里不用带任何凭据
+    const asAdmin = await fetch(BASE + '/api/files/raw/' + anonStored, { headers: { Cookie: cookie } })
+    assert(asAdmin.ok, '管理员凭会话可下载（管理端页面走的就是这条路）', String(asAdmin.status))
+    // 缓存策略跟着鉴权走：以前是 public + 一年，代理和 CDN 替你长期存着，
+    // 鉴权对它一点约束都没有；private/max-age 也不行——退出登录后点同一张图仍命中磁盘缓存，
+    // 请求根本没发出去过。no-cache + ETag 才是「每次都得回来问一句」。
+    const cc = asAdmin.headers.get('cache-control') || ''
+    assert(!/public/.test(cc) && /no-cache/.test(cc),
+      '附件响应不允许公共缓存、且每次回源校验（否则退出登录后仍能从缓存里翻出别人的附件）', cc)
+    const etag = asAdmin.headers.get('etag')
+    assert(!!etag, '附件响应带 ETag（回源校验的代价是一次 304）', String(etag))
+    const notModified = await fetch(BASE + '/api/files/raw/' + anonStored, { headers: { Cookie: cookie, 'If-None-Match': etag } })
+    assert(notModified.status === 304, '条件请求走 304，不重下整个文件', String(notModified.status))
+
+    // 换一个无关账号：403。这才是「有权限」和「拿到链接」的区别
+    await req('POST', '/api/users', { username: 'fileoutsider', nickname: '外部', password: 'out-pass-123', roleCode: 'user' })
+    const outsider = await asUser('fileoutsider', 'out-pass-123')
+    assert(!!outsider, '外部账号登录成功')
+    const asOutsider = await fetch(BASE + '/api/files/raw/' + anonStored, { headers: { Cookie: outsider } })
+    assert(asOutsider.status === 403, '无关账号拿到路径也不能下载别人的附件', String(asOutsider.status))
+
+    // 附件认领不能跨表单：把别的表单的 file id 写进自己的作答，不能把它挂到自己卷子上
+    const fOther = (await req('POST', '/api/forms', {
+      title: '别人的表单', schema: [{ id: 'x1', type: 'upload', label: '附件' }], settings: {}
+    })).json.id
+    await req('PUT', `/api/forms/${fOther}`, { status: 'published' })
+    const stolen = await req('POST', `/api/public/forms/${fOther}/submit`, { data: { x1: [{ id: au.json.id, name: 'answer.txt', url: '/api/files/raw/' + anonStored }] } })
+    assert(stolen.status === 201, '别的表单仍可正常交卷', String(stolen.status))
+    const claimed = (await req('GET', '/api/files')).json.data.find(f => f.id === au.json.id)
+    assert(Number(claimed.submission_id) === Number(sub.json.id),
+      '附件只被真正拥有它的那份答卷认领，不会被别人的作答带走', `submission_id=${claimed.submission_id} 期望 ${sub.json.id}`)
+
+    // 公开页与答卷查询里的附件地址带票（访客没有会话）
+    const pubAfter = await (await fetch(BASE + `/api/public/forms/${fFile}`)).json()
+    assert(pubAfter.ok, '公开页仍可读取')
+    await req('PUT', `/api/forms/${fFile}`, { settings: { allowQuery: true } })
+    // 同一个 UA（node 的 fetch 默认 UA）才通过设备指纹校验，模拟「同一个人回头看自己的答卷」
+    const q = await (await fetch(BASE + `/api/public/forms/${fFile}/query?submissionId=${sub.json.publicId}`)).json()
+    const qUrl = q?.data?.data?.up1?.[0]?.url || ''
+    assert(q.ok && /[?&]s=/.test(qUrl), '匿名查回自己的答卷时附件地址被现签一张票（否则回看全是裂图）', qUrl)
+
+    await req('DELETE', `/api/forms/${fFile}`); await req('DELETE', `/api/forms/${fFile}/purge`)
+    await req('DELETE', `/api/forms/${fOther}`); await req('DELETE', `/api/forms/${fOther}/purge`)
+  }
+
+  console.log('\n[64] 存量富文本清洗脚本')
+  {
+    // 白名单只在写入时生效，升级前落库的富文本仍是脏的。
+    // 用一份独立的临时库跑脚本，不碰正在跑的服务那个库（避免和服务抢写锁）
+    const { execFileSync } = await import('node:child_process')
+    const work = fs.mkdtempSync(path.join(os.tmpdir(), 'eqs-scrub-'))
+    const scrubDb = path.join(work, 'eqs.db')
+    const dirty = '<p>正文</p><img src=x onerror=alert(1)><script>steal()</script><a href="javascript:alert(1)">点我</a>'
+    const seedDb = new DatabaseSync(scrubDb)
+    seedDb.exec('CREATE TABLE forms(id INTEGER PRIMARY KEY, title TEXT, schema TEXT)')
+    seedDb.prepare('INSERT INTO forms(id, title, schema) VALUES(1, ?, ?)')
+      .run('老问卷', JSON.stringify([{ id: 'a', type: 'richtext', label: '说明', props: { html: dirty } }, { id: 'b', type: 'html', label: 'HTML', props: { html: '<p>干净</p>' } }]))
+    seedDb.close()
+
+    const run = (...args) => execFileSync(process.execPath, ['scripts/sanitize-html.mjs', '--db', scrubDb, ...args], { encoding: 'utf8' })
+
+    const dry = run()
+    assert(/1 段需要清洗/.test(dry), '体检模式能找出脏数据', dry.split('\n')[1])
+    assert(/on\*/.test(dry) && /可执行标签/.test(dry), '体检结果说清楚脏在哪（不是只说「需要清洗」）', dry)
+    assert(/库没有改动/.test(dry), '默认不写库，先说清要动什么', dry)
+
+    let after = new DatabaseSync(scrubDb)
+    assert(JSON.parse(after.prepare('SELECT schema FROM forms WHERE id = 1').get().schema)[0].props.html === dirty,
+      '没加 --apply 时数据库一个字节都没改')
+    after.close()
+
+    const applied = run('--apply')
+    assert(/已写回/.test(applied), '--apply 真的写回', applied.split('\n')[1])
+    after = new DatabaseSync(scrubDb)
+    const cleaned = JSON.parse(after.prepare('SELECT schema FROM forms WHERE id = 1').get().schema)
+    after.close()
+    assert(!/onerror|<script|javascript:/.test(cleaned[0].props.html), '脏内容被清掉', cleaned[0].props.html)
+    assert(/正文/.test(cleaned[0].props.html), '正常文字保留，不是整段删掉', cleaned[0].props.html)
+    assert(cleaned[1].props.html === '<p>干净</p>', '本来就干净的富文本原样不动')
+
+    const again = run()
+    assert(/0 段需要清洗/.test(again), '再跑一次是幂等的（不重复改）', again.split('\n')[1])
+    assert(/无需清洗/.test(again), '干净之后明确说没事可做', again)
+    fs.rmSync(work, { recursive: true, force: true })
   }
 
   console.log('\n[45] 前端静态资源')

@@ -5,6 +5,7 @@ import { normalizeSchema, parseForm, pickForm, paginate, safeJson, judgeOptions 
 // 富文本清洗与服务端同一份实现：渲染层清过一遍，落库再清一遍。
 // 只靠前端清洗等于「谁都能直接 POST 一份带 onerror 的 richText 进来」。
 import { sanitizeHtml } from '../../web/js/sanitize.js'
+import { normalizeFileUrls } from '../lib/fileAccess.js'
 
 /**
  * 落库前的 schema 清洗：富文本组件的 HTML 走白名单。
@@ -13,7 +14,13 @@ import { sanitizeHtml } from '../../web/js/sanitize.js'
 function sanitizeSchemaHtml(schema) {
   for (const f of schema) {
     if (f && (f.type === 'richtext' || f.type === 'html') && f.props && typeof f.props.html === 'string') {
-      f.props.html = sanitizeHtml(f.props.html)
+      // 顺序不能反：sanitize 会把地址里的 & 转成 &amp;，之后再摘票据就匹配不上了
+      f.props.html = sanitizeHtml(normalizeFileUrls(f.props.html))
+    }
+    // 头图 / 图片组件里的地址要摘掉票据：上传接口回的是限期票，
+    // 存进来就等于给这张图定了保质期，过期之后管理端和公开页一起裂图
+    if (f && f.props && typeof f.props === 'object') {
+      for (const k of ['src', 'url']) if (typeof f.props[k] === 'string') f.props[k] = normalizeFileUrls(f.props[k])
     }
   }
   return schema
@@ -38,6 +45,8 @@ function settingsOf(input, fallback = {}) {
     const n = Number(out.duration)
     out.duration = Number.isFinite(n) && n > 0 ? Math.min(600, n) : 0
   }
+  // 头图 / 背景图同理：规范化到不带票据的路径，取的时候按当前身份现签
+  for (const k of ['headerImage', 'bgImage']) if (typeof out[k] === 'string' && out[k]) out[k] = normalizeFileUrls(out[k])
   return out
 }
 import { localPath } from '../lib/storage.js'

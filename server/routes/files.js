@@ -8,6 +8,7 @@ import { safeJson, formWindow } from '../lib/forms.js'
 import { buildZip, extractZip, writeZipStream } from '../lib/zip.js'
 import { formRole, formVisibleScope, requireFormRole } from '../lib/formMembers.js'
 import { checkUpload, dispositionFor, RAW_HEADERS, rateLimit, publicLimit } from '../lib/guard.js'
+import { signFileUrl, verifyFileTicket } from '../lib/fileAccess.js'
 
 /** multipart/form-data 解析（够用即可） */
 /**
@@ -146,18 +147,48 @@ export default function register(r) {
       id: Number(result.lastInsertRowid),
       name: stored.name,
       size: stored.size,
-      url: stored.driver === 'local' ? `/api/files/raw/${stored.stored}` : stored.url,
+      /*
+       * 回给上传者的地址带一张限期票据：匿名填表的人此刻还没有会话，
+       * 不给票据的话，他连自己刚传的图片都预览不了（页面上一片裂图）。
+       * 管理端拿到的是同一条带票据的地址，但页面刷新后重取时走的是会话那一路。
+       */
+      url: stored.driver === 'local' ? signFileUrl(`/api/files/raw/${stored.stored}`) : stored.url,
       driver: stored.driver
     })
   })
 
-  /** 公开读取本地文件 */
+  /**
+   * 读取本地文件（需鉴权）。
+   *
+   * 前几轮把「进来」这一头堵死了，这一头一直是敞开的：任何拿到 `/api/files/raw/<key>`
+   * 的人都能下载，不需要登录、不需要任何凭据。key 里那 8 字节随机数确实猜不到，
+   * 但「猜不到」不是「有权限」——链接被转发一次、进了一次浏览器同步，
+   * 答卷附件里的身份证照片、薪资表就永久可读，且无法撤销。
+   *
+   * 现在两条准入路径，都得先有身份：
+   *   1. 签名票据 `?e=&s=`：匿名填表的人刚传完文件、还没有会话，只能靠这个，
+   *      限期、只对这一个 key 有效（见 lib/fileAccess.js）；
+   *   2. 会话：管理员、文件归属者、该文件所属表单的协作者。
+   *      管理端页面点附件走的就是这条，URL 里不带任何凭据。
+   */
   r.get('/api/files/raw/*', async (req, res, { params }) => {
     const key = params['*']
     const file = localPath(key)
     if (!file) fail(404, '文件不存在')
     const stat = fs.statSync(file)
-    const row = get('SELECT name, mime FROM files WHERE stored = ?', key)
+    const row = get('SELECT name, mime, form_id, owner_id FROM files WHERE stored = ?', key)
+    const url = new URL(req.url, 'http://x')
+    const signed = verifyFileTicket(key, url.searchParams.get('e'), url.searchParams.get('s'))
+    if (!signed) {
+      const me = currentUser(req)
+      if (!me) fail(401, '请先登录后再下载该附件')
+      let allowed = can(me, '*') || (row?.owner_id && Number(row.owner_id) === Number(me.id))
+      if (!allowed && row?.form_id) {
+        const form = get('SELECT * FROM forms WHERE id = ?', row.form_id)
+        allowed = !!form && !!formRole(me, form)
+      }
+      if (!allowed) fail(403, '无权访问该附件')
+    }
     /*
      * 出去这一层也要挡一次。
      * 库里的 mime 是上传那一刻记下来的，而存量文件可能早于这套校验（升级前传的 .html）。
@@ -166,13 +197,25 @@ export default function register(r) {
      */
     const mime = row?.mime || 'application/octet-stream'
     const name = row?.name || path.basename(file)
-    res.writeHead(200, {
+    /*
+     * 缓存策略跟着鉴权一起改。
+     * 以前是 `public, max-age=31536000`：任何人取一次，公司代理和 CDN 就替你长期存着，
+     * 后来加上的那道鉴权对它一点约束都没有。
+     * 但改成 `private, max-age=600` 也不对——实测这么写之后，
+     * 管理员看过的一张图，在同一个浏览器里退出登录后仍然能打开（命中磁盘缓存，请求根本没发出去）。
+     * 所以是 no-cache：允许存，但每次必须回来问一句，那问的这一下就会过鉴权。
+     * ETag 让「问一句」的代价只有一次 304，不是重下一遍文件。
+     */
+    const etag = `W/"${stat.size}-${Number(stat.mtimeMs).toString(36)}"`
+    const headers = {
       'Content-Type': mime,
-      'Content-Length': stat.size,
       'Content-Disposition': dispositionFor({ name, mime }),
-      'Cache-Control': 'public, max-age=31536000',
+      ETag: etag,
+      'Cache-Control': 'private, no-cache',
       ...RAW_HEADERS
-    })
+    }
+    if (req.headers['if-none-match'] === etag) { res.writeHead(304, headers); res.end(); return }
+    res.writeHead(200, { ...headers, 'Content-Length': stat.size })
     fs.createReadStream(file).pipe(res)
   })
 

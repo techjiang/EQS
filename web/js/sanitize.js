@@ -38,8 +38,17 @@ const TAG_ATTRS = {
 /** 值为 URL 的属性：协议不对就整条丢掉 */
 const URL_ATTRS = new Set(['href', 'src'])
 
-const escapeText = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-const escapeAttr = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+/*
+ * 已经写成实体的 & 不再转义。
+ *
+ * 只转「裸 &」看起来偷懒，但清洗必须能重复跑：设计器里每保存一次都会过一遍白名单，
+ * 无条件 `&` → `&amp;` 的话，一张图存三次就变成 `&amp;amp;amp;`，
+ * 富文本里的链接一次比一次长，最后彻底打不开（实测第三轮就认不出地址了）。
+ * 放行实体本身不打开缺口：`&lt;script&gt;` 渲染出来是一段文字，不是标签。
+ */
+const ENTITY = /&(?!(?:#\d+|#x[0-9a-fA-F]+|[a-zA-Z][a-zA-Z0-9]{1,10});)/g
+const escapeText = s => String(s).replace(ENTITY, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+const escapeAttr = s => String(s).replace(ENTITY, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
 
 function safeUrl(raw, tag) {
   const v = String(raw).trim()
