@@ -217,8 +217,14 @@ export default {
     }
     const typeLabelOf = (q) => (isJudgeQ(q) ? '判断题' : fieldMeta(q.type).label)
 
-    /** 搜一页题目（跨题库），已勾选的项不会因为翻页丢失 */
+    /**
+     * 搜一页题目（跨题库），已勾选的项不会因为翻页丢失。
+     * seq 用来丢弃过期响应：打字快时先发的请求可能后回来，
+     * 结果就是「清空关键字了，列表里还留着上一次的结果」。
+     */
+    let pickSeq = 0
     const loadPick = async () => {
+      const seq = ++pickSeq
       pick.value.loading = true
       try {
         const qs = new URLSearchParams({ page: String(pick.value.page), pageSize: '20' })
@@ -227,10 +233,24 @@ export default {
         if (pick.value.tag) qs.set('tag', pick.value.tag)
         if (pick.value.bankIds.length) qs.set('bankIds', pick.value.bankIds.join(','))
         const r = await api.get('/api/questions/search?' + qs)
+        if (seq !== pickSeq) return
         pick.value.rows = r.data
         pick.value.total = r.total
         pick.value.totalPages = r.totalPages
-      } catch (e) { err(e.message) } finally { pick.value.loading = false }
+      } catch (e) { if (seq === pickSeq) err(e.message) } finally { if (seq === pickSeq) pick.value.loading = false }
+    }
+
+    /**
+     * 边打边搜。
+     *
+     * 上一轮是「输入关键字 → 点搜索 / 按回车」，题库上千道时人在这个框里
+     * 反复敲关键字找一道题，每敲一次都要再点一下按钮——真正的手感应该是
+     * 边打边收窄。防抖 260ms，够快到不觉得卡，也不会一个字打一次请求。
+     */
+    let pickTimer = null
+    const pickSearch = () => {
+      clearTimeout(pickTimer)
+      pickTimer = setTimeout(() => { pick.value.page = 1; loadPick() }, 260)
     }
 
     const openPick = () => {
@@ -532,9 +552,9 @@ export default {
             h('div', { class: 'field', style: 'margin:0;flex:1;min-width:180px' }, [
               h('label', {}, '搜题干或标签'),
               h('input', {
-                class: 'input', value: pick.value.keyword, placeholder: '例如：HTTP',
-                onInput: e => pick.value.keyword = e.target.value,
-                onKeydown: e => { if (e.key === 'Enter') { pick.value.page = 1; loadPick() } }
+                class: 'input', value: pick.value.keyword, placeholder: '边打边搜：题干或标签，例如 HTTP / 数据库',
+                onInput: e => { pick.value.keyword = e.target.value; pickSearch() },
+                onKeydown: e => { if (e.key === 'Enter') { clearTimeout(pickTimer); pick.value.page = 1; loadPick() } }
               })
             ]),
             h('div', { class: 'field', style: 'margin:0' }, [
@@ -548,7 +568,10 @@ export default {
                 ...['radio', 'checkbox', 'text', 'textarea'].map(t => h('option', { value: t }, fieldMeta(t).label))
               ])
             ]),
-            h('button', { class: 'btn', onClick: () => { pick.value.page = 1; loadPick() } }, '搜索')
+            h('button', { class: 'btn', onClick: () => { pick.value.page = 1; loadPick() } }, '搜索'),
+            pick.value.keyword.trim() ? h('button', {
+              class: 'btn ghost', onClick: () => { pick.value.keyword = ''; pick.value.page = 1; loadPick() }
+            }, '清空') : null
           ]),
           pick.value.bankIds.length || banks.value.length ? h('div', { class: 'flex wrap', style: 'gap:6px;margin-bottom:10px' }, [
             h('span', { class: 'small muted', style: 'line-height:28px' }, '题库：'),

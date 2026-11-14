@@ -977,11 +977,15 @@ export function parseTextToFields(text, { defaultScore = 0 } = {}) {
         // 之前漏了第三种，于是「1. 缓存能减少数据库压力 [判断] + 答案：正确」被当成填空题，
         // 答案连同一个「这是填空提示」的分支一起丢掉——判断题全员无标准答案。
         const type = cur.declType || matchType(cur.typeWord || '') || pickTypeTag(cur.stems.join(' '))?.type || null
-        const judgeLike = /^(对|错|正确|错误|是|否|true|false|√|✓|×|✗|t|f)$/i.test(tokens[0] || '')
-        // 填空题没有选项，答案就是那个空的空格，随手写的「答案：Docker」是猜错题意，不能当标准答案
-        if (type === 'text' || (type == null && !cur.options.length && !judgeLike && !/^[A-Za-z]$/.test(tokens[0] || ''))) {
-          if (!cur.options.length) { cur.placeholderHint = tokens.join(' '); continue }
-        }
+        /*
+         * 填空题的「答案：xxx」就是标准答案。
+         *
+         * 以前这里反过来——只要是填空题且没有选项，就把答案当「占位提示」扔掉
+         * （cur.placeholderHint，而那个字段全项目没有第二处读它）。
+         * 于是「[填空] Redis 默认端口是____。 / 答案：6379」导进题库后是一道
+         * **没有标准答案的填空题**：交卷永远判错，手工挑题组卷还会提示「没有标准答案」。
+         * 填空的答案本来就是一段文本，没有任何理由丢。
+         */
         cur.answerTokens = tokens
       }
       else if (rest === 'score') cur.score = Number(/(\d+(?:\.\d+)?)/.exec(t)?.[1] || 0)

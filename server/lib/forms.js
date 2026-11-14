@@ -289,23 +289,45 @@ export function isAnswerCorrect(field, value) {
   return given.length === want.length && given.every((x, i) => x === want[i])
 }
 
-/** 把作答 / 答案渲染成人能读的一行——回顾、刷题反馈都用它 */
-export function answerText(field, value) {
+/**
+ * 选项值 → 选项文字。
+ *
+ * 选项的 value 是「存进库里的口径」：字典里可能是 1/2/3，组织架构取人是 u12/d3。
+ * 这些都是给机器看的，人看到的是 label（「技术中心 / 后端组 / 张伟」）。
+ * 少这层映射，答卷明细、Excel 导出、交卷回顾里就全是 u12 和 1 —— 前几轮一直如此。
+ */
+export function optionLabel(field, value) {
+  const opts = Array.isArray(field?.options) ? field.options : []
+  const hit = opts.find(o => String(o?.value) === String(value))
+  return hit ? String(hit.label ?? hit.value ?? '') : String(value ?? '')
+}
+
+/** 这些题的作答存的是选项值，展示时必须换成选项文字 */
+const LABELED = new Set(['radio', 'select', 'checkbox', 'carousel', 'sort', 'matrix'])
+
+/**
+ * 把作答 / 答案渲染成人能读的一行——回顾、刷题反馈、导出、明细都用它。
+ * @param opts.max 单值最大长度；0 表示不截断（导出要完整数据，反馈框要短）
+ */
+export function answerText(field, value, opts = {}) {
   const type = field?.type
+  const max = opts.max === undefined ? 80 : Number(opts.max)
+  const cut = (s) => (max > 0 && String(s).length > max ? String(s).slice(0, max) + '…' : s)
   if (value === undefined || value === null || value === '') return ''
   // 级联存的是最末一级的值：「西湖区」三个字看不出它是哪个省的，
   // 复核、阅卷、导出附件清单都需要「浙江省 / 杭州市 / 西湖区」这条完整路径
   if (type === 'cascader') return cascadeLabelPath(field.options, value) || String(value)
   if (type === 'matrix') {
     const rows = Array.isArray(field.props?.rows) ? field.props.rows : []
+    const show = (v) => (LABELED.has(type) ? optionLabel(field, v) : String(v))
     // 作答是 {行: 列}；标准答案是「每行各选哪一列」的数组，同样按行贴出去
     if (Array.isArray(value)) {
-      return value.map((v, i) => (rows[i] ? `${rows[i]}：${v}` : String(v))).join(' · ')
+      return value.map((v, i) => (rows[i] ? `${rows[i]}：${show(v)}` : String(v))).join(' · ')
     }
     const obj = value && typeof value === 'object' ? value : {}
     return (rows.length ? rows : Object.keys(obj))
       .map(r => [r, obj[r]]).filter(([, v]) => v !== undefined && v !== null && String(v) !== '')
-      .map(([r, v]) => `${r}：${v}`).join(' · ')
+      .map(([r, v]) => `${r}：${show(v)}`).join(' · ')
   }
   if (type === 'subform') {
     const labels = Object.fromEntries((field.props?.fields || []).map(sf => [sf.id, sf.label]))
@@ -315,12 +337,13 @@ export function answerText(field, value) {
   }
   if (Array.isArray(value)) {
     // 排序题：数组顺序就是答案，用箭头连起来才看得出「他排成了这样」
-    if (type === 'sort') return value.map(String).join(' → ')
-    return value.map(v => (v && typeof v === 'object' ? (v.name || v.url || JSON.stringify(v)) : String(v))).join('、')
+    if (type === 'sort') return value.map(v => optionLabel(field, v)).join(' → ')
+    return value.map(v => (v && typeof v === 'object'
+      ? (v.name || v.url || JSON.stringify(v))
+      : LABELED.has(type) ? optionLabel(field, v) : String(v))).join('、')
   }
-  if (typeof value === 'object') return Object.values(value).map(String).join('、')
-  // 图片/定位等长值截断，别把一张 dataURL 塞进反馈框
-  return String(value).length > 80 ? String(value).slice(0, 80) + '…' : String(value)
+  if (typeof value === 'object') return Object.values(value).map(v => (LABELED.has(type) ? optionLabel(field, v) : String(v))).join('、')
+  return cut(LABELED.has(type) ? optionLabel(field, value) : String(value))
 }
 
 /**
@@ -463,7 +486,7 @@ export function createStatsAccumulator(form) {
         return { ...base, kind: 'subform', labels, samples: [], rows: 0 }
       }
       default:
-        return { ...base, kind: 'text', samples: [] }
+        return { ...base, kind: 'text', samples: [], textCounts: new Map() }
     }
   }
 
@@ -548,7 +571,19 @@ export function createStatsAccumulator(form) {
             break
           }
           default: {
-            if (cell.samples.length < 20) cell.samples.push(String(flat(v)).slice(0, 60))
+            /*
+             * 自由作答的样本要能看出「哪句话被说得最多」。
+             *
+             * 以前是「前 20 条原样列出来」：26 份答卷里 6 种说法，屏幕上就是同一句
+             * 重复四遍——真正要看的分布被稀释掉了。现在按出现次数合并，
+             * 次数多的排前面；只列不同的说法，样本数上限也改成「不同说法的条数」。
+             */
+            const text = String(flat(v)).slice(0, 60).trim()
+            if (!text) break
+            const hit = cell.textCounts.get(text)
+            if (hit) hit.n++
+            else if (cell.textCounts.size < 20) cell.textCounts.set(text, { text, n: 1 })
+            break
           }
         }
       }
@@ -621,7 +656,11 @@ export function createStatsAccumulator(form) {
           item.samples = cell.samples
           item.rows = cell.rows
         } else {
-          item.samples = cell.samples
+          // 说法多的排前面：同一句被 10 个人说到，比 10 句各说一次更该占第一行
+          const ranked = [...cell.textCounts.values()].sort((a, b) => b.n - a.n)
+          item.samples = ranked.map(x => x.text)
+          item.sampleCounts = ranked.map(x => x.n)
+          item.distinct = ranked.length
         }
         list.push(item)
       }

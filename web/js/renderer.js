@@ -606,6 +606,9 @@ function initSignature(canvas, onChange) {
   canvas.addEventListener('touchend', end)
 }
 
+/** 选项值型的题：作答存的是 value，展示要换成 label */
+const LABELED_TYPES = new Set(['radio', 'select', 'checkbox', 'carousel', 'sort', 'matrix'])
+
 /**
  * 作答 → 人能读的一行。与服务端 lib/forms.js 的 answerText 同一口径：
  * 排序题的数组顺序就是答案，用 → 连起来才看得出「他排成了这样」；
@@ -615,6 +618,13 @@ function initSignature(canvas, onChange) {
 export function answerDisplay(field, value) {
   const type = field?.type
   if (value === undefined || value === null || value === '') return ''
+  // 选项的 value 是入库口径（字典是 1/2/3，组织架构取人是 u12/d3），
+  // 表格和明细里必须显示 label，否则看到的是「u12 提交了一份问卷」
+  const show = (v) => {
+    if (!LABELED_TYPES.has(type)) return String(v)
+    const hit = (field.options || []).find(o => String(o?.value) === String(v))
+    return hit ? String(hit.label ?? hit.value ?? '') : String(v)
+  }
   // 级联只存末级值：表格里必须铺成完整路径，否则一列「西湖区」谁也认不出是哪儿
   if (type === 'cascader') {
     const path = cascadeLabelPath(field.options, Array.isArray(value) ? value[value.length - 1] : value)
@@ -622,11 +632,11 @@ export function answerDisplay(field, value) {
   }
   if (type === 'matrix') {
     const rows = Array.isArray(field?.props?.rows) ? field.props.rows : []
-    if (Array.isArray(value)) return value.map((v, i) => (rows[i] ? `${rows[i]}：${v}` : String(v))).join(' · ')
+    if (Array.isArray(value)) return value.map((v, i) => (rows[i] ? `${rows[i]}：${show(v)}` : String(v))).join(' · ')
     const obj = value && typeof value === 'object' ? value : {}
     const keys = rows.length ? rows : Object.keys(obj)
     return keys.map(r => [r, obj[r]]).filter(([, v]) => v !== undefined && v !== null && String(v) !== '')
-      .map(([r, v]) => `${r}：${v}`).join(' · ')
+      .map(([r, v]) => `${r}：${show(v)}`).join(' · ')
   }
   if (type === 'subform') {
     const labels = Object.fromEntries((field.props?.fields || []).map(sf => [sf.id, sf.label]))
@@ -637,11 +647,12 @@ export function answerDisplay(field, value) {
     }).filter(Boolean).join('\n')
   }
   if (Array.isArray(value)) {
-    if (type === 'sort') return value.map(String).join(' → ')
-    return value.map(v => (v && typeof v === 'object' ? (v.name || v.url || JSON.stringify(v)) : String(v))).join('、')
+    if (type === 'sort') return value.map(show).join(' → ')
+    return value.map(v => (v && typeof v === 'object' ? (v.name || v.url || JSON.stringify(v)) : show(v))).join('、')
   }
-  if (typeof value === 'object') return Object.entries(value).map(([k, v]) => `${k}：${v}`).join('；')
-  return String(value).length > 200 ? String(value).slice(0, 200) + '…' : String(value)
+  if (typeof value === 'object') return Object.entries(value).map(([k, v]) => `${k}：${show(v)}`).join('；')
+  const text = show(value)
+  return text.length > 200 ? text.slice(0, 200) + '…' : text
 }
 
 /**

@@ -3448,7 +3448,71 @@ try {
     await req('DELETE', `/api/depts/${dA}`)
   }
 
-  console.log('\n[44] 前端静态资源')
+  console.log('\n[44] 展示口径：选项值换成选项文字 + 填空答案不再丢')
+  {
+    // ---- 导出与明细：value 是 u12 / 1 这种机器口径，人看的是 label
+    const { answerText, optionLabel, computeStats } = await import('../server/lib/forms.js')
+    const { submissionRow, submissionsHead } = await import('../server/lib/sheet.js')
+    const orgField = {
+      id: 'owner', type: 'radio', label: '值班人',
+      options: [{ label: '技术中心 / 后端组 / 张伟', value: 'u3' }, { label: '技术中心 / 前端组 / 李娜', value: 'u4' }]
+    }
+    const skillField = { id: 'skills', type: 'checkbox', label: '技能', options: [{ label: 'Java', value: '1' }, { label: 'Go', value: '2' }] }
+    const matrixField = { id: 'm', type: 'matrix', label: '评价', props: { rows: ['速度', '稳定'] }, options: [{ label: '很满意', value: '5' }, { label: '一般', value: '3' }] }
+    const sortField = { id: 's', type: 'sort', label: '排序', options: [{ label: '甲', value: 'a' }, { label: '乙', value: 'b' }] }
+    const dictField = { id: 'edu', type: 'select', label: '学历', options: [{ label: '本科', value: '3' }, { label: '硕士', value: '4' }] }
+
+    assert(optionLabel(orgField, 'u3') === '技术中心 / 后端组 / 张伟', '组织架构取人的 value 能换回完整路径')
+    assert(answerText(orgField, 'u3') === '技术中心 / 后端组 / 张伟', '答卷明细里显示的是人，不是 u3')
+    assert(answerText(skillField, ['1', '2']) === 'Java、Go', '多选显示选项文字而不是 1,2')
+    assert(answerText(dictField, '3') === '本科', '字典取用的选项显示 label 而不是码值')
+    assert(/速度：很满意/.test(answerText(matrixField, { 速度: '5', 稳定: '3' })), '矩阵每行的列值也换成人话', answerText(matrixField, { 速度: '5', 稳定: '3' }))
+    assert(answerText(sortField, ['b', 'a']) === '乙 → 甲', '排序题按顺序显示选项文字')
+
+    const fakeForm = { kind: 'survey', schema: [orgField, skillField, matrixField, sortField] }
+    const { schema } = submissionsHead(fakeForm)
+    const row = submissionRow(fakeForm, schema, {
+      id: 1, public_id: 'A1', created_at: '2026-01-01T00:00:00Z', score: null, passed: null,
+      data: { owner: 'u3', skills: ['1', '2'], m: { 速度: '5', 稳定: '3' }, s: ['b', 'a'] }
+    })
+    assert(row[2] === '技术中心 / 后端组 / 张伟', '导出的 Excel 里是完整路径而不是 u3', row[2])
+    assert(row[3] === 'Java、Go', '导出的 Excel 里多选是选项文字', row[3])
+    assert(!/\{/.test(row[4]), '导出的 Excel 里矩阵不是一坨 JSON', row[4])
+    assert(row[5] === '乙 → 甲', '导出的 Excel 里排序带箭头', row[5])
+    // 判分口径不能跟着变：仍然按 value 比
+    const { isAnswerCorrect } = await import('../server/lib/forms.js')
+    assert(isAnswerCorrect({ ...orgField, answer: ['u3'] }, 'u3') === true, '展示换成人话，判分仍比 value')
+
+    // ---- 自由作答：同一句说法要合并计数，别让重复句把别的说法挤出屏幕
+    const textField = { id: 'advice', type: 'textarea', label: '建议' }
+    const acc = computeStats({ kind: 'survey', schema: [textField] }, [
+      { data: { advice: '希望能多招人' }, score: null, passed: null, created_at: '2026-01-01T00:00:00Z' },
+      { data: { advice: '希望能多招人' }, score: null, passed: null, created_at: '2026-01-01T00:00:00Z' },
+      { data: { advice: '希望能多招人' }, score: null, passed: null, created_at: '2026-01-01T00:00:00Z' },
+      { data: { advice: '文档要跟上' }, score: null, passed: null, created_at: '2026-01-01T00:00:00Z' }
+    ])
+    const stat = acc.questions[0]
+    assert(stat.distinct === 2, '四种作答只有两种说法', String(stat.distinct))
+    assert(stat.samples[0] === '希望能多招人' && stat.sampleCounts[0] === 3, '出现次数最多的说法排第一并带次数', JSON.stringify(stat.sampleCounts))
+
+    // ---- 文本导入：填空题的「答案：6379」是标准答案，不是占位提示
+    r = await req('POST', '/api/banks', { name: '填空答案探针' })
+    const bid = r.json.id
+    r = await req('POST', `/api/banks/${bid}/import-text`, {
+      text: ['[填空] Redis 默认端口号是____。', '答案：6379', '分值：5'].join('\n')
+    })
+    assert(r.json.imported === 1, '填空题导入成功', JSON.stringify(r.json))
+    r = await req('GET', `/api/banks/${bid}/questions`)
+    assert(JSON.stringify(r.json.data[0]?.answer) === JSON.stringify(['6379']), '填空题的答案落库了，不是被当成占位提示丢掉', JSON.stringify(r.json.data[0]?.answer))
+    // 进了卷子才算真的可判分
+    r = await req('POST', '/api/banks/paper/pick', { title: '填空答案卷', questionIds: [r.json.data[0].id] })
+    assert(r.status === 201 && r.json.noAnswer.length === 0, '填空题组卷时不再被标成「没有标准答案」', JSON.stringify(r.json.noAnswer))
+    await req('DELETE', `/api/forms/${r.json.id}`)
+    await req('DELETE', `/api/banks/${bid}`)
+    await req('DELETE', `/api/banks/${bid}/purge`)
+  }
+
+  console.log('\n[45] 前端静态资源')
 
   for (const p of ['/', '/js/main.js', '/css/app.css', '/js/views/Logs.js', '/js/views/Dicts.js', '/assets/eqs-mark.svg', '/vendor/echarts.min.js']) {
     const res = await fetch(BASE + p)

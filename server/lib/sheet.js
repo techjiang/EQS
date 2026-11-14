@@ -1,4 +1,4 @@
-import { normalizeField, coerceAnswerToField } from './forms.js'
+import { normalizeField, coerceAnswerToField, answerText } from './forms.js'
 import { buildXlsx, readXlsx } from './xlsx.js'
 import { cascadeLabelPath } from '../../web/js/cascade.js'
 
@@ -240,25 +240,19 @@ export function questionsXlsx(questions, sheetName = '题目') {
 /** 答卷导出：列来自表单 schema */
 /** 答卷的一行 → 表格一行（导出与流式导出的唯一口径，避免两条实现走偏） */
 export function submissionRow(form, schema, r) {
+  /*
+   * 这一格必须和答卷明细、交卷回顾讲同一句话。
+   *
+   * 以前这里自己写了一套：单选取值原样输出（组织架构取人就是 u12、字典取用就是 3），
+   * 多选 join 成「1,2」，矩阵直接 JSON.stringify 成 {"速度":"5"}。
+   * 做报表的人拿到这么一列，还得自己去翻码表才知道是谁。
+   * 现在统一走 answerText（max: 0 不截断，导出要的是完整数据）。
+   */
   const cell = (v, f) => {
     if (v === undefined || v === null || v === '') return ''
-    // 级联只存末级值：导出成「浙江省 / 杭州市 / 西湖区」，
-    // 否则一张表里全是「西湖区」，打开的人得自己回忆这是哪个省的
-    if (f.type === 'cascader') {
-      const leaf = Array.isArray(v) ? v[v.length - 1] : v
-      return cascadeLabelPath(f.options, leaf) || leaf
-    }
-    if (Array.isArray(v)) {
-      if (v.some(x => x && typeof x === 'object')) {
-        const labels = Object.fromEntries((f.props?.fields || []).map(sf => [sf.id, sf.label]))
-        return v.map(row => Object.entries(row || {})
-          .filter(([, x]) => x !== undefined && x !== null && String(x).trim() !== '')
-          .map(([k, x]) => `${labels[k] || k}：${x}`).join(' / ')).filter(Boolean).join('\n')
-      }
-      return v.join(',')
-    }
-    if (typeof v === 'object') return JSON.stringify(v)
-    return v
+    const text = answerText(f, v, { max: 0 })
+    // 子表单 / 多行文本在 Excel 里换行才读得下去；单元格内换行由写盘层负责
+    return text
   }
   return [
     r.public_id || String(r.id),

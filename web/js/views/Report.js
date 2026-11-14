@@ -269,7 +269,21 @@ export default {
                         `范围 ${q.min ?? '-'} ~ ${q.max ?? '-'} · ${q.count} 份作答`)
                     ])
                   : h('div', { class: 'card-b' }, q.samples?.length
-                      ? q.samples.map(s => h('div', { class: 'small', style: 'padding:6px 10px;background:var(--panel-2);border-radius:8px;margin-bottom:5px' }, s))
+                      ? [
+                          // 同一句话被多个人说到时给出次数：只列原文的话，
+                          // 「希望需求变更少一点」重复四遍就把别的说法挤出屏幕了
+                          q.distinct > 1
+                            ? h('div', { class: 'small muted', style: 'margin-bottom:6px' },
+                                `${q.count} 份作答，${q.distinct} 种说法${q.distinct < q.count ? '（按出现次数排）' : ''}`)
+                            : null,
+                          ...q.samples.map((s, i) => h('div', {
+                            class: 'flex between small',
+                            style: 'gap:10px;padding:6px 10px;background:var(--panel-2);border-radius:8px;margin-bottom:5px'
+                          }, [
+                            h('span', { style: 'word-break:break-word' }, s),
+                            q.sampleCounts?.[i] > 1 ? h('span', { class: 'tag', style: 'flex:none' }, `×${q.sampleCounts[i]}`) : null
+                          ]))
+                        ]
                       : h('span', { class: 'muted small' }, '暂无作答'))
             ])))
           ])
