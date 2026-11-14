@@ -48,6 +48,7 @@ export const FIELD_GROUPS = [
       { type: 'qrcode', label: '扫码', icon: '▣' },
       { type: 'subform', label: '子表单', icon: '⧉+' },
       { type: 'captcha', label: '验证码', icon: '⌘' },
+      { type: 'calculate', label: '计算题', icon: '=' },
       { type: 'image', label: '图片展示', icon: '▧' },
       { type: 'divider', label: '分割线', icon: '—' },
       { type: 'richtext', label: '富文本说明', icon: '§' }
@@ -100,6 +101,8 @@ export function blankField(type) {
   if (type === 'subform') base.props = { fields: [{ id: uid(), type: 'text', label: '子项' }] }
   if (type === 'divider') base.label = ''
   if (type === 'richtext') base.props = { html: '在这里写一段说明文字。' }
+  // 计算题：只读，值由公式算出来；默认给一个能直接跑的例子，省得对着空输入框猜语法
+  if (type === 'calculate') base.props = { formula: '', precision: 2, unit: '' }
   return base
 }
 
@@ -114,6 +117,7 @@ export function defaultData(schema) {
     else if (f.type === 'matrix') data[f.id] = {}
     else if (f.type === 'switch') data[f.id] = f.defaultValue === true || f.defaultValue === 'true' || f.defaultValue === 1
     else if (f.type === 'subform') data[f.id] = []
+    else if (f.type === 'calculate') data[f.id] = ''
     else data[f.id] = f.defaultValue ?? ''
   }
   return data

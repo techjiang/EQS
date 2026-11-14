@@ -217,9 +217,20 @@ export default {
               ]),
               q.series?.length
                 ? h('div', { id: 'chart_' + q.id, class: 'chart' })
-                : h('div', { class: 'card-b' }, q.samples?.length
-                    ? q.samples.map(s => h('div', { class: 'small', style: 'padding:6px 10px;background:var(--panel-2);border-radius:8px;margin-bottom:5px' }, s))
-                    : h('span', { class: 'muted small' }, '暂无作答'))
+                // 数字 / 滑块这类没有「选项分布」的题，只有均值与范围可看：
+                // 以前直接落到「暂无作答」，明明库里 13 份都填了数字
+                : q.average != null && q.count
+                  ? h('div', { class: 'card-b' }, [
+                      h('div', { class: 'flex between', style: 'align-items:baseline' }, [
+                        h('b', { style: 'font-size:26px;font-variant-numeric:tabular-nums' }, String(q.average)),
+                        h('span', { class: 'small muted' }, '平均值')
+                      ]),
+                      h('div', { class: 'small muted', style: 'margin-top:6px' },
+                        `范围 ${q.min ?? '-'} ~ ${q.max ?? '-'} · ${q.count} 份作答`)
+                    ])
+                  : h('div', { class: 'card-b' }, q.samples?.length
+                      ? q.samples.map(s => h('div', { class: 'small', style: 'padding:6px 10px;background:var(--panel-2);border-radius:8px;margin-bottom:5px' }, s))
+                      : h('span', { class: 'muted small' }, '暂无作答'))
             ])))
           ])
     ])

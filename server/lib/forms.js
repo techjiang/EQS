@@ -1,12 +1,18 @@
 import crypto from 'node:crypto'
 import { get, all, run, now } from './db.js'
+// 逻辑规则（显示 / 必填 / 计算 / 跳转 / 自动填入）与浏览器共用同一份实现。
+// 各写一遍的下场在判分上已经演过：三个入口三套口径，同一道题三种结论。
+import { buildFlow, resolveAnswers, renderText, evalFormula } from '../../web/js/flow.js'
 
 export const FIELD_TYPES = [
   'text', 'textarea', 'number', 'date', 'datetime', 'time', 'select', 'radio', 'checkbox',
   'switch', 'rate', 'nps', 'slider', 'upload', 'file', 'sort', 'cascader', 'carousel',
   'location', 'phone', 'email', 'idcard', 'matrix', 'subform', 'signature', 'qrcode',
-  'divider', 'richtext', 'image', 'html', 'captcha'
+  'divider', 'richtext', 'image', 'html', 'captcha', 'calculate'
 ]
+
+/** 只用于展示、不收作答也不参与判分的组件 */
+export const DISPLAY_TYPES = new Set(['divider', 'richtext', 'html', 'image', 'calculate'])
 
 const CHOICE = new Set(['select', 'radio', 'checkbox', 'sort', 'cascader', 'carousel', 'matrix'])
 
@@ -31,6 +37,12 @@ export function normalizeField(f, i = 0) {
     // 标签只对题库/组卷有意义，但 schema 是前后端共用的结构，顺手带上，避免题型之外再开一条通道
     tags: typeof f.tags === 'string' ? f.tags : Array.isArray(f.tags) ? f.tags.join(',') : '',
     logic: Array.isArray(f.logic) ? f.logic : [],
+    // 动态必填：满足时必填，否则可不填；为空则按 required
+    requiredWhen: Array.isArray(f.requiredWhen) ? f.requiredWhen : [],
+    // 条件跳转（提前结束）：命中则本题之后的题目作废，并显示 text
+    jump: Array.isArray(f.jump) ? f.jump : [],
+    // 自动填入：来源题有作答时，把值（可选经映射）填进空着的本题
+    fill: f.fill && typeof f.fill === 'object' ? f.fill : null,
     props: typeof f.props === 'object' && f.props ? f.props : {}
   }
   if (CHOICE.has(type) && out.options.length === 0 && type !== 'matrix') {
@@ -160,17 +172,27 @@ export function captchaChallenge(id) {
   return { a: (sum % 7) + 2, b: (sum % 5) + 2 }
 }
 
-export function validateSubmission(schema, data) {
+/**
+ * 提交校验。
+ *
+ * 口径从「按 schema 逐题看」换成「按逻辑计算出这份作答的真实范围」：
+ * 隐藏的题不校验（原有行为），被条件跳转跳过的题同样不校验，
+ * 动态必填只看当下满足不满足——否则「选了『无』还要填说明」这种题永远提交不上去。
+ */
+export function validateSubmission(schema, rawData) {
   const errors = []
+  const flow = buildFlow(schema, rawData)
+  const data = flow.data
   for (const f of schema) {
-    if (!fieldVisible(f, data)) continue
-    if (['divider', 'richtext', 'image', 'html'].includes(f.type)) continue
+    // 跳过的、隐藏的都不在作答范围内
+    if (!flow.active.has(f.id)) continue
+    if (DISPLAY_TYPES.has(f.type)) continue
     const v = data[f.id]
     // 排序题的空数组要真正算「没作答」：它一旦被默认填满，必填就成了摆设
     // 数组：空数组是没作答；子表单还要看「每行都空」；排序/多选这类值数组本身有元素就算作答
     const empty = v === undefined || v === null || v === '' || (Array.isArray(v) && (v.length === 0 ||
       (f.type === 'subform' && v.every(row => !row || typeof row !== 'object' || Object.values(row).every(x => x === undefined || x === null || String(x).trim() === '')))))
-    if (f.required && empty) { errors.push(`${f.label} 为必填项`); continue }
+    if (flow.required.get(f.id) && empty) { errors.push(`${f.label} 为必填项`); continue }
     if (empty) continue
     if (f.type === 'phone' && !/^1[3-9]\d{9}$/.test(String(v))) errors.push(`${f.label} 手机号格式不正确`)
     if (f.type === 'email' && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(v))) errors.push(`${f.label} 邮箱格式不正确`)
@@ -291,14 +313,18 @@ export function answerText(field, value) {
  * 既没答案也没人批的主观题，只算进卷面总分，不进可判分总分——否则「全对也永远不及格」。
  * @param manual { [fieldId]: number } 老师给的分
  */
-export function gradeSubmission(schema, data, settings = {}, manual = {}) {
+export function gradeSubmission(schema, rawData, settings = {}, manual = {}) {
+  // 判分范围与校验同一口径：隐藏的、被跳转跳过的不进总分。
+  // 否则「不符合条件直接结束」的那份卷子，满分仍然按全套题算，及格线当场失真。
+  const flow = buildFlow(schema, rawData)
+  const data = flow.data
   let total = 0
   let got = 0
   let scored = 0
   let ungraded = 0
   let paperTotal = 0
   for (const f of schema) {
-    if (!f.score || !fieldVisible(f, data)) continue
+    if (!f.score || !flow.active.has(f.id)) continue
     paperTotal += f.score
     if (f.answer?.length) {
       total += f.score
@@ -320,7 +346,7 @@ export function gradeSubmission(schema, data, settings = {}, manual = {}) {
 }
 
 /** 验证码是防机器人的，不是题目；哪怕误填了分值也不该进阅卷队列 */
-const NO_GRADE_TYPES = new Set(['captcha', 'divider', 'richtext', 'html', 'image'])
+const NO_GRADE_TYPES = new Set(['captcha', 'divider', 'richtext', 'html', 'image', 'calculate'])
 
 /** 需要人工给分的题：有分值、无标准答案、不是说明类组件 */
 export function isSubjective(f) {
@@ -337,8 +363,9 @@ export function pendingLeft(form, row) {
   const manual = manualScoresOf(row)
   // 直接查库拿到的是未解析的行，schema 还是 JSON 字符串
   const schema = Array.isArray(form.schema) ? form.schema : safeJson(form.schema, [])
+  const flow = buildFlow(schema, data)
   return schema.filter(f =>
-    isSubjective(f) && fieldVisible(f, data) && !Object.prototype.hasOwnProperty.call(manual, f.id)
+    isSubjective(f) && flow.active.has(f.id) && !Object.prototype.hasOwnProperty.call(manual, f.id)
   ).length
 }
 
@@ -422,7 +449,7 @@ export function createStatsAccumulator(form) {
 
   for (const f of schema) {
     // 验证码只是防刷手段，统计它等于把「3+4」的答案摊在报表上；分割线/富文本/图片本来就没有作答
-    if (['divider', 'richtext', 'html', 'image', 'captcha'].includes(f.type)) continue
+    if (['divider', 'richtext', 'html', 'image', 'captcha', 'calculate'].includes(f.type)) continue
     answers.set(f.id, makeCell(f))
   }
 

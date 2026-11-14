@@ -5,6 +5,7 @@ import { Icon } from '../icons.js'
 import { ok, err, confirmBox, promptBox } from '../ui.js'
 import { FIELD_GROUPS, blankField, fieldMeta, hasOptions, defaultData, uid } from '../fields.js'
 import { renderControl, FormRenderer, fieldVisible } from '../renderer.js'
+import { OP_LABELS } from '../flow.js'
 import { state } from '../store.js'
 
 
@@ -127,6 +128,51 @@ export default {
       const others = form.value.schema.filter(f => f.id !== active.value.id)
       if (!others.length) return err('至少需要其他题目才能设置逻辑')
       active.value.logic.push({ fieldId: others[0].id, op: 'eq', value: '' })
+    }
+
+    /**
+     * 条件规则编辑器。显隐、动态必填、条件跳转三种规则形状一样（fieldId/op/value），
+     * 所以共用一个编辑器：三套各自的 UI 只会让「为什么这条规则不生效」多三种查法。
+     */
+    const ruleList = (f, key, { extra } = {}) => {
+      const list = f[key] || (f[key] = [])
+      const others = form.value.schema.filter(x => x.id !== f.id)
+      const add = () => {
+        if (!others.length) return err('至少需要其他题目才能设置条件')
+        list.push({ fieldId: others[0].id, op: 'eq', value: '', ...(extra ? extra() : {}) })
+      }
+      return h('div', { class: 'field' }, [
+        // 没有规则时不摆一个空标签行：上面已经有说明文字，这里只留按钮
+        list.length ? null : h('div', { class: 'flex', style: 'margin-bottom:4px' }, [
+          h('button', { class: 'btn ghost sm', onClick: add }, '+ 添加条件')
+        ]),
+        list.length ? h('div', { class: 'flex', style: 'justify-content:flex-end;margin-bottom:4px' }, [
+          h('button', { class: 'btn ghost sm', onClick: add }, '+ 再添加一条')
+        ]) : null,
+        ...list.map((rule, i) => h('div', { style: 'border:1px solid var(--line);border-radius:9px;padding:8px;margin-bottom:6px' }, [
+          h('select', {
+            class: 'select', style: 'height:30px;margin-bottom:5px', value: rule.fieldId,
+            onChange: e => rule.fieldId = e.target.value
+          }, others.map(x => h('option', { value: x.id }, x.label || x.type))),
+          h('div', { class: 'flex', style: 'gap:5px' }, [
+            h('select', {
+              class: 'select', style: 'height:30px;width:96px', value: rule.op,
+              onChange: e => rule.op = e.target.value
+            }, Object.entries(OP_LABELS).map(([v, l]) => h('option', { value: v }, l))),
+            h('input', {
+              class: 'input', style: 'height:30px;flex:1', value: rule.value, placeholder: '比较值',
+              onInput: e => rule.value = e.target.value
+            }),
+            h('button', { class: 'btn ghost sm', onClick: () => list.splice(i, 1) }, '×')
+          ]),
+          // 条件跳转要多一句「结束语」：否则用户不知道这份问卷为什么突然就完事了
+          key === 'jump' ? h('input', {
+            class: 'input', style: 'height:30px;margin-top:5px', value: rule.text || '',
+            placeholder: '结束后显示的说明，例如：感谢填写，您暂不符合条件',
+            onInput: e => rule.text = e.target.value
+          }) : null
+        ]))
+      ])
     }
 
     const publishToggle = async () => {
@@ -385,31 +431,77 @@ export default {
           }))
         ]) : null,
         h('div', { class: 'field' }, [
-          h('label', { class: 'flex between' }, [
-            h('span', {}, '显示逻辑'),
-            h('button', { class: 'btn ghost sm', onClick: addLogic }, '+ 条件')
-          ]),
+          h('label', { class: 'flex between' }, [h('span', {}, '显示条件')]),
           (f.logic || []).length === 0
             ? h('div', { class: 'hint' }, '无条件下始终显示')
-            : f.logic.map((rule, i) => h('div', { style: 'border:1px solid var(--line);border-radius:9px;padding:8px;margin-bottom:6px' }, [
-              h('select', {
-                class: 'select', style: 'height:30px;margin-bottom:5px', value: rule.fieldId,
-                onChange: e => rule.fieldId = e.target.value
-              }, form.value.schema.filter(x => x.id !== f.id).map(x => h('option', { value: x.id }, x.label || x.type))),
-              h('div', { class: 'flex', style: 'gap:5px' }, [
-                h('select', {
-                  class: 'select', style: 'height:30px;width:96px', value: rule.op,
-                  onChange: e => rule.op = e.target.value
-                }, [['eq', '等于'], ['ne', '不等于'], ['contains', '包含'], ['in', '任意等于'], ['gt', '大于'], ['lt', '小于'], ['empty', '为空'], ['notEmpty', '不为空']]
-                  .map(([v, l]) => h('option', { value: v }, l))),
-                h('input', {
-                  class: 'input', style: 'height:30px;flex:1', value: rule.value, placeholder: '比较值',
-                  onInput: e => rule.value = e.target.value
-                }),
-                h('button', { class: 'btn ghost sm', onClick: () => f.logic.splice(i, 1) }, '×')
-              ])
-            ]))
-        ])
+            : null
+        ]),
+        ruleList(f, 'logic'),
+        h('div', { class: 'field' }, [
+          h('label', {}, '动态必填'),
+          h('div', { class: 'hint' }, (f.requiredWhen || []).length
+            ? '满足下列条件时必填；不满足可以不填（覆盖上面的「必填」开关）'
+            : '留空即按上面的「必填」开关；加条件可做成「选了其他才必填」')
+        ]),
+        ruleList(f, 'requiredWhen'),
+        h('div', { class: 'field' }, [
+          h('label', {}, '条件跳转（提前结束）'),
+          h('div', { class: 'hint' }, (f.jump || []).length
+            ? '本题作答满足条件时，后面的题目不再展示，直接交卷'
+            : '例如：不符合资格就直接结束，不必让填完 20 道题再告诉他')
+        ]),
+        ruleList(f, 'jump'),
+        // 自动填入：来源题 → 本题。典型场景是「同一份联系人信息填两次」
+        h('div', { class: 'field' }, [
+          h('label', {}, '自动填入'),
+          h('select', {
+            class: 'select', style: 'height:32px', value: f.fill?.from || '',
+            onChange: e => f.fill = e.target.value ? { from: e.target.value, map: f.fill?.map || {} } : null
+          }, [
+            h('option', { value: '' }, '不自动填入'),
+            ...form.value.schema.filter(x => x.id !== f.id && x.type !== 'calculate')
+              .map(x => h('option', { value: x.id }, `从「${x.label || x.type}」带入`))
+          ]),
+          h('div', { class: 'hint' }, '只在本题还空着时填入，不会覆盖已答内容'),
+          f.fill?.from ? h('input', {
+            class: 'input', style: 'height:32px;margin-top:6px',
+            value: Object.entries(f.fill.map || {}).map(([k, v]) => `${k}=${v}`).join(','),
+            placeholder: '可选：值映射，例如 是=已同意,否=未同意',
+            onInput: e => {
+              const map = {}
+              for (const part of e.target.value.split(/[,，]/)) {
+                const i = part.indexOf('=')
+                if (i > 0) map[part.slice(0, i).trim()] = part.slice(i + 1).trim()
+              }
+              f.fill = { from: f.fill.from, map }
+            }
+          }) : null
+        ]),
+        // 计算题：公式 + 精度 + 单位
+        f.type === 'calculate' ? h('div', { class: 'field' }, [
+          h('label', {}, '公式'),
+          h('input', {
+            class: 'input', value: f.props?.formula || '', placeholder: '例如：{{单价}} * {{数量}} * 0.9',
+            onInput: e => f.props = { ...f.props, formula: e.target.value }
+          }),
+          h('div', { class: 'hint' }, '用 {{题干}} 或 {{字段id}} 引用其它题；只支持 + - * / % 与括号，没有 eval'),
+          h('div', { class: 'row', style: 'margin-top:6px' }, [
+            h('div', { class: 'field' }, [
+              h('label', {}, '保留小数'),
+              h('input', {
+                class: 'input', type: 'number', min: 0, max: 6, value: f.props?.precision ?? 2,
+                onInput: e => f.props = { ...f.props, precision: Number(e.target.value) }
+              })
+            ]),
+            h('div', { class: 'field' }, [
+              h('label', {}, '单位'),
+              h('input', {
+                class: 'input', value: f.props?.unit || '', placeholder: '元 / 分 / 人',
+                onInput: e => f.props = { ...f.props, unit: e.target.value }
+              })
+            ])
+          ])
+        ]) : null,
       ])
     }
 
@@ -613,7 +705,8 @@ export default {
                   f.required ? h('span', { class: 'req' }, '*') : null
                 ]),
                 f.description ? h('div', { class: 'fs-desc' }, f.description) : null,
-                h('div', { style: 'pointer-events:none' }, renderControl(f, previewModel.value))
+                // 计算题要拿到整张 schema 才能算：只给它自己，公式里的 {{单价}} 解析不出来
+                h('div', { style: 'pointer-events:none' }, renderControl(f, previewModel.value, { schema: form.value.schema }))
               ])))
           ])
         ]),

@@ -1,5 +1,7 @@
 import { h } from '/vendor/vue.esm.js'
 import { escapeHtml } from './ui.js'
+// 逻辑规则的唯一实现，服务端 import 的是同一个文件
+import { buildFlow, renderText, OP_LABELS, evalFormula, roundTo } from './flow.js'
 
 const findMeta = (type) => type
 
@@ -11,25 +13,17 @@ function FieldLabel(f) {
   ])
 }
 
+/**
+ * 条件显隐。真正实现搬到 flow.js：那份文件服务端也会 import，
+ * 这样「页面上能提交」和「服务端认为能提交」不可能出现两种答案。
+ */
 export function fieldVisible(field, data) {
-  const rules = field.logic || []
-  if (!rules.length) return true
-  return rules.every(r => {
-    const v = data[r.fieldId]
-    const flat = Array.isArray(v) ? v.join(',') : v
-    switch (r.op) {
-      case 'eq': return String(flat) === String(r.value)
-      case 'ne': return String(flat) !== String(r.value)
-      case 'in': return Array.isArray(r.value) ? r.value.map(String).includes(String(flat)) : String(flat) === String(r.value)
-      case 'contains': return Array.isArray(v) ? v.map(String).includes(String(r.value)) : String(flat ?? '').includes(String(r.value))
-      case 'gt': return Number(flat) > Number(r.value)
-      case 'lt': return Number(flat) < Number(r.value)
-      case 'empty': return flat === '' || flat === undefined || flat === null
-      case 'notEmpty': return !(flat === '' || flat === undefined || flat === null)
-      default: return true
-    }
-  })
+  const flow = buildFlow([field], data)
+  return flow.visible.get(field.id) !== false
 }
+
+/** 题干 / 说明里的 {{字段}} 换成作答；不认识的引用给空串而不是把 {{xxx}} 原样留着 */
+export { renderText, OP_LABELS }
 
 /**
  * 输入控件的值绑定。
@@ -328,6 +322,16 @@ export function renderControl(field, model, opts = {}) {
         ])
       ])
     }
+    case 'calculate': {
+      // 单独用 renderControl 的地方（答卷详情、批阅面板）也要能画出这道题
+      const v = evalFormula(field.props?.formula, opts.schema || [field], model)
+      const shown = v === null ? (val ?? '') : roundTo(v, field.props?.precision)
+      return h('div', { class: 'flex', style: 'gap:8px;align-items:center' }, [
+        h('span', { class: 'calc-value' }, String(shown === '' ? 0 : shown)),
+        field.props?.unit ? h('span', { class: 'small muted' }, field.props.unit) : null,
+        h('span', { class: 'small muted' }, '自动计算')
+      ])
+    }
     case 'image':
       if (!field.props?.src) return h('div', { class: 'hint' }, '未设置图片地址')
       return h('div', { style: 'border-radius:12px;overflow:hidden' }, h('img', {
@@ -492,23 +496,53 @@ export function answerDisplay(field, value) {
   return String(value).length > 200 ? String(value).slice(0, 200) + '…' : String(value)
 }
 
-/** 渲染整张表单（预览 / 公开填写） */
+/**
+ * 渲染整张表单（预览 / 公开填写）。
+ *
+ * 这里不再是「filter 一下显隐就把剩下的画出来」，而是先跑一遍逻辑：
+ *  - 显隐       隐藏的不画
+ *  - 动态必填   星号跟着当前作答变（选了「其他」才必填，而不是从头到尾都标红）
+ *  - 计算       calculate 渲染成只读、带公式说明
+ *  - 自动填入   fill 规则算出来的值直接体现在值上
+ *  - 条件跳转   命中就停下，并在那个位置说明「为什么到此为止」
+ *  - 文本替换   题干、说明里的 {{字段}} 换成作答（"您选择了 {{q1}}"）
+ */
 export function FormRenderer({ schema, model, readonly = false, onChange, onUpload, brand, errors = [] }) {
-  const visible = schema.filter(f => fieldVisible(f, model))
+  /*
+   * 计算 / 自动填入的值要写回 model，而且只能用 model 当渲染源。
+   * 曾经试过「另建一份 flow.data 传下去渲染」：那份是普通对象，不参与 Vue 的依赖追踪，
+   * 于是填了单价、合计金额仍然是 0——看起来像公式没生效，其实是渲染根本不重算。
+   */
+  const flow = buildFlow(schema, model)
+  for (const f of schema) {
+    if (!(f.type === 'calculate' || f.fill)) continue
+    const v = flow.data[f.id]
+    if (v !== undefined && model[f.id] !== v) model[f.id] = v
+  }
   const errOf = (f) => (errors || []).find(m => m && f.label && m.startsWith(f.label))
-  return h('div', {}, visible.map(f => {
+  const blocks = []
+  for (const f of schema) {
+    if (!flow.active.has(f.id)) continue
     const message = errOf(f)
-    return h('div', {
+    const required = flow.required.get(f.id)
+    const label = renderText(f.label, schema, flow.data)
+    const desc = f.description ? renderText(f.description, schema, flow.data) : ''
+    blocks.push(h('div', {
       class: ['q-block', message ? 'has-err' : ''],
       key: f.id,
       'data-field': f.id
     }, [
-      FieldLabel(f),
-      f.description ? h('div', { class: 'q-desc' }, f.description) : null,
-      renderControl(f, model, { readonly, onChange, onUpload }),
+      FieldLabel({ ...f, label, required }),
+      desc ? h('div', { class: 'q-desc' }, desc) : null,
+      renderControl(f, model, { readonly, onChange, onUpload, schema }),
       message ? h('div', { class: 'q-err' }, message) : null
-    ])
-  }))
+    ]))
+    // 跳转提示放在触发题下面，而不是页面顶部：用户要知道「是这道题把我送走了」
+    if (flow.stopped && flow.stopFieldId === f.id) {
+      blocks.push(h('div', { class: 'q-stop', key: f.id + '_stop' }, flow.stopText || '根据您的作答，后面的题目无需填写。'))
+    }
+  }
+  return h('div', {}, blocks)
 }
 
 export { findMeta, escapeHtml }

@@ -4,6 +4,7 @@ import { route } from '../router.js'
 import { ok, err, confirmBox, fmtDate, Empty, Modal, Pagination } from '../ui.js'
 import { Icon } from '../icons.js'
 import { renderControl, answerDisplay } from '../renderer.js'
+import { buildFlow } from '../flow.js'
 
 export default {
   setup() {
@@ -24,26 +25,9 @@ export default {
     const importing = ref(false)
     const review = ref(null)
 
-    /** 与服务端 fieldVisible 同口径：隐藏的题不该出现在批阅清单里 */
-    const flat = v => (Array.isArray(v) ? v.join(',') : v)
-    const visible = (q, data) => {
-      const rules = q.logic || []
-      if (!rules.length) return true
-      return rules.every(rule => {
-        const v = flat(data[rule.fieldId])
-        switch (rule.op) {
-          case 'eq': return String(v) === String(rule.value)
-          case 'ne': return String(v) !== String(rule.value)
-          case 'in': return Array.isArray(rule.value) ? rule.value.map(String).includes(String(v)) : String(v) === String(rule.value)
-          case 'contains': return Array.isArray(data[rule.fieldId]) ? data[rule.fieldId].map(String).includes(String(rule.value)) : String(v ?? '').includes(String(rule.value))
-          case 'gt': return Number(v) > Number(rule.value)
-          case 'lt': return Number(v) < Number(rule.value)
-          case 'empty': return v === '' || v === undefined || v === null
-          case 'notEmpty': return !(v === '' || v === undefined || v === null)
-          default: return true
-        }
-      })
-    }
+    // 与服务端同一份实现（flow.js）：这里曾经自己抄了一遍 fieldVisible 的分支，
+    // 于是「条件跳转跳过的题」在这一页仍然算「答过」，批阅清单和报表对不上
+    const visible = (q, data) => buildFlow([q], data).visible.get(q.id) !== false
 
     const loadForms = async () => {
       const r = await api.get('/api/forms?pageSize=200')

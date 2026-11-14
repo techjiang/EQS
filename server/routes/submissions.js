@@ -2,7 +2,10 @@ import crypto from 'node:crypto'
 import { get, all, run, each, now, log } from '../lib/db.js'
 import { readJson, fail, sendJson, clientIp } from '../lib/http.js'
 import { requireUser, requirePerm, currentUser, can } from '../lib/auth.js'
-import { pickForm, validateSubmission, isSubjective, pendingLeft, gradeSubmission, computeStats, createStatsAccumulator, submissionData, paginate, fieldVisible, passLineOf, manualScoresOf, passHintOf, captchaChallenge, safeJson, isAnswerCorrect, answerText } from '../lib/forms.js'
+import { pickForm, validateSubmission, isSubjective, pendingLeft, gradeSubmission, computeStats, createStatsAccumulator, submissionData, paginate, fieldVisible, passLineOf, manualScoresOf, passHintOf, captchaChallenge, safeJson, isAnswerCorrect, answerText, DISPLAY_TYPES } from '../lib/forms.js'
+// 逻辑规则只有一份，浏览器与服务端都跑它：页面上看到几道题、哪几道必填，
+// 与服务端判分时的口径必须完全一致
+import { buildFlow, resolveAnswers, renderText } from '../../web/js/flow.js'
 
 /** 对外答卷编号：不可猜、无业务含义，只给提交者本人用 */
 export function newPublicId() {
@@ -54,18 +57,15 @@ function collectFileIds(data) {
 }
 
 /**
- * 只保留当前可见题目的作答。
- * 显隐逻辑要求「隐藏的题不校验必填」，但它的值还留在 data 里，于是：
- * 用户先选了 A（显示追问）再改回 B（追问隐藏），那份残留作答照样入库、照样进报表。
+ * 只保留「这份作答真正触及的题」。
+ *
+ * 旧实现只过滤了显隐逻辑，两个后果：
+ *  1. 被条件跳转跳过的题（答完第 2 题就结束）的值还留在 data 里，照样入库、照样进报表；
+ *  2. 计算题的值完全由客户端说了算——一份被改过的全对答案能把总分刷成任意数字。
+ * 现在统一走 buildFlow / resolveAnswers：跳过的题丢掉，计算题用服务端的值覆盖。
  */
 export function pickVisibleAnswers(schema, raw) {
-  const src = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}
-  const out = {}
-  for (const f of schema) {
-    if (!fieldVisible(f, src)) continue
-    if (src[f.id] !== undefined) out[f.id] = src[f.id]
-  }
-  return out
+  return resolveAnswers(schema, raw).data
 }
 
 /** 校验答题限制：微信/账号/IP/设备/次数/时间窗口 */
@@ -158,7 +158,9 @@ export default function register(r) {
       const out = {
         id: f.id, type: f.type, label: f.label, required: f.required,
         placeholder: f.placeholder, description: f.description, options: f.options,
-        defaultValue: f.defaultValue, logic: f.logic, props: publicFieldProps(f)
+        defaultValue: f.defaultValue, logic: f.logic, props: publicFieldProps(f),
+        // 逻辑规则必须下发，否则浏览器根本不知道「选了否就别再问下去」
+        requiredWhen: f.requiredWhen, jump: f.jump, fill: f.fill
       }
       if (f.type === 'captcha') out.challenge = captchaChallenge(f.id)
       return out
@@ -184,7 +186,8 @@ export default function register(r) {
       userId: user?.id || 0,
       password: body.password
     })
-    const data = pickVisibleAnswers(form.schema, body.data)
+    const resolved = resolveAnswers(form.schema, body.data)
+    const data = resolved.data
     const errors = validateSubmission(form.schema, data)
     if (errors.length) fail(422, errors.join('；'))
     const ts = now()
@@ -212,6 +215,11 @@ export default function register(r) {
     const review = form.kind === 'exam' && form.settings?.showResult !== false
       ? buildReview(form.schema, data, form.settings, {})
       : null
+    // 条件跳转结束后，提交页要说清楚「为什么只有这几题」：
+    // 只回一句「提交成功」，用户会以为剩下的题没显示是坏了
+    const stop = resolved.stopped
+      ? { stopped: true, fieldId: resolved.stopFieldId, text: resolved.stopText || form.settings?.submitText || '提交成功，感谢您的参与！' }
+      : { stopped: false }
 
     sendJson(res, 201, {
       ok: true,
@@ -225,6 +233,7 @@ export default function register(r) {
       graded: form.kind === 'exam' ? !!review?.graded : false,
       passed: passed === 1,
       review,
+      jump: stop,
       message: form.settings?.submitText || '提交成功，感谢您的参与！',
       redirect: form.settings?.redirectUrl || '',
       // 交卷那一刻就能看到自己的名次：这是考试类表单最想立刻知道的一件事，
@@ -247,9 +256,12 @@ export default function register(r) {
   /** 交卷后逐题回顾：只返回对错、正确答案与解析，不回传用户原始作答之外的信息 */
   function buildReview(schema, data, settings = {}, manual = {}) {
     const items = []
+    // 与校验、判分同一口径：被条件跳转跳过的题不进回顾——
+    // 一份「答到第 2 题就结束」的卷子，回顾里不该出现后面 8 道没答的题然后判他全错
+    const flow = buildFlow(schema, data)
     for (const f of schema) {
-      if (['divider', 'richtext', 'html', 'image'].includes(f.type)) continue
-      if (!fieldVisible(f, data)) continue
+      if (DISPLAY_TYPES.has(f.type)) continue
+      if (!flow.active.has(f.id)) continue
       const right = (f.answer || []).map(String)
       const auto = right.length > 0
       // 与 gradeSubmission 同一套判分口径：排序题看顺序、矩阵题逐行比
@@ -670,7 +682,10 @@ const PUBLIC_SETTING_KEYS = [
 /** 作答需要的 props 白名单；标准答案常藏在自定义属性里，一律不下发 */
 const PUBLIC_PROP_KEYS = [
   'max', 'min', 'step', 'rows', 'fields', 'multiple', 'maxSize', 'accept', 'html',
-  'minLength', 'maxLength', 'unit', 'precision', 'labels', 'placeholder'
+  'minLength', 'maxLength', 'unit', 'precision', 'labels', 'placeholder',
+  // 计算题的公式要下发：浏览器要在答题过程中实时算给用户看。
+  // 公式本身不含答案（引用的是别的题），但服务端仍会重算一遍再入库，不采信客户端算的数
+  'formula'
 ]
 
 export function publicFieldProps(field = {}) {

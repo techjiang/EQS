@@ -69,8 +69,37 @@
 提交响应：
 
 ```json
-{ "ok": true, "id": 12, "score": 85, "total": 100, "paperTotal": 100, "ungraded": 0, "graded": true, "passed": true, "message": "提交成功", "redirect": "" }
+{ "ok": true, "id": 12, "score": 85, "total": 100, "paperTotal": 100, "ungraded": 0, "graded": true,
+  "passed": true, "message": "提交成功", "redirect": "",
+  "jump": { "stopped": false } }
 ```
+
+`jump.stopped: true` 表示这份作答被**条件跳转**提前结束了，`jump.text` 是作者写的那句结束语
+（例如「本季度预算已用完，申请已记录」）。此时 `total` / `paperTotal` / `passLine` 只按
+**已答题**计算，逐题回顾里也不会出现被跳过的题。
+
+### 条件逻辑
+
+字段上的逻辑规则（形状与 `schema` 一起存，公开接口会下发 `requiredWhen` / `jump` / `fill`，
+计算题的 `props.formula` 也在 `props` 白名单里）：
+
+| 字段 | 形状 | 语义 |
+| --- | --- | --- |
+| `logic` | `[{fieldId, op, value}]` | 全部满足才显示；为空即总是显示 |
+| `requiredWhen` | 同上 | 全部满足才必填；为空则按 `required` |
+| `jump` | `[{op, value, text}]` | 命中即提前结束，`text` 为结束语 |
+| `fill` | `{from, map: {来源值: 目标值}}` | 来源题有作答时填入**空着的**本题，不覆盖已答 |
+| `type: "calculate"` | `props: {formula, precision, unit}` | 只读计算题，公式形如 `{{单价}} * {{数量}}` |
+
+`op` 取值：`eq` `ne` `in` `contains` `gt` `lt` `empty` `notEmpty`。
+
+实现只有一份：`web/js/flow.js`（服务端 `import '../../web/js/flow.js'`，浏览器走 `/js/flow.js`）。
+提交时服务端跑 `resolveAnswers`：丢掉越界作答、**重算计算题**（不采信客户端算的数）、
+返回跳转信息。校验与判分都先跑 `buildFlow`，所以「被跳过的必填题」不会拦住提交，
+也不会算进卷面总分。
+
+公式只支持 `+ - * / %`、括号、数字与 `{{字段}}` / `裸字段id` 引用，**没有 eval**。
+引用不存在的字段会明确报错，除零返回 0（`Infinity` 会一路污染成 `NaN`）。
 
 分数口径：
 - `total` 只统计**可自动判分**的题目（客观题），主观题没有标准答案，不计入。

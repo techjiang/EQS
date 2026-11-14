@@ -244,6 +244,10 @@ table.table{width:100%;border-collapse:collapse;font-size:13.5px}
 .q-title{font-weight:600;font-size:14.5px;margin-bottom:8px;display:flex;gap:5px}
 .q-title .req{color:var(--danger)}
 .q-desc{font-size:12.5px;color:var(--text-3);margin:-4px 0 8px}
+/* 计算题：只读结果，长得像一个数出来的答案，而不是一个坏掉的输入框 */
+.calc-value{display:inline-flex;align-items:center;min-height:38px;padding:0 16px;border-radius:10px;background:var(--panel-2);border:1px dashed var(--line);font-size:17px;font-weight:600;font-variant-numeric:tabular-nums}
+/* 条件跳转的收尾提示：淡黄底，说明「到此为止」而不是报错 */
+.q-stop{margin:2px 0 18px;padding:11px 14px;border-radius:10px;background:rgba(245,158,11,.12);border-left:3px solid #f59e0b;font-size:13px;color:var(--text-2);line-height:1.6}
 /* 矩阵量表：列数不定（2~5 档），窄屏也要一眼看全，不能靠横滚 */
 .matrix-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
 .matrix-tbl{width:100%;border-collapse:collapse;font-size:13px;min-width:0}

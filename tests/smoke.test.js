@@ -2399,6 +2399,152 @@ try {
     await new Promise(res => mock.close(res))
   }
 
+  console.log('\n[59] 逻辑引擎：计算 / 跳转 / 动态必填 / 文本替换 / 自动填入')
+  {
+    const { evalFormula, buildFlow, renderText, resolveAnswers } = await import('../web/js/flow.js')
+
+    // 一、公式：只有四则运算与括号，没有 eval
+    const schema = [
+      { id: 'price', type: 'number', label: '单价' },
+      { id: 'qty', type: 'number', label: '数量' },
+      { id: 'total', type: 'calculate', label: '合计', props: { formula: '{{单价}} * {{数量}}', precision: 2 } },
+      { id: 'after', type: 'calculate', label: '折后', props: { formula: 'total * 0.9', precision: 1 } }
+    ]
+    assert(evalFormula('1+2*3', [], {}) === 7, '公式按四则优先级算')
+    assert(evalFormula('(1+2)*3', [], {}) === 9, '括号生效')
+    assert(evalFormula('10/0', [], {}) === 0, '除零给 0 而不是 Infinity（Infinity 会污染后续公式）')
+    assert(evalFormula('', [], {}) === null, '空公式返回 null，与「算出 0」区分开')
+    let threw = ''
+    try { evalFormula('price2', schema, { price: 9 }) } catch (e) { threw = e.message }
+    assert(/不存在的字段/.test(threw), '引用不存在的字段明确报错', threw)
+
+    // 二、计算题：按 schema 顺序算，后面的公式能引用前面的结果
+    const r1 = resolveAnswers(schema, { price: 12.5, qty: 4 })
+    assert(r1.data.total === 50, '计算题算出合计', String(r1.data.total))
+    assert(r1.data.after === 45, '后面的计算题能引用前面的结果', String(r1.data.after))
+
+    // 三、客户端改过的计算值不算数（安全边界）
+    const r2 = resolveAnswers(schema, { price: 1, qty: 1, total: 99999 })
+    assert(r2.data.total === 1, '提交上来的计算值被服务端重算覆盖', String(r2.data.total))
+
+    // 四、条件跳转：命中即结束，后面的题不出现在作答里
+    const jumpSchema = [
+      { id: 'ok', type: 'radio', label: '是否符合', options: [{ label: '是', value: '是' }, { label: '否', value: '否' }],
+        jump: [{ op: 'eq', value: '否', text: '感谢填写，您暂不符合条件' }] },
+      { id: 'name', type: 'text', label: '姓名', required: true },
+      { id: 'detail', type: 'textarea', label: '详细说明', required: true }
+    ]
+    const rj = resolveAnswers(jumpSchema, { ok: '否', name: '张三', detail: '不应入库' })
+    assert(rj.stopped === true, '命中条件跳转')
+    assert(rj.stopText === '感谢填写，您暂不符合条件', '结束语带回给前端', rj.stopText)
+    assert(!('detail' in rj.data), '跳转之后的题目不进库', JSON.stringify(rj.data))
+    // 关键：跳过了必填题，校验不能因此报错
+    const { validateSubmission } = await import('../server/lib/forms.js')
+    assert(validateSubmission(jumpSchema, { ok: '否' }).length === 0, '跳过的必填题不再拦提交')
+    const flowYes = buildFlow(jumpSchema, { ok: '是' })
+    assert(flowYes.stopped === false && flowYes.isRequired('name'), '没命中时后面的题照常必填')
+
+    // 五、动态必填：选了「其他」才要求填说明
+    const dynSchema = [
+      { id: 'src', type: 'radio', label: '来源', options: [{ label: '朋友', value: '朋友' }, { label: '其他', value: '其他' }] },
+      { id: 'other', type: 'text', label: '具体来源', required: false,
+        requiredWhen: [{ fieldId: 'src', op: 'eq', value: '其他' }] }
+    ]
+    assert(validateSubmission(dynSchema, { src: '朋友', other: '' }).length === 0, '不满足条件时不要求必填')
+    assert(validateSubmission(dynSchema, { src: '其他', other: '' }).length === 1, '满足条件时变成必填')
+
+    // 六、文本替换
+    assert(renderText('您选择了 {{src}}', dynSchema, { src: '朋友' }) === '您选择了 朋友', '题干里的 {{字段}} 被替换')
+    assert(renderText('未知 {{不存在}}', dynSchema, {}) === '未知 ', '引用不存在的字段给空串，不留半截花括号')
+    // 字段存在但还没作答：保留占位，别拼出「来源：）」这种残句
+    assert(renderText('来源：{{src}}', dynSchema, {}) === '来源：{{src}}', '未作答时保留占位而不是留空括号')
+    assert(renderText('来源：{{src}}', dynSchema, { src: '朋友' }) === '来源：朋友', '有作答时替换成作答')
+
+    // 七、自动填入：只填空的，不覆盖已答
+    const fillSchema = [
+      { id: 'agree', type: 'radio', label: '是否同意', options: [{ label: '是', value: '是' }, { label: '否', value: '否' }] },
+      { id: 'copy', type: 'radio', label: '确认', options: [{ label: '是', value: '是' }, { label: '否', value: '否' }],
+        fill: { from: 'agree', map: { 是: '是', 否: '否' } } }
+    ]
+    assert(resolveAnswers(fillSchema, { agree: '是' }).data.copy === '是', '自动填入生效')
+    assert(resolveAnswers(fillSchema, { agree: '是', copy: '否' }).data.copy === '否', '已作答的目标不被覆盖')
+
+    // 八、端到端：走真实接口提交一份带计算题 + 跳转的表单
+    let r = await req('POST', '/api/forms', {
+      title: '逻辑引擎验收', kind: 'exam',
+      schema: [
+        { id: 'f_price', type: 'number', label: '单价', score: 0 },
+        { id: 'f_qty', type: 'number', label: '数量', score: 0 },
+        { id: 'f_total', type: 'calculate', label: '合计', props: { formula: '{{单价}} * {{数量}}', precision: 2 } },
+        { id: 'f_ok', type: 'radio', label: '是否有预算', options: [{ label: '有', value: '有' }, { label: '没有', value: '没有' }],
+          jump: [{ op: 'eq', value: '没有', text: '没有预算就不再问了' }] },
+        { id: 'f_more', type: 'text', label: '预算说明', required: true, score: 10, answer: ['已批准'] }
+      ],
+      settings: { passPercent: 60 }
+    })
+    const lf = r.json.id
+    await req('PUT', `/api/forms/${lf}`, { status: 'published' })
+
+    // 公开页要下发逻辑规则，否则浏览器根本不知道有跳转
+    r = await req('GET', `/api/public/forms/${lf}`)
+    const pubOk = r.json.data.schema.find(f => f.id === 'f_ok')
+    assert(Array.isArray(pubOk.jump) && pubOk.jump.length === 1, '公开接口下发 jump 规则')
+    assert(r.json.data.schema.find(f => f.id === 'f_total').props.formula, '公开接口下发计算公式')
+
+    // 提交：跳过 f_more，计算值被服务端重算，校验不因跳过的必填题失败
+    r = await fetch(BASE + `/api/public/forms/${lf}/submit`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ data: { f_price: 30, f_qty: 2, f_total: 123456, f_ok: '没有', f_more: '不该入库' } })
+    })
+    const sub = await r.json()
+    assert(r.status === 201, '带跳转的表单能提交', JSON.stringify(sub).slice(0, 200))
+    assert(sub.jump?.stopped === true && sub.jump.text === '没有预算就不再问了', '提交结果带回结束语', JSON.stringify(sub.jump))
+    const row = (await req('GET', `/api/submissions?formId=${lf}`)).json.data[0]
+    assert(row.data.f_total === 60, '入库的计算值是服务端算的', String(row.data.f_total))
+    assert(!('f_more' in row.data), '被跳过的题没有入库', JSON.stringify(row.data))
+
+    // 回顾里不该出现被跳过的题（否则「没答的题」被算成全错）
+    assert(!(sub.review?.items || []).some(i => i.id === 'f_more'), '跳过的题不进逐题回顾')
+
+    // 九、不跳转的路径：必填仍然拦人
+    r = await fetch(BASE + `/api/public/forms/${lf}/submit`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ data: { f_price: 1, f_qty: 1, f_ok: '有' } })
+    })
+    assert(r.status === 422, '没跳转时必填仍然校验', String(r.status))
+
+    // 十、考试里跳转会改变及格线：只按已答题算，而不是按整卷满分算
+    r = await req('POST', '/api/forms', {
+      title: '跳转影响及格线', kind: 'exam', status: 'published',
+      schema: [
+        { id: 'g1', type: 'radio', label: '第一题', options: [{ label: '80', value: '80' }, { label: '21', value: '21' }], answer: ['80'], score: 10 },
+        { id: 'g2', type: 'radio', label: '是否有资格', options: [{ label: '有', value: '有' }, { label: '没有', value: '没有' }], score: 10,
+          jump: [{ op: 'eq', value: '没有', text: '没有资格' }] },
+        { id: 'g3', type: 'text', label: '第三题', answer: ['SYN'], score: 10 },
+        { id: 'g4', type: 'text', label: '第四题', answer: ['53'], score: 10 }
+      ],
+      settings: { passPercent: 60 }
+    })
+    const gf = r.json.id
+    const full = await fetch(BASE + `/api/public/forms/${gf}/submit`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ data: { g1: '80', g2: '有', g3: 'SYN', g4: '53' } })
+    }).then(x => x.json())
+    // g2 没设标准答案、带分值 → 它算主观题，不计入可判分总分（10+10+10=30）
+    assert(full.total === 30 && full.score === 30 && full.passLine === 18, '全答时可判分满分 30、及格线 18', JSON.stringify({ t: full.total, p: full.passLine }))
+    const cut = await fetch(BASE + `/api/public/forms/${gf}/submit`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ data: { g1: '80', g2: '没有', g3: 'WRONG', g4: 'WRONG' } })
+    }).then(x => x.json())
+    assert(cut.total === 10 && cut.passLine === 6, '提前结束时只按已答题算总分与及格线', JSON.stringify({ t: cut.total, p: cut.passLine }))
+    assert(cut.jump?.stopped === true, '考试也能提前结束')
+    assert(!(cut.review?.items || []).some(i => i.id === 'g3'), '考试回顾里没有跳过的题')
+
+    // 十一、跳转后的答卷不进「待批阅」队列：它没有未批的主观题
+    r = await req('GET', `/api/forms/${gf}/report`)
+    assert(r.json.data.total === 2, '两份答卷都进了报表', String(r.json.data.total))
+  }
+
   console.log('\n[44] 前端静态资源')
 
   for (const p of ['/', '/js/main.js', '/css/app.css', '/js/views/Logs.js', '/assets/eqs-mark.svg', '/vendor/echarts.min.js']) {

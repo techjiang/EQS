@@ -4,6 +4,7 @@ import { route } from '../router.js'
 import { ok, err, fmtDate } from '../ui.js'
 import { FormRenderer } from '../renderer.js'
 import { defaultData } from '../fields.js'
+import { renderText } from '../flow.js'
 
 export default {
   setup() {
@@ -89,7 +90,8 @@ export default {
         }
         fieldErrors.value = []
         done.value = true
-        ok(r.message || '提交成功')
+        // 有跳转结束语时 toast 也用那一句：否则页面上写着「预算已用完」，右上角还在说「提交成功」
+        ok(r.jump?.stopped ? r.jump.text : (r.message || '提交成功'))
         if (r.redirect) setTimeout(() => location.href = r.redirect, 1200)
         window.scrollTo({ top: 0, behavior: 'smooth' })
       } catch (e) {
@@ -155,12 +157,15 @@ export default {
           style: [s.headerImage ? `background-image:linear-gradient(rgba(0,0,0,.35),rgba(0,0,0,.35)),url(${s.headerImage})` : '', 'background-size:cover;background-position:center'].join(';')
         }, h('div', {}, [
           h('h1', {}, form.value.title),
-          form.value.description ? h('p', { style: 'margin-top:8px;opacity:.92;font-size:14px' }, form.value.description) : null
+          // 表单说明也支持 {{字段}} 引用：整句话跟着作答变，比固定文案有用
+          form.value.description ? h('p', { style: 'margin-top:8px;opacity:.92;font-size:14px' }, renderText(form.value.description, form.value.schema, model.value)) : null
         ])),
         h('div', { class: 'fill-card' }, done.value
           ? h('div', { class: 'center', style: 'padding:20px 0' }, [
               h('div', { style: 'font-size:52px' }, '🎉'),
-              h('h2', { style: 'margin:12px 0 6px' }, result.value?.message || '提交成功'),
+              h('h2', { style: 'margin:12px 0 6px' }, result.value?.jump?.text || result.value?.message || '提交成功'),
+              // 跳转结束时标题已经是那句「为什么到此为止」，不必再补一行同样意思的话
+
               form.value.kind === 'exam' && result.value?.score != null ? h('div', { class: 'center', style: 'margin:10px 0 4px' }, [
                 h('div', { style: 'font-size:34px;font-weight:700;color:' + (result.value.passed ? 'var(--ok)' : 'var(--danger)') }, result.value.graded === false ? '待批阅' : `${result.value.score}`),
                 h('div', { class: 'small muted' }, result.value.graded === false
@@ -171,7 +176,11 @@ export default {
                   `第 ${result.value.rank.rank} / ${result.value.rank.total} 名 · 超过 ${result.value.rank.percentile}% 的考生`) : null,
                 result.value.ungraded ? h('div', {
                   style: 'margin-top:8px;padding:8px 12px;border-radius:9px;background:rgba(245,158,11,.12);font-size:12.5px;color:var(--warn, #b06b00)'
-                }, `还有 ${result.value.ungraded} 道主观题等待人工批阅，批阅后总分与是否通过会更新，可凭答卷编号回来查询`) : null
+                }, `还有 ${result.value.ungraded} 道主观题等待人工批阅，批阅后总分与是否通过会更新，可凭答卷编号回来查询`) : null,
+                // 提前结束的卷子分数只按已答题算：不说明的话，「不具备资格」却显示「通过」看着像 bug
+                result.value.jump?.stopped && result.value.score != null
+                  ? h('div', { class: 'small muted', style: 'margin-top:6px' }, '本次作答提前结束，成绩仅按已答题目计算')
+                  : null
               ]) : null,
               result.value?.review?.items?.length ? h('div', { style: 'margin-top:16px;text-align:left' }, [
                 h('div', { class: 'small muted', style: 'margin-bottom:8px' }, '逐题回顾'),
