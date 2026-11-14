@@ -735,15 +735,31 @@ export function isSubjective(f) {
  * 与 gradeSubmission 同口径：有分值、无标准答案、当前可见、且没出现在 manual_scores 里。
  */
 export function pendingLeft(form, row) {
-  if (!form || form.kind !== 'exam') return 0
+  return reviewTally(form, row).pending
+}
+
+/**
+ * 这份答卷有几道要人工给分的题、其中几道还没给分。
+ *
+ * 单看 pending 分不清「这份卷子没有主观题」和「这份卷子已经批完了」——两者都是 0。
+ * 而阅卷进度恰恰要区分这两件事：没有主观题的卷子根本不该进「本次共 N 份」的分母，
+ * 混进去的话进度条永远到不了头（82 份里 40 份是纯客观题，批完 42 份显示 51%）。
+ */
+export function reviewTally(form, row) {
+  if (!form || form.kind !== 'exam') return { subjective: 0, pending: 0 }
   const data = safeJson(row.data, {})
   const manual = manualScoresOf(row)
   // 直接查库拿到的是未解析的行，schema 还是 JSON 字符串
   const schema = Array.isArray(form.schema) ? form.schema : safeJson(form.schema, [])
   const flow = buildFlow(schema, data)
-  return schema.filter(f =>
-    isSubjective(f) && flow.active.has(f.id) && !Object.prototype.hasOwnProperty.call(manual, f.id)
-  ).length
+  let subjective = 0
+  let pending = 0
+  for (const f of schema) {
+    if (!isSubjective(f) || !flow.active.has(f.id)) continue
+    subjective++
+    if (!Object.prototype.hasOwnProperty.call(manual, f.id)) pending++
+  }
+  return { subjective, pending }
 }
 
 /** 从答卷记录里取人工批阅分：{ [fieldId]: number } */

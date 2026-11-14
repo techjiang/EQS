@@ -440,6 +440,15 @@ table.table{width:100%;border-collapse:collapse;font-size:13.5px}
   background:var(--panel);color:var(--text);font-size:11.5px;font-weight:600;
   font-family:ui-monospace,SFMono-Regular,Menlo,monospace;text-align:center;
 }
+
+/* 阅卷进度锚：一页存完就清空，批到第 6 页时得知道自己在整场里的位置。
+   只显示「待批阅 10 份」不够——那个 10 是这一页的，不是这场考试的 */
+.review-progress{
+  padding:10px 12px;margin-bottom:10px;border-radius:10px;
+  background:var(--panel);border:1px solid var(--line-2);
+}
+.review-progress .bar-line{height:6px}
+
 /* 分数输入框：键盘焦点必须一眼看得见，否则「刚才那题敲进去了吗」只能靠猜 */
 .modal .input[data-batch-score]:focus,
 .modal .input[data-review-score]:focus{

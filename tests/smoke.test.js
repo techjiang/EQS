@@ -4139,6 +4139,9 @@ try {
 
     r = await req('GET', `/api/forms/${objForm}/review-queue`)
     assert(r.status === 200 && r.json.total === 0, '没有主观题的考试不进阅卷队列', String(r.json.total))
+    // 进度锚的分母只算「有主观题的卷子」：纯客观题的答卷不进队列，也就不该进分母，
+    // 否则进度永远到不了头（批完所有主观题，进度条还停在 0%）
+    assert(r.json.need === 0 && r.json.done === 0, '没有主观题的考试进度分母为 0', JSON.stringify({ need: r.json.need, done: r.json.done }))
 
     r = await req('GET', `/api/forms/${bfid}/review-queue?limit=2`)
     assert(r.status === 200 && r.json.ok, '阅卷队列接口可用', `${r.status} ${r.json?.message || ''}`)
@@ -4149,6 +4152,8 @@ try {
     assert(typeof one.items[0].given === 'string' && one.items[0].given.includes('份的作答'),
       '作答原文被摊成可读文本（不是对象）', String(one.items[0].given))
     assert(one.items.every(i => i.current === null), '还没批过的题 current 为空')
+    // 一页存完就清空，批到第 6 页时得知道自己在整场里的位置
+    assert(r.json.need === 5 && r.json.done === 0, '进度锚：共 5 份、已批 0', JSON.stringify({ need: r.json.need, done: r.json.done }))
 
     // 分页不重叠
     const r2 = await req('GET', `/api/forms/${bfid}/review-queue?limit=2&offset=2`)
@@ -4178,6 +4183,7 @@ try {
     const left = (r.json.data || []).map(x => x.id)
     assert(!left.includes(ids[0]), '两份主观题都批完的答卷离开队列')
     assert(left.includes(ids[1]), '只批了一部分的答卷仍留在队列里')
+    assert(r.json.need === 5 && r.json.done === 1, '已批份数跟着走：共 5 份、已批 1', JSON.stringify({ need: r.json.need, done: r.json.done }))
     assert(r.json.total === 4, '队列总数从 5 减到 4', String(r.json.total))
 
     // 越界给分被拒，但不牵连同一批里的其它份
@@ -4207,6 +4213,8 @@ try {
     assert(back.json.data.manual_scores?.b3 === undefined, 'null 能把已给的分撤掉', JSON.stringify(back.json.data?.manual_scores))
     r = await req('GET', `/api/forms/${bfid}/review-queue?limit=20`)
     assert((r.json.data || []).some(x => x.id === ids[4]), '撤分之后重新回到阅卷队列')
+    assert(r.json.need === 5 && r.json.done + r.json.total === r.json.need, '已批 + 待批 = 总份数（撤分后进度往回收）',
+      JSON.stringify({ need: r.json.need, done: r.json.done, total: r.json.total }))
 
     // 空请求、超量请求要有明确说法
     r = await req('PUT', '/api/submissions/review-batch', { items: [] })
@@ -4224,7 +4232,7 @@ try {
   console.log('\n[44] 阅卷键盘：能提交什么、Enter 往哪走')
 
   {
-    const { batchPayload, scoreError, nextIndex } = await import('../web/js/review.js')
+    const { batchPayload, scoreError, nextIndex, reviewProgress, afterSave } = await import('../web/js/review.js')
 
     // 留空 = 还没批，不能因为看了一眼就被判 0 分
     let r = batchPayload([{ id: 1, draft: { a: '8', b: '' }, items: [{ id: 'a', score: 10 }, { id: 'b', score: 5 }] }])
@@ -4257,6 +4265,23 @@ try {
     assert(nextIndex(0, 3) === 1 && nextIndex(1, 3) === 2, 'Enter 逐题往下走')
     assert(nextIndex(2, 3) === -1, '最后一题按 Enter 返回 -1（交给保存）')
     assert(nextIndex(-1, 3) === 0 && nextIndex(0, 0) === -1, '没有焦点时从头开始，空队列没有下一题')
+
+    // 进度锚：分母是「有主观题的卷子」，不是「扫过的答卷」
+    let p = reviewProgress(82, 37)
+    assert(p.total === 82 && p.done === 37 && p.left === 45, '共 82 已批 37 还剩 45', JSON.stringify(p))
+    assert(p.percent === 45, '百分比跟着「还剩几份」算（37/82 → 45%）', String(p.percent))
+    assert(!p.complete, '还没批完就不算完')
+    p = reviewProgress(5, 5)
+    assert(p.complete && p.percent === 100 && p.left === 0, '全批完时进度锚给收尾口径', JSON.stringify(p))
+    p = reviewProgress(0, 0)
+    assert(!p.complete && p.percent === 0, '没有主观题的考试不算「批完了」', JSON.stringify(p))
+    p = reviewProgress(3, 9)
+    assert(p.done === 3 && p.left === 0, '已批超过总数时按总数封顶（撤分/删卷会往回走）', JSON.stringify(p))
+
+    // 保存之后往哪走：队列前移，所以接着批同一个 offset；空了才是真批完
+    assert(afterSave({ offset: 20, left: 0 }).action === 'done', '队列空了就收尾，不再拉一张空页')
+    let cont = afterSave({ offset: 20, left: 3 })
+    assert(cont.action === 'continue' && cont.offset === 20, '队列还有人就接着批同一个 offset（不是 +limit，翻页会漏卷）', JSON.stringify(cont))
   }
 
   console.log('\n[45] 前端静态资源')

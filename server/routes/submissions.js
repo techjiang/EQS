@@ -2,7 +2,7 @@ import crypto from 'node:crypto'
 import { get, all, run, each, now, log } from '../lib/db.js'
 import { readJson, fail, sendJson, clientIp } from '../lib/http.js'
 import { requireUser, requirePerm, currentUser, can } from '../lib/auth.js'
-import { pickForm, formWindow, validateSubmission, sanitizeAnswers, sanitizeSubmission, isSubjective, pendingLeft, gradeSubmission, computeStats, createStatsAccumulator, submissionData, paginate, fieldVisible, passLineOf, manualScoresOf, passHintOf, captchaChallenge, safeJson, isAnswerCorrect, answerText, DISPLAY_TYPES } from '../lib/forms.js'
+import { pickForm, formWindow, validateSubmission, sanitizeAnswers, sanitizeSubmission, isSubjective, pendingLeft, reviewTally, gradeSubmission, computeStats, createStatsAccumulator, submissionData, paginate, fieldVisible, passLineOf, manualScoresOf, passHintOf, captchaChallenge, safeJson, isAnswerCorrect, answerText, DISPLAY_TYPES } from '../lib/forms.js'
 // 逻辑规则只有一份，浏览器与服务端都跑它：页面上看到几道题、哪几道必填，
 // 与服务端判分时的口径必须完全一致
 import { buildFlow, resolveAnswers, renderText } from '../../web/js/flow.js'
@@ -709,12 +709,19 @@ export default function register(r) {
     const url = new URL(req.url, 'http://x')
     const limit = Math.min(Math.max(Number(url.searchParams.get('limit')) || 20, 1), 50)
     const offset = Math.max(Number(url.searchParams.get('offset')) || 0, 0)
-    // 先按「这份卷子还剩几题没批」筛一遍：没有主观题或已批完的不进队列
+    // 先按「这份卷子还剩几题没批」筛一遍：没有主观题或已批完的不进队列。
+    // 顺手统计整场考试的批阅进度——一页存完就清空，批到第 6 页时已经不知道
+    // 自己在整场里的位置，也不知道还剩几个人的卷子没看。分母只算「有主观题的卷子」，
+    // 否则纯客观题的答卷会让进度永远到不了头。
     const queue = []
     let scanned = 0
+    let need = 0
     for (const row of each('SELECT id, public_id, data, manual_scores, score, passed, created_at, review_note, reviewed_at FROM submissions WHERE form_id = ? AND deleted_at IS NULL ORDER BY id ASC', form.id)) {
       scanned++
-      if (pendingLeft(form, row) === 0) continue
+      const tally = reviewTally(form, row)
+      if (!tally.subjective) continue
+      need++
+      if (tally.pending === 0) continue
       queue.push(row)
     }
     const page = queue.slice(offset, offset + limit)
@@ -739,7 +746,9 @@ export default function register(r) {
         items
       }
     })
-    sendJson(res, 200, { ok: true, data, total: queue.length, scanned, offset, limit })
+    // done 只报「已批完」的份数，不报「扫过多少」：后者包含没有主观题的卷子，
+    // 拿它做进度分子的话，刚打开阅卷界面就显示「已批 40 份」，一份都还没批。
+    sendJson(res, 200, { ok: true, data, total: queue.length, need, done: Math.max(need - queue.length, 0), scanned, offset, limit })
   })
 
   /** 从回收站恢复一份答卷 */

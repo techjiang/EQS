@@ -49,3 +49,30 @@ export function nextIndex(current, total) {
   if (!Number.isInteger(current) || current < 0) return total ? 0 : -1
   return current + 1 < total ? current + 1 : -1
 }
+
+/**
+ * 整场考试的批阅进度。
+ *
+ * 一页存完就清空，批到第 6 页时已经不知道自己在整场里的位置，也不知道还剩几个人的卷子没看。
+ * 分母只算「有主观题的卷子」——纯客观题的答卷不进阅卷队列，混进分母的话进度永远到不了头。
+ * 份数只做裁剪不做四舍五入：已批 37 / 共 82 显示 45%，因为「还剩 45 份」是给人看的数字，
+ * 百分比跟着它算才对得上。
+ */
+export function reviewProgress(need, done) {
+  const total = Math.max(Math.floor(Number(need) || 0), 0)
+  const finished = Math.min(Math.max(Math.floor(Number(done) || 0), 0), total)
+  const left = total - finished
+  return { total, done: finished, left, percent: total ? Math.round((finished / total) * 100) : 0, complete: total > 0 && left === 0 }
+}
+
+/**
+ * 保存这一页之后该往哪走。
+ *
+ * 队列会在批完之后前移，所以「继续」永远是同一个 offset（不是 +limit）——
+ * 往下翻页会跳过被清掉的位置，一页 10 份批了 3 份，翻页就漏掉 3 份没批的。
+ * 队列空了才是真的批完了，这时候别再拉一张空页，直接给收尾。
+ */
+export function afterSave({ offset, left }) {
+  if (Number(left) <= 0) return { action: 'done', offset: Math.max(Number(offset) || 0, 0) }
+  return { action: 'continue', offset: Math.max(Number(offset) || 0, 0) }
+}

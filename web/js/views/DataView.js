@@ -5,7 +5,7 @@ import { ok, err, confirmBox, fmtDate, Empty, Modal, Pagination, escapeHtml } fr
 import { Icon } from '../icons.js'
 import { renderControl, answerDisplay } from '../renderer.js'
 import { buildFlow } from '../flow.js'
-import { batchPayload, nextIndex } from '../review.js'
+import { batchPayload, nextIndex, reviewProgress, afterSave } from '../review.js'
 
 export default {
   setup() {
@@ -344,7 +344,13 @@ export default {
     }
 
     const loadBatch = async (offset, { silent = false } = {}) => {
-      const r = await api.get(`/api/forms/${formId.value}/review-queue?limit=${BATCH_LIMIT}&offset=${offset || 0}`)
+      let r = await api.get(`/api/forms/${formId.value}/review-queue?limit=${BATCH_LIMIT}&offset=${offset || 0}`)
+      // 批完最后一页的几份之后，队列变短了，原来的 offset 可能已经越过队尾。
+      // 这时回落到队尾那一页，而不是给一张空页让人以为「批完了」（其实前面还有没批的）
+      if (!r.data?.length && r.total > 0 && offset > 0) {
+        offset = Math.max(Math.floor((r.total - 1) / BATCH_LIMIT) * BATCH_LIMIT, 0)
+        r = await api.get(`/api/forms/${formId.value}/review-queue?limit=${BATCH_LIMIT}&offset=${offset}`)
+      }
       const items = (r.data || []).map(x => ({
         ...x,
         // 输入框里存字符串更方便：空串表示「还没给分」，0 是有效的 0 分
@@ -354,9 +360,24 @@ export default {
         revoke: new Set(),
         noteDraft: x.note || ''
       }))
-      batch.value = { formId: formId.value, title: form.value.title, total: r.total, scanned: r.scanned, offset: offset || 0, limit: BATCH_LIMIT, items }
+      batch.value = {
+        formId: formId.value, title: form.value.title,
+        // need/done 是整场考试的进度锚：total 只是「这一页还剩几份待批」，
+        // 拿它当分子分母都会说错话（批到第 6 页时它一直是 10）
+        need: r.need, done: r.done, scanned: r.scanned,
+        total: r.total, offset: offset || 0, limit: BATCH_LIMIT, items
+      }
       // 保存之后队列清空是正常结果，不该再弹一句「没有待批阅」——那句提示是说给「点进来才发现空」的人
-      if (!items.length && !r.total && !silent) return ok('这张卷子没有待批阅的答卷了')
+      /*
+       * 空队列有两种说法，混成一句会让人以为点错了地方：
+       * ① 这场考试的卷子一份都还没交（或压根没有主观题）→「没有待批阅的答卷」；
+       * ② 本来有，而且现在全批完了 → 直接说批完了、共几份。
+       */
+      if (!items.length && !r.total && !silent) {
+        return r.done > 0
+          ? ok(`这场考试 ${r.done} 份有主观题的卷子都批完了`)
+          : ok('这张卷子没有待批阅的答卷了')
+      }
     }
 
     /**
@@ -377,14 +398,21 @@ export default {
       batchBusy.value = true
       try {
         const r = await api.put('/api/submissions/review-batch', { items: payload })
+        // 批完就从队列里消失，所以重新拉这一页而不是往下翻：往下翻会跳过被清掉的位置，
+        // 一页 10 份只批了 3 份时，剩下的 7 份就被翻页翻过去了
+        await loadBatch(batch.value.offset, { silent: true })
+        await load()
+        // 存完把焦点交回第一题：批一整页时手不用离开键盘，接着敲下一批
+        if (batch.value?.items.length) nextTick(() => focusScore(0))
         if (r.rejected?.length) {
           err(`已保存 ${r.saved} 份，${r.rejected.length} 份被拒：${r.rejected[0].reason}`)
         } else {
-          ok(`已保存 ${r.saved} 份，成绩已重算`)
+          const p = reviewProgress(batch.value?.need, batch.value?.done)
+          const next = afterSave({ offset: batch.value?.offset, left: p.left })
+          ok(next.action === 'done'
+            ? `已保存 ${r.saved} 份，这场考试的卷子批完了`
+            : `已保存 ${r.saved} 份，还剩 ${p.left} 份待批`)
         }
-        // 批完就从队列里消失，所以重新拉这一页（不是往下翻，前面被清掉的位置要补上来）
-        await loadBatch(batch.value.offset, { silent: true })
-        await load()
       } catch (e) { err(e.message) } finally { batchBusy.value = false }
     }
 
@@ -423,7 +451,31 @@ export default {
 
     const cols = computed(() => (form.value?.schema || []).filter(f => !['divider', 'richtext', 'html', 'image'].includes(f.type)).slice(0, 4))
 
-    return () => h('div', {}, [
+    /**
+   * 进度锚：批到第 6 页时，得知道自己在整场考试的哪儿。
+   * 只显示「待批阅 10 份」是不够的——那个 10 是这一页的，不是这场考试的。
+   */
+  const progressBar = (b) => {
+    const p = reviewProgress(b.need, b.done)
+    return h('div', { class: 'review-progress' }, [
+      h('div', { class: 'flex between wrap', style: 'gap:8px;align-items:baseline' }, [
+        h('span', { class: 'small', style: 'font-weight:600' },
+          p.complete
+            ? `这场考试 ${p.total} 份有主观题的卷子都批完了`
+            : `本次共 ${p.total} 份 · 已批 ${p.done} · 还剩 ${p.left}`),
+        // 队列空了就别再说「这一页第 1 – 0 份」——那是把内部页码漏到人眼前
+        h('span', { class: 'small muted' },
+          b.items.length
+            ? `这一页第 ${b.offset + 1} – ${b.offset + b.items.length} 份 · 只有填了分的题会被提交`
+            : '只有填了分的题会被提交，留空表示「还没批」')
+      ]),
+      h('div', { class: 'bar-line', style: 'margin-top:6px' }, [
+        h('i', { style: `width:${p.percent}%` })
+      ])
+    ])
+  }
+
+  return () => h('div', {}, [
       // 被拒绝时整页只留说明：工具条上一排「导出 / 导入 / 批量删除」点了全是 403，
       // 摆在那里等于把人往错误上引
       denied.value ? h('div', {}, [
@@ -661,14 +713,10 @@ export default {
           ref: el => { batchRoot.value = el },
           onKeydown: e => { if (e.key === 'Escape') batch.value = null }
         }, [
-          h('div', { class: 'flex between wrap mb', style: 'gap:8px' }, [
-            h('span', { class: 'small muted' },
-              `待批阅 ${batch.value.total} 份 · 第 ${batch.value.offset + 1} – ${batch.value.offset + batch.value.items.length} 份`),
-            h('span', { class: 'small muted' }, '只有填了分的题会被提交，留空表示「还没批」')
-          ]),
+          progressBar(batch.value),
           // 键盘提示摆在最上面而不是藏进 tooltip：这一页的意义就是把打字速度顶上去，
           // 而「按了 Enter 会不会直接存」是老师最不敢试的一件事
-          h('div', { class: 'kbd-bar' }, [
+          batch.value.items.length ? h('div', { class: 'kbd-bar' }, [
             h('span', {}, [h('kbd', {}, '数字'), ' 直接填分（聚焦即全选，敲了就替换）']),
             h('span', {}, [h('kbd', {}, 'Enter'), ' 下一题，最后一题再按一次 = 保存本页']),
             h('span', {}, [h('kbd', {}, '↑ ↓'), ' 上下题']),
@@ -677,7 +725,7 @@ export default {
               class: 'btn sm', style: 'margin-left:auto',
               onClick: () => focusScore(0)
             }, '从第一题开始')
-          ]),
+          ]) : null,
           ...batch.value.items.map((x, xi) => h('div', {
             style: 'padding:14px;border:1px solid var(--line);border-radius:10px;margin-bottom:12px'
           }, [
@@ -734,17 +782,25 @@ export default {
               value: x.noteDraft, onInput: e => { x.noteDraft = e.target.value }
             })
           ])),
-          batch.value.items.length ? null : Empty({ text: '这一页已经没有待批阅的答卷了' })
+          batch.value.items.length ? null : Empty({
+            text: reviewProgress(batch.value.need, batch.value.done).complete
+              ? '这场考试的卷子都批完了'
+              : '这一页已经没有待批阅的答卷了'
+          })
         ]),
         footer: [
           h('button', { class: 'btn', disabled: batch.value.offset === 0, onClick: () => batchPage(-1) }, '上一页'),
           h('button', {
             class: 'btn',
-            disabled: batch.value.offset + batch.value.limit >= batch.value.total,
+            disabled: reviewProgress(batch.value.need, batch.value.done).complete
+              || batch.value.offset + batch.value.limit >= batch.value.total,
             onClick: () => batchPage(1)
           }, '下一页'),
           h('button', { class: 'btn', onClick: () => batch.value = null }, '关闭'),
-          h('button', { class: 'btn primary', disabled: batchBusy.value, onClick: saveBatch }, batchBusy.value ? '保存中…' : '保存本页分数')
+          // 队列空了就不摆一颗点了会报错的保存按钮：这时候该做的是关掉它
+          batch.value.items.length
+            ? h('button', { class: 'btn primary', disabled: batchBusy.value, onClick: saveBatch }, batchBusy.value ? '保存中…' : '保存本页分数')
+            : null
         ]
       }) : null,
 
