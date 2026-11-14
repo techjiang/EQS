@@ -147,15 +147,19 @@ export default {
             sw(s, 'allowRegister', '允许自助注册'),
             h('div', { class: 'hint' }, '默认关闭。问卷系统里的账号等于「能建卷、能看自己那份数据」，陌生人注册进来没有审核环节，建议只在内部试用时打开。'),
             h('div', { style: 'height:14px' }),
-            field('客户端 IP 来源', h('select', {
-              class: 'select', style: 'max-width:320px',
-              value: s.trustProxy === true ? 'on' : ['auto', 'on'].includes(s.trustProxy) ? s.trustProxy : 'off',
-              onChange: e => s.trustProxy = e.target.value
-            }), [
-              ['off', '不信任（默认）：只认 TCP 对端地址，最安全'],
-              ['on', '信任代理头，按下面的层数从右往左取（Nginx 反代请选这个）'],
-              ['auto', '对端是本机/内网地址时才采信，取最右段']
-            ].map(([v, l]) => h('option', { value: v }, l))),
+            field('客户端 IP 来源', (() => {
+              const cur = s.trustProxy === true ? 'on' : ['auto', 'on'].includes(s.trustProxy) ? s.trustProxy : 'off'
+              // 选项用 selected 而不是只给 select 一个 value：props 在子节点之前应用，
+              // 只写 value 时浏览器还没得选，下拉框会显示成空白
+              return h('select', {
+                class: 'select', style: 'max-width:340px', value: cur,
+                onChange: e => s.trustProxy = e.target.value
+              }, [
+                ['off', '不信任（默认）：只认 TCP 对端地址'],
+                ['on', '信任代理头：按层数从右往左取（Nginx 反代选这个）'],
+                ['auto', '仅当对端是本机/内网时才采信，取最右段']
+              ].map(([v, l]) => h('option', { value: v, selected: v === cur }, l)))
+            })()),
             s.trustProxy === 'on' ? field('代理层数', h('input', {
               class: 'input', type: 'number', min: 1, max: 5, value: s.trustHops ?? 1,
               onInput: e => s.trustHops = Number(e.target.value) || 1
