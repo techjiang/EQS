@@ -1,0 +1,51 @@
+/**
+ * 阅卷的纯逻辑：把「一页草稿」变成「该提交什么」。
+ *
+ * 放在这里而不是埋在视图里，是因为这几十行牵着两件容易出错的事：
+ * ① 哪些题算「这次批了」（空串 = 还没批，0 分 = 批了 0 分）；
+ * ② 越界的分数要在提交前拦住——服务端会拒，但一份越界只拒那一份，
+ *    老师看到的是一句「已保存 7 份，1 份被拒」，还得回头找是哪一份。
+ */
+
+/** 一题的分数是否落在 [0, 满分] 内。空串表示「这题还没批」，不算越界 */
+export function scoreError(raw, max) {
+  if (raw === '' || raw === undefined || raw === null) return ''
+  const n = Number(raw)
+  if (!Number.isFinite(n)) return '不是数字'
+  if (n < 0) return `不能小于 0`
+  if (n > max) return `不能超过满分 ${max}`
+  return ''
+}
+
+/**
+ * 把一页草稿整理成批量保存的请求体。
+ * 只交填了分的题：留空 = 还没批，不该因为看了一眼就被判 0 分。
+ * 返回 { items, error }，error 里带上第一处越界的位置，好把焦点也挪过去。
+ */
+export function batchPayload(rows) {
+  const items = []
+  for (const [ri, row] of (rows || []).entries()) {
+    const scores = {}
+    const revoked = row.revoke instanceof Set ? row.revoke : new Set()
+    for (const [qi, it] of (row.items || []).entries()) {
+      // 显式撤分：送 null，服务端会把这道题退回待批（文档里一直有，界面上此前没入口）
+      if (revoked.has(it.id)) { scores[it.id] = null; continue }
+      const raw = row.draft?.[it.id]
+      const message = scoreError(raw, Number(it.score) || 0)
+      if (message) return { items, error: { row: ri, item: qi, id: it.id, label: it.label, message } }
+      if (raw === '' || raw === undefined || raw === null) continue
+      scores[it.id] = Number(raw)
+    }
+    if (Object.keys(scores).length) items.push({ id: row.id, scores, note: row.noteDraft })
+  }
+  return { items, error: null }
+}
+
+/**
+ * Enter 键该往哪走：本页所有打分框按 DOM 顺序排成一条队列，
+ * 到队尾再按一次就是「该保存了」。返回 -1 表示没有下一个。
+ */
+export function nextIndex(current, total) {
+  if (!Number.isInteger(current) || current < 0) return total ? 0 : -1
+  return current + 1 < total ? current + 1 : -1
+}

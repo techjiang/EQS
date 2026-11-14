@@ -4221,9 +4221,47 @@ try {
     assert(r.status === 400 && /批阅/.test(r.json.message), '问卷没有阅卷队列', `${r.status} ${r.json.message}`)
   }
 
+  console.log('\n[44] 阅卷键盘：能提交什么、Enter 往哪走')
+
+  {
+    const { batchPayload, scoreError, nextIndex } = await import('../web/js/review.js')
+
+    // 留空 = 还没批，不能因为看了一眼就被判 0 分
+    let r = batchPayload([{ id: 1, draft: { a: '8', b: '' }, items: [{ id: 'a', score: 10 }, { id: 'b', score: 5 }] }])
+    assert(!r.error && r.items.length === 1, '留空的题不进提交', JSON.stringify(r))
+    assert(r.items[0].scores.b === undefined, '留空的题不带分数', JSON.stringify(r.items[0].scores))
+    assert(r.items[0].scores.a === 8, '填了的题按数字提交', JSON.stringify(r.items[0].scores))
+
+    // 0 分是有效的 0 分，不是「没批」
+    r = batchPayload([{ id: 1, draft: { a: '0' }, items: [{ id: 'a', score: 10 }] }])
+    assert(r.items[0]?.scores.a === 0, '0 分算批过，会提交', JSON.stringify(r.items))
+
+    // 一个字都没填的整页：不该拼出一个空 items 让服务端报「没有要保存的答卷」
+    r = batchPayload([{ id: 1, draft: { a: '' }, items: [{ id: 'a', score: 10 }] }])
+    assert(!r.error && r.items.length === 0, '整页没填分就不提交任何一份', JSON.stringify(r))
+
+    // 越界在提交前就拦下，并指出是哪一题
+    r = batchPayload([{ id: 1, draft: { a: '11' }, items: [{ id: 'a', score: 10, label: '问答题' }] }])
+    assert(!!r.error && /满分 10/.test(r.error.message), '超过满分的分在本地就被拦下', JSON.stringify(r.error))
+    assert(r.error.row === 0 && r.error.item === 0, '拦下时指明第几份第几题', JSON.stringify(r.error))
+    assert(scoreError('-1', 10) && scoreError('abc', 10) && !scoreError('', 10), '负分与非数字都算错，空串不算')
+
+    // 显式撤分：送 null，服务端才会把这道题退回待批
+    r = batchPayload([{
+      id: 1, draft: { a: '8', b: '' }, revoke: new Set(['b']),
+      items: [{ id: 'a', score: 10 }, { id: 'b', score: 5 }]
+    }])
+    assert(r.items[0].scores.b === null, '撤分的题送 null 而不是空串', JSON.stringify(r.items[0].scores))
+
+    // Enter 的路径：最后一题再按一次才该保存
+    assert(nextIndex(0, 3) === 1 && nextIndex(1, 3) === 2, 'Enter 逐题往下走')
+    assert(nextIndex(2, 3) === -1, '最后一题按 Enter 返回 -1（交给保存）')
+    assert(nextIndex(-1, 3) === 0 && nextIndex(0, 0) === -1, '没有焦点时从头开始，空队列没有下一题')
+  }
+
   console.log('\n[45] 前端静态资源')
 
-  for (const p of ['/', '/js/main.js', '/css/app.css', '/js/views/Logs.js', '/js/views/Dicts.js', '/assets/eqs-mark.svg', '/vendor/echarts.min.js']) {
+  for (const p of ['/', '/js/main.js', '/css/app.css', '/js/views/Logs.js', '/js/views/Dicts.js', '/js/review.js', '/assets/eqs-mark.svg', '/vendor/echarts.min.js']) {
     const res = await fetch(BASE + p)
     assert(res.ok, `静态资源可访问：${p}`)
   }

@@ -424,3 +424,24 @@ table.table{width:100%;border-collapse:collapse;font-size:13.5px}
   .pick-row{padding:10px}
   .pick-row .tag{margin-left:0}
 }
+
+/* ============ 阅卷键盘条 ============
+   批量阅卷把「开/关弹窗」的成本压掉了，剩下的瓶颈全在打字。
+   所以把键位摆在第一行：老师最不敢试的是「按了 Enter 会不会直接存本页」。 */
+.kbd-bar{
+  display:flex;flex-wrap:wrap;align-items:center;gap:6px 16px;
+  padding:9px 12px;margin-bottom:12px;border-radius:10px;
+  background:var(--panel-2);border:1px solid var(--line-2);
+  font-size:12px;color:var(--text-2);
+}
+.kbd-bar kbd{
+  display:inline-block;min-width:20px;padding:1px 6px;margin-right:5px;
+  border-radius:5px;border:1px solid var(--line);border-bottom-width:2px;
+  background:var(--panel);color:var(--text);font-size:11.5px;font-weight:600;
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace;text-align:center;
+}
+/* 分数输入框：键盘焦点必须一眼看得见，否则「刚才那题敲进去了吗」只能靠猜 */
+.modal .input[data-batch-score]:focus,
+.modal .input[data-review-score]:focus{
+  border-color:var(--brand);box-shadow:0 0 0 3px rgba(91,124,250,.18);
+}

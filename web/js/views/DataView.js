@@ -5,6 +5,7 @@ import { ok, err, confirmBox, fmtDate, Empty, Modal, Pagination, escapeHtml } fr
 import { Icon } from '../icons.js'
 import { renderControl, answerDisplay } from '../renderer.js'
 import { buildFlow } from '../flow.js'
+import { batchPayload, nextIndex } from '../review.js'
 
 export default {
   setup() {
@@ -291,6 +292,49 @@ export default {
     const batchBusy = ref(false)
     const BATCH_LIMIT = 10
 
+    /**
+     * 键盘直填：批量阅卷把「打开/关闭」的成本压掉了，剩下的瓶颈全在打字。
+     * 所以这一页的打分框按 DOM 顺序排成一条队列：数字键直接输入（聚焦时全选，敲了就替换），
+     * ↑↓ 上下题，Enter 下一题，最后一题再 Enter 就是存本页。
+     * 不做「输入即跳」——两位数的分刚敲下第一位就跳走，反而要回头改。
+     */
+    const batchRoot = ref(null)
+    const scoreInputs = () => [...(batchRoot.value?.querySelectorAll('[data-batch-score]') || [])]
+    const focusScore = (i) => {
+      const el = scoreInputs()[i]
+      if (!el) return false
+      el.focus()
+      el.select?.()
+      return true
+    }
+
+    // 单份批阅走同一套键位：十几道题也要能一路敲下来。两个弹窗各自一个根节点，
+    // 打分框在各自弹窗内按 DOM 顺序排成队列，互不串
+    const reviewRoot = ref(null)
+    const reviewInputs = () => [...(reviewRoot.value?.querySelectorAll('[data-review-score]') || [])]
+
+    /**
+     * 打分框上的键盘：Enter 下一题（最后一题再按一次就是保存），↑↓ 上下题。
+     * 只认打分框自己的按键，不管别的输入框——批阅备注里按 Enter 不该跳走。
+     */
+    const scoreKeys = (els, onSubmit) => (e) => {
+      const list = els()
+      const idx = list.indexOf(e.target)
+      if (idx < 0) return
+      if (e.key === 'Enter') {
+        e.preventDefault()
+        const next = nextIndex(idx, list.length)
+        if (next < 0) return onSubmit()
+        list[next].focus()
+        list[next].select?.()
+      } else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        e.preventDefault()
+        const next = e.key === 'ArrowDown' ? Math.min(idx + 1, list.length - 1) : Math.max(idx - 1, 0)
+        list[next]?.focus()
+        list[next]?.select?.()
+      }
+    }
+
     const openBatch = async () => {
       if (!form.value) return err('请先在左上角选择一个具体表单')
       if (form.value.kind !== 'exam') return err('只有考试需要批阅')
@@ -305,6 +349,9 @@ export default {
         ...x,
         // 输入框里存字符串更方便：空串表示「还没给分」，0 是有效的 0 分
         draft: Object.fromEntries(x.items.map(it => [it.id, it.current == null ? '' : String(it.current)])),
+        // 「撤掉已给的分，退回待批」要单记一笔：空串表示「本来就没批」，
+        // 两者混成一个状态的话，撤分这份永远赖在队列里
+        revoke: new Set(),
         noteDraft: x.note || ''
       }))
       batch.value = { formId: formId.value, title: form.value.title, total: r.total, scanned: r.scanned, offset: offset || 0, limit: BATCH_LIMIT, items }
@@ -312,18 +359,19 @@ export default {
       if (!items.length && !r.total && !silent) return ok('这张卷子没有待批阅的答卷了')
     }
 
-    /** 只提交填过分的那几题：没填的题保持「待批」，不会因为看了一眼就被判 0 分 */
+    /**
+     * 只提交填过分的那几题：没填的题保持「待批」，不会因为看了一眼就被判 0 分。
+     * 越界的分数在这里就拦下来并跳到那一题——交给服务端拒，回来的是一句
+     * 「已保存 7 份，1 份被拒」，还得自己回头找是哪一份哪一题。
+     */
     const saveBatch = async () => {
       if (!batch.value || batchBusy.value) return
-      const payload = []
-      for (const x of batch.value.items) {
-        const scores = {}
-        for (const it of x.items) {
-          const v = x.draft[it.id]
-          if (v === '' || v === undefined || v === null) continue
-          scores[it.id] = Number(v)
-        }
-        if (Object.keys(scores).length) payload.push({ id: x.id, scores, note: x.noteDraft })
+      const { items: payload, error } = batchPayload(batch.value.items)
+      if (error) {
+        const label = String(error.label || '')
+        err(`「${label.length > 14 ? label.slice(0, 14) + '…' : label}」的分数${error.message}`)
+        const idx = batch.value.items.slice(0, error.row).reduce((n, x) => n + x.items.length, 0) + error.item
+        return focusScore(idx)
       }
       if (!payload.length) return err('还没有给任何一份卷子打分')
       batchBusy.value = true
@@ -542,10 +590,20 @@ export default {
       review.value ? Modal({
         title: `批阅答卷 #${review.value.id} · ${review.value.title}`, modelValue: true,
         onClose: () => review.value = null, wide: true,
-        children: h('div', {}, [
+        children: h('div', {
+          ref: el => { reviewRoot.value = el },
+          onKeydown: e => { if (e.key === 'Escape') review.value = null }
+        }, [
           h('div', { class: 'small muted mb' }, review.value.reviewedAt
             ? `上次批阅：${fmtDate(review.value.reviewedAt)}，可再次调整`
             : '主观题没有标准答案，需要人工给分；给完分系统会重算总分与及格判定'),
+          h('div', { class: 'kbd-bar' }, [
+            h('span', {}, [h('kbd', {}, '数字'), ' 直接填分']),
+            h('span', {}, [h('kbd', {}, 'Enter'), ' 下一题，最后一题再按一次 = 保存']),
+            h('span', {}, [h('kbd', {}, '↑ ↓'), ' 上下题']),
+            h('span', {}, [h('kbd', {}, 'Esc'), ' 退出']),
+            h('button', { class: 'btn sm', style: 'margin-left:auto', onClick: () => { reviewInputs()[0]?.focus(); reviewInputs()[0]?.select?.() } }, '从第一题开始')
+          ]),
           review.value.items.length > 1 ? h('div', { class: 'flex between mb' }, [
             h('span', { class: 'small muted' }, `共 ${review.value.items.length} 道主观题，未填的按 0 分算`),
             h('button', { class: 'btn sm', onClick: fillZero }, '未填的按 0 分')
@@ -562,8 +620,12 @@ export default {
               h('span', { class: 'small muted' }, '给分'),
               h('input', {
                 class: 'input', type: 'number', min: 0, max: it.score, step: '0.5',
+                'data-review-score': String(it.id),
                 style: 'max-width:110px', value: review.value.scores[it.id] ?? '',
                 placeholder: '0',
+                // 同一套键盘：单份批阅也常常是十几道题一路敲下来，凭什么要回去点鼠标
+                onFocus: e => e.target.select?.(),
+                onKeydown: scoreKeys(reviewInputs, saveReview),
                 onInput: e => {
                   const v = e.target.value
                   if (v === '') delete review.value.scores[it.id]
@@ -595,11 +657,26 @@ export default {
       batch.value ? Modal({
         title: `批量阅卷 · ${batch.value.title}`, modelValue: true,
         onClose: () => batch.value = null, wide: true,
-        children: h('div', {}, [
+        children: h('div', {
+          ref: el => { batchRoot.value = el },
+          onKeydown: e => { if (e.key === 'Escape') batch.value = null }
+        }, [
           h('div', { class: 'flex between wrap mb', style: 'gap:8px' }, [
             h('span', { class: 'small muted' },
               `待批阅 ${batch.value.total} 份 · 第 ${batch.value.offset + 1} – ${batch.value.offset + batch.value.items.length} 份`),
             h('span', { class: 'small muted' }, '只有填了分的题会被提交，留空表示「还没批」')
+          ]),
+          // 键盘提示摆在最上面而不是藏进 tooltip：这一页的意义就是把打字速度顶上去，
+          // 而「按了 Enter 会不会直接存」是老师最不敢试的一件事
+          h('div', { class: 'kbd-bar' }, [
+            h('span', {}, [h('kbd', {}, '数字'), ' 直接填分（聚焦即全选，敲了就替换）']),
+            h('span', {}, [h('kbd', {}, 'Enter'), ' 下一题，最后一题再按一次 = 保存本页']),
+            h('span', {}, [h('kbd', {}, '↑ ↓'), ' 上下题']),
+            h('span', {}, [h('kbd', {}, 'Esc'), ' 退出']),
+            h('button', {
+              class: 'btn sm', style: 'margin-left:auto',
+              onClick: () => focusScore(0)
+            }, '从第一题开始')
           ]),
           ...batch.value.items.map((x, xi) => h('div', {
             style: 'padding:14px;border:1px solid var(--line);border-radius:10px;margin-bottom:12px'
@@ -629,12 +706,26 @@ export default {
               h('div', { class: 'flex', style: 'gap:6px;align-items:center;flex-wrap:wrap' }, [
                 h('input', {
                   class: 'input', type: 'number', min: 0, max: it.score, step: '0.5',
+                  'data-batch-score': String(it.id),
                   style: 'max-width:96px', value: x.draft[it.id],
                   placeholder: '未批',
-                  onInput: e => { x.draft[it.id] = e.target.value }
+                  onFocus: e => e.target.select?.(),
+                  onKeydown: scoreKeys(scoreInputs, saveBatch),
+                  onInput: e => {
+                    x.revoke.delete(it.id)
+                    x.draft[it.id] = e.target.value
+                  }
                 }),
-                h('button', { class: 'btn sm', onClick: () => { x.draft[it.id] = String(it.score) } }, '满分'),
-                h('button', { class: 'btn sm', onClick: () => { x.draft[it.id] = '0' } }, '0 分'),
+                h('button', { class: 'btn sm', onClick: () => { x.revoke.delete(it.id); x.draft[it.id] = String(it.score) } }, '满分'),
+                h('button', { class: 'btn sm', onClick: () => { x.revoke.delete(it.id); x.draft[it.id] = '0' } }, '0 分'),
+                // 服务端早就支持 null = 撤分回队列，界面上一直没有入口；
+                // 给过分之后又把「还没批」写回来的通道，只能靠这一颗
+                it.current !== null && it.current !== undefined
+                  ? h('button', {
+                      class: 'btn ghost sm', title: '撤掉这道题的分，让它回到待批队列',
+                      onClick: () => { x.revoke.add(it.id); x.draft[it.id] = '' }
+                    }, x.revoke.has(it.id) ? '已撤分' : '撤分')
+                  : null,
                 it.analysis ? h('span', { class: 'small muted', style: 'margin-left:4px' }, '解析：' + it.analysis.slice(0, 40)) : null
               ])
             ])),
