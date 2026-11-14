@@ -2,6 +2,7 @@ import http from 'node:http'
 import fs from 'node:fs'
 import path from 'node:path'
 import zlib from 'node:zlib'
+import { setting } from './db.js'
 
 const MIME = {
   html: 'text/html; charset=utf-8', js: 'text/javascript; charset=utf-8',
@@ -56,10 +57,36 @@ export function sendJson(res, status, data, headers = {}) {
   })
 }
 
+/**
+ * 取客户端 IP。
+ *
+ * 以前无条件信任 `X-Forwarded-For`，取最左边那一段 —— 而这个头是**客户端自己发的**，
+ * 想写什么写什么。后果不是「日志里 IP 不准」这么轻：
+ *   1. 登录失败限速按「账号 + IP」计数，换个头就换了个计数器 —— 实测连打 12 次全是 401，一次不锁；
+ *   2. 问卷的「每个 IP 限填 1 次」同理，换 3 个头就交了 3 份；
+ *   3. 匿名答卷里记的 IP 是谁都能指定的字符串，出了事根本追不回来。
+ *
+ * 默认只认 socket 的对端地址。反向代理后面（Nginx / 容器网关）才需要在
+ * 系统设置 → 站点 里显式打开「信任代理头」，并指定代理层数：
+ * 右边第 N 段才是可信代理追加的，左边全是调用方自己填的。
+ */
+let ipCfg = { at: 0, trust: false, hops: 1 }
+function ipTrust() {
+  const now = Date.now()
+  if (now - ipCfg.at > 5000) {
+    const s = setting('site', {}) || {}
+    ipCfg = { at: now, trust: s.trustProxy === true, hops: Math.min(5, Math.max(1, Number(s.trustHops) || 1)) }
+  }
+  return ipCfg
+}
+
 export function clientIp(req) {
-  const fwd = req.headers['x-forwarded-for']
-  if (fwd) return String(fwd).split(',')[0].trim()
-  return (req.socket.remoteAddress || '').replace('::ffff:', '')
+  const direct = String(req.socket?.remoteAddress || '').replace('::ffff:', '')
+  const cfg = ipTrust()
+  if (!cfg.trust) return direct
+  const chain = String(req.headers['x-forwarded-for'] || '').split(',').map(x => x.trim()).filter(Boolean)
+  if (!chain.length) return direct
+  return chain[Math.max(0, chain.length - cfg.hops)] || direct
 }
 
 /** 静态文件目录服务，带 etag 与 gzip */

@@ -284,14 +284,20 @@ table.table{width:100%;border-collapse:collapse;font-size:13.5px}
 /* 登录设备表：只有 4 列有效信息，窄屏让掉 IP / 时间 / 状态三列，把它挪进设备名下面，
    这样 390px 里「下线」按钮能显示完整，不用横滚去找 */
 .show-sm{display:none}
+.hide-sm{display:block}
 @media(max-width:640px){
   /* 窄屏不要压缩列宽：中文标题会被挤成一行一个字，操作按钮还会被裁掉。
      给表格一个最小宽度，让外层容器横向滚动，读起来才像一张表。 */
   .table{min-width:620px}
   /* 登录设备表只有 4 列有效信息，让掉 IP / 时间 / 状态，以免 390px 里还要横滚找按钮 */
   .table.sessions-table{min-width:0}
-  .sessions-table .col-time,.sessions-table .col-ip,.sessions-table .col-status{display:none}
+  /* 「最近活跃」在窄屏是最不重要的一列（你正在用的就是这台，日期戳没有决策价值），
+     和 IP / 登录时间 / 状态一起让掉，只留「哪台设备 + 能不能踢」，设备名才不至于被挤成两行 */
+  .sessions-table .col-time,.sessions-table .col-ip,.sessions-table .col-status,.sessions-table .col-seen{display:none}
   .sessions-table .show-sm{display:block}
+  .sessions-table .hide-sm{display:none}
+  /* 设备名不折行：折成「Android 手机 ·」/「Chrome」比省略更让人困惑 */
+  .sessions-table tbody td:first-child{white-space:nowrap}
   .page{padding:14px}
   .grid.c2,.grid.c3,.grid.c4{grid-template-columns:1fr}
   .grid[style*="grid-template-columns"]{grid-template-columns:1fr!important}

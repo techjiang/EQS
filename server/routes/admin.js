@@ -4,7 +4,7 @@ import { requireUser, requirePerm, can, hashPassword, verifyPassword, stampPassw
 import { storageConfig } from '../lib/storage.js'
 import { smtpSend, sendSms, dispatchWebhooks } from '../lib/notify.js'
 import { aiConfig, generateForm, localGenerate } from '../lib/ai.js'
-import { safeJson } from '../lib/forms.js'
+import { safeJson, paginate } from '../lib/forms.js'
 
 const SECRET_FIELDS = ['password', 'pass', 'apiKey', 'secretKey', 'secret', 'accessKey', 'appSecret', 'secretId']
 
@@ -415,12 +415,45 @@ export default function register(r) {
     sendJson(res, 200, { ok: true, data: { ...cfg, apiKey: cfg.apiKey ? cfg.apiKey.slice(0, 3) + '****' : '' } })
   })
 
-  /* ---------------- 日志 ---------------- */
+  /* ---------------- 审计日志 ---------------- */
+  /**
+   * 日志页。
+   * 之前只有一个「最近 200 条，全部动作混在一起」的接口，也没有任何页面调它 ——
+   * 于是「谁在什么时候删了那张问卷」这件事，系统里记着，但没人看得见。
+   */
   r.get('/api/logs', async (req, res) => {
     const me = requireUser(req)
     if (!can(me, '*')) fail(403, '权限不足')
-    const rows = all('SELECT * FROM logs ORDER BY id DESC LIMIT 200')
-    sendJson(res, 200, { ok: true, data: rows })
+    const url = new URL(req.url, 'http://x')
+    const action = url.searchParams.get('action') || ''
+    const keyword = String(url.searchParams.get('keyword') || '').trim()
+    const where = []
+    const args = []
+    if (action) { where.push('action = ?'); args.push(action) }
+    if (keyword) {
+      // 动作名也要能搜：用户想查「登录失败」，最直觉的就是往框里打这四个字
+      where.push('(username LIKE ? OR detail LIKE ? OR ip LIKE ? OR action LIKE ?)')
+      args.push(`%${keyword}%`, `%${keyword}%`, `%${keyword}%`, `%${keyword}%`)
+    }
+    const total = get(`SELECT COUNT(*) c FROM logs ${where.length ? 'WHERE ' + where.join(' AND ') : ''}`, ...args).c
+    const p = paginate(req, total)
+    const rows = all(`SELECT * FROM logs ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+      ORDER BY id DESC LIMIT ? OFFSET ?`, ...args, p.pageSize, p.offset)
+    // 动作分组给前端做下拉：日志长得快，全量 distinct 每页算一次不划算，这里限 60 个
+    const actions = all('SELECT action, COUNT(*) c FROM logs GROUP BY action ORDER BY c DESC LIMIT 60')
+    sendJson(res, 200, { ok: true, data: rows, actions, page: p.page, pageSize: p.pageSize, total, totalPages: p.totalPages })
+  })
+
+  /** 只清「够老」的日志：一次误点把审计记录清空的代价太大，保留期由调用方明确给出 */
+  r.delete('/api/logs', async (req, res) => {
+    const me = requireUser(req)
+    if (!can(me, '*')) fail(403, '权限不足')
+    const url = new URL(req.url, 'http://x')
+    const days = Math.min(3650, Math.max(7, Number(url.searchParams.get('days')) || 90))
+    const before = new Date(Date.now() - days * 864e5).toISOString()
+    const r2 = run('DELETE FROM logs WHERE created_at < ?', before)
+    log(me, '清理审计日志', `删除 ${days} 天前的记录，共 ${Number(r2.changes || 0)} 条`, clientIp(req))
+    sendJson(res, 200, { ok: true, removed: Number(r2.changes || 0), days })
   })
 
   /* ---------------- 多语言 ---------------- */

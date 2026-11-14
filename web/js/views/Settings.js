@@ -145,7 +145,16 @@ export default {
             field('站点访问地址', txt(s, 'baseUrl', 'https://your-domain.com'), '用于生成回调地址与第三方登录'),
             field('ICP 备案号', txt(s, 'icp', '')),
             sw(s, 'allowRegister', '允许自助注册'),
-            h('div', { class: 'hint' }, '默认关闭。问卷系统里的账号等于「能建卷、能看自己那份数据」，陌生人注册进来没有审核环节，建议只在内部试用时打开。')
+            h('div', { class: 'hint' }, '默认关闭。问卷系统里的账号等于「能建卷、能看自己那份数据」，陌生人注册进来没有审核环节，建议只在内部试用时打开。'),
+            h('div', { style: 'height:14px' }),
+            sw(s, 'trustProxy', '信任反向代理传来的 X-Forwarded-For'),
+            s.trustProxy ? field('代理层数', h('input', {
+              class: 'input', type: 'number', min: 1, max: 5, value: s.trustHops ?? 1,
+              onInput: e => s.trustHops = Number(e.target.value) || 1
+            }), '从右往左第几段是可信代理写的。Nginx 直接反代就是 1，前面再加一层 CDN 就是 2。') : null,
+            h('div', { class: 'hint' },
+              '默认不信任。这个头是客户端自己发的，无条件相信它等于让「每个 IP 限填一次」「登录失败锁号」这两条防线失效——' +
+              '换个头就换了个计数器和一条新身份。只有在 Nginx / 容器网关后面才需要打开。')
           ])
         }
         case 'storage': {

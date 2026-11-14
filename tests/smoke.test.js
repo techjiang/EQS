@@ -1631,9 +1631,72 @@ try {
     assert(p.status === 401 || p.status === 403, '停用账号后旧会话不再通行', String(p.status))
   }
 
+  console.log('\n[49] 伪造的 X-Forwarded-For 不该改变身份与计数')
+  {
+    /*
+     * X-Forwarded-For 是客户端自己发的头。无条件信任它，等于把三道防线一起送掉：
+     * 登录失败限速、每个 IP 限填一次的答卷限制、答卷里记的 IP。
+     * 这里直接用一个来自「新 IP」的请求去撞锁定，确认它并没有换到一个新的计数器。
+     */
+    cookie = await asUser('admin', 'test-pass-123')
+    await req('POST', '/api/settings/site', { trustProxy: false })
+    const fakeIps = []
+    for (let i = 0; i < 12; i++) {
+      const res = await fetch(BASE + '/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Forwarded-For': `10.9.${i}.${i}` },
+        body: JSON.stringify({ username: 'lockme', password: 'definitely-wrong' })
+      })
+      fakeIps.push(res.status)
+    }
+    assert(fakeIps.includes(429), '换 X-Forwarded-For 无法绕过登录失败锁定', fakeIps.join(','))
+
+    // 打开「信任代理」后，才按代理层数从右往左取——这是给真站在 Nginx 后面的部署用的
+    await req('POST', '/api/settings/site', { trustProxy: true, trustHops: 1 })
+    const r1 = await req('POST', '/api/auth/login', { username: 'nobody-here', password: 'x' })
+    assert(r1.status === 401, '信任代理模式下登录照常校验')
+    await req('POST', '/api/settings/site', { trustProxy: false })
+  }
+
+  console.log('\n[50] 审计日志：看得见，查得到')
+  {
+    cookie = await asUser('admin', 'test-pass-123')
+    // 造一个普通账号，用来确认日志页不是谁都能开
+    await req('POST', '/api/users', { username: 'audituser', password: 'audit-pass-1', nickname: '审计测试', role_id: 2 })
+    let r = await req('GET', '/api/logs?keyword=' + encodeURIComponent('登录失败'))
+    assert(r.status === 200 && r.json.total > 0, '按关键词搜得到登录失败记录', JSON.stringify(r.json?.total))
+    const failed = r.json.data.find(x => /登录失败/.test(x.action))
+    assert(!!failed && failed.ip, '失败记录带来源 IP', JSON.stringify(failed))
+    assert(!JSON.stringify(r.json.data).includes('definitely-wrong'), '日志不记录明文密码')
+
+    r = await req('GET', '/api/logs?action=' + encodeURIComponent('登录失败'))
+    assert(r.status === 200 && r.json.data.every(x => x.action === '登录失败'), '按动作筛选生效')
+    assert(Array.isArray(r.json.actions) && r.json.actions.length > 0, '动作清单可用于筛选面板')
+
+    r = await req('GET', '/api/logs?pageSize=5')
+    assert(r.json.data.length <= 5 && r.json.totalPages >= 1, '日志分页生效', `len=${r.json.data.length}`)
+
+    const ckUser = await asUser('audituser', 'audit-pass-1')
+    r = await call(ckUser, 'GET', '/api/logs')
+    assert(r.status === 403, '普通用户看不到审计日志', String(r.status))
+  }
+
+  console.log('\n[51] 会话上限：一个账号不该堆出无限多条')
+  {
+    const cks = []
+    for (let i = 0; i < 14; i++) cks.push(await asUser('audituser', 'audit-pass-1'))
+    const last = cks[cks.length - 1]
+    const r = await call(last, 'GET', '/api/auth/sessions')
+    assert(r.status === 200 && r.json.data.length <= 10, '同账号活跃会话数被压在上限内', `len=${r.json.data.length}`)
+    const first = await call(cks[0], 'GET', '/api/forms')
+    assert(first.status === 401, '最老的会话被自动踢掉（新设备照常能登）', String(first.status))
+    const newest = await call(last, 'GET', '/api/forms')
+    assert(newest.status === 200, '最新登录的会话仍然有效', String(newest.status))
+  }
+
   console.log('\n[44] 前端静态资源')
 
-  for (const p of ['/', '/js/main.js', '/css/app.css', '/assets/eqs-mark.svg', '/vendor/echarts.min.js']) {
+  for (const p of ['/', '/js/main.js', '/css/app.css', '/js/views/Logs.js', '/assets/eqs-mark.svg', '/vendor/echarts.min.js']) {
     const res = await fetch(BASE + p)
     assert(res.ok, `静态资源可访问：${p}`)
   }

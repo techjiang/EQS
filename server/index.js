@@ -6,6 +6,7 @@ import { createRouter, sendJson, serveStatic, HttpError, clientIp } from './lib/
 import { ensureAdmin, seedRoles } from './lib/auth.js'
 import { seedTemplates, seedSettings } from './lib/seed.js'
 import { log } from './lib/db.js'
+import { runWithRequest } from './lib/ctx.js'
 
 import authRoutes from './routes/auth.js'
 import formRoutes from './routes/forms.js'
@@ -53,7 +54,8 @@ const server = http.createServer(async (req, res) => {
 
   try {
     const match = router.match(req.method, pathname)
-    if (match) return await match.handler(req, res, { params: match.params })
+    // 请求级上下文：handler 里任何一处 log() 不传 IP，也能拿到来源地址
+    if (match) return await runWithRequest(clientIp(req), () => match.handler(req, res, { params: match.params }))
     if (pathname.startsWith('/api/')) return sendJson(res, 404, { ok: false, message: '接口不存在' })
 
     // 静态资源

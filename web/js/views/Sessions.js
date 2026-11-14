@@ -84,7 +84,7 @@ export default {
               h('th', {}, '设备'),
               h('th', { class: 'col-ip' }, 'IP'),
               h('th', { class: 'col-time' }, '登录时间'),
-              h('th', {}, '最近活跃'),
+              h('th', { class: 'col-seen' }, '最近活跃'),
               h('th', { class: 'col-status' }, '状态'),
               h('th', {}, '操作')
             ])),
@@ -95,16 +95,17 @@ export default {
                 }, /iPhone|iPad|iPod|Android/i.test(s.device) ? "📱" : "💻"),
                 h('div', {}, [
                   h('div', { style: 'font-weight:540' }, s.device),
-                  // 窄屏把 IP 收到设备名下面：单独一列放不下，信息和「是不是我的设备」没关系
-                  h('div', { class: 'small muted' }, [s.current ? '这台设备 · ' : '', s.ip || '-']),
-                  // 窄屏没有「状态」列：过期时间挪到设备名下面，免得读者以为这些会话永不过期
-                  h('div', { class: 'small muted show-sm' }, s.current ? '当前登录' : left(s.expiresAt))
+                  // 宽屏 IP / 状态各有自己的列，这一行只留「是不是这台」；
+                  // 窄屏那三列被让掉了，IP 与过期时间落到这里（一行放不下就换行，别硬挤成三行）
+                  h('div', { class: 'small muted show-sm' }, [s.ip || '-', s.current ? ' · 当前登录' : ''].join('')),
+                  s.current ? h('div', { class: 'small muted hide-sm' }, '这台设备') : null,
+                  h('div', { class: 'small muted show-sm' }, s.current ? '' : left(s.expiresAt))
                 ])
               ])),
               h('td', { class: 'mono small col-ip' }, s.ip || '-'),
               // 窄屏上「登录时间」最不重要：先让掉这一列，操作按钮才不至于被挤出屏幕
               h('td', { class: 'small muted nowrap col-time' }, fmtDate(s.createdAt)),
-              h('td', { class: 'small nowrap' }, ago(s.lastSeenAt)),
+              h('td', { class: 'small nowrap col-seen' }, ago(s.lastSeenAt)),
               h('td', { class: ['nowrap', 'col-status'] }, h('span', { class: ['tag', s.current ? 'ok' : 'brand'] }, s.current ? '当前登录' : left(s.expiresAt))),
               h('td', {}, h('button', {
                 class: ['btn', 'sm', s.current ? '' : 'danger'], disabled: busy.value,

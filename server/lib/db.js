@@ -1,6 +1,7 @@
 import { DatabaseSync } from 'node:sqlite'
 import fs from 'node:fs'
 import path from 'node:path'
+import { currentRequestIp } from './ctx.js'
 
 const DATA_DIR = process.env.EQS_DATA_DIR || path.join(process.cwd(), 'data')
 fs.mkdirSync(path.join(DATA_DIR, 'files'), { recursive: true })
@@ -246,9 +247,15 @@ export function setSetting(key, value) {
   run('INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value', key, v)
 }
 
+/**
+ * 写审计日志。
+ * ip 不传时回退到当前请求的来源地址：以前各调用点基本都不传，日志里这一列大面积是空的，
+ * 而「从哪个 IP 干的」是出事后第一个要看的字段。
+ */
 export function log(user, action, detail = '', ip = '') {
+  const from = ip || currentRequestIp()
   run('INSERT INTO logs(user_id, username, action, detail, ip, created_at) VALUES(?,?,?,?,?,?)',
-    user?.id || 0, user?.username || '-', action, String(detail).slice(0, 500), ip, now())
+    user?.id || 0, user?.username || '-', action, String(detail).slice(0, 500), from || '', now())
 }
 
 export { now, DATA_DIR }

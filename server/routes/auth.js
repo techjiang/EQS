@@ -12,25 +12,46 @@ import {
  * 放内存即可：重启丢掉计数不是问题，重启本来就打断了攻击节奏。
  */
 const MAX_FAILS = 8
+// 同一 IP 上换着账号名试，是撞库的典型姿势：只按「账号 + IP」计数的话，
+// 攻击者拿一份账号字典挨个试，每个账号都只错一次，一次都锁不上。
+const MAX_IP_FAILS = 30
 const LOCK_MS = 10 * 60 * 1000
 const fails = new Map()
 const failKey = (username, ip) => `${String(username || '').trim().toLowerCase()}|${ip}`
+const ipKey = ip => `ip|${ip}`
+
+function lockedFor(rec) {
+  if (!rec?.lockedUntil || rec.lockedUntil <= Date.now()) return 0
+  return Math.ceil((rec.lockedUntil - Date.now()) / 60000)
+}
+
 function checkLocked(username, ip) {
-  const rec = fails.get(failKey(username, ip))
-  if (!rec) return
-  if (rec.lockedUntil && rec.lockedUntil > Date.now()) {
-    const min = Math.ceil((rec.lockedUntil - Date.now()) / 60000)
-    fail(429, `密码错误次数过多，请 ${min} 分钟后再试`)
+  // 先看账号，再看 IP：撞库时锁的是整个来源，正常用户输错几次不会被牵连
+  for (const k of [failKey(username, ip), ipKey(ip)]) {
+    const min = lockedFor(fails.get(k))
+    if (min) fail(429, `密码错误次数过多，请 ${min} 分钟后再试`)
   }
 }
+
+/** 记一次失败；返回本次同时触发的锁定原因（用于写审计日志） */
 function noteFail(username, ip) {
-  const k = failKey(username, ip)
-  const rec = fails.get(k) || { count: 0, lockedUntil: 0 }
-  rec.count++
-  if (rec.count >= MAX_FAILS) { rec.lockedUntil = Date.now() + LOCK_MS; rec.count = 0 }
-  fails.set(k, rec)
-  // 顺手清掉过期记录，避免一张表无限长
+  const bump = (k, limit) => {
+    const rec = fails.get(k) || { count: 0, lockedUntil: 0 }
+    rec.count++
+    let locked = ''
+    if (rec.count >= limit) {
+      rec.lockedUntil = Date.now() + LOCK_MS
+      rec.count = 0
+      locked = k === ipKey(ip) ? `来源 IP ${ip} 因连续失败被锁 ${LOCK_MS / 60000} 分钟` : '该账号在此 IP 上被锁'
+    }
+    fails.set(k, rec)
+    return locked
+  }
+  const byAccount = bump(failKey(username, ip), MAX_FAILS)
+  const byIp = bump(ipKey(ip), MAX_IP_FAILS)
+  // 顺手清掉过期记录，避免这张表无限长
   if (fails.size > 5000) for (const [k2, v] of fails) if (!v.lockedUntil || v.lockedUntil < Date.now()) fails.delete(k2)
+  return byAccount || byIp
 }
 const clearFail = (username, ip) => fails.delete(failKey(username, ip))
 
@@ -45,11 +66,21 @@ export default function register(r) {
     checkLocked(username, ip)
     const user = get('SELECT * FROM users WHERE username = ?', String(username).trim())
     if (!user || !verifyPassword(password, user.password)) {
-      noteFail(username, ip)
+      // 失败登录必须留痕：以前连打 30 次错误密码，接口一声不吭、日志里也一个字没有。
+      // 「谁在什么时候从哪台机器试了多少次」是出事之后唯一能查的东西，事后补不回来。
+      const locked = noteFail(username, ip)
+      // 日志的「账号」列填被尝试的那个名字（不是提交成功的人）：查「有没有人在猜我密码」时，
+      // 一眼看的就是这一列，把账号名塞进详情里等于每次都要点开看。
+      // 详情写清「错在哪」：只写「登录失败」的话，看日志的人还得去猜是猜错了密码，还是账号压根不存在
+      const why = [user ? '密码错误' : '账号不存在', locked].filter(Boolean).join(' · ')
+      log({ username: String(username).slice(0, 40) }, locked ? '登录失败（已锁定）' : '登录失败', why, ip)
       fail(401, '账号或密码错误')
     }
     clearFail(username, ip)
-    if (user.status !== 1) fail(403, '账号已被禁用')
+    if (user.status !== 1) {
+      log(user, '登录失败（账号停用）', '', ip)
+      fail(403, '账号已被禁用')
+    }
     run('UPDATE users SET last_login_at = ? WHERE id = ?', now(), user.id)
     log(user, '登录', '', clientIp(req))
     const { token } = createSession(user.id, req, ip, req.headers['user-agent'] || '')

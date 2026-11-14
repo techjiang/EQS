@@ -34,6 +34,13 @@ const b64 = s => Buffer.from(s).toString('base64url')
  */
 export const SESSION_TTL = 7 * 864e5
 const TOUCH_MS = 60 * 1000
+/**
+ * 每个账号最多留几条活跃会话。
+ * 不设上限的话，一个脚本反复登录会把 sessions 表堆成无人审查的垃圾场——
+ * 「登录设备」页第一屏全是同一台机器的 30 条记录，于是这一页也就没人看了。
+ * 满了就踢最久没动的那条，而不是拒绝新登录：用户看到的永远是「新设备能登进来」。
+ */
+export const MAX_SESSIONS_PER_USER = 10
 
 const sha256 = s => crypto.createHash('sha256').update(String(s)).digest('hex')
 
@@ -50,8 +57,21 @@ export function createSession(userId, req = null, ip = '', ua = '') {
     String(ua || (req?.headers?.['user-agent'] || '')).slice(0, 300),
     t.toISOString(), t.toISOString(), exp.toISOString()
   )
-  // 顺手清掉过期记录，别让这张表无限长
-  try { run('DELETE FROM sessions WHERE expires_at < ?', t.toISOString()) } catch {}
+  // 顺手清掉「已经死透」的记录：过期 + 吊销超过一天的。
+  // 以前只删过期行，被吊销的行永远留着——退一次登录留一行，这张表只涨不消。
+  try {
+    run('DELETE FROM sessions WHERE expires_at < ?', t.toISOString())
+    run('DELETE FROM sessions WHERE revoked_at IS NOT NULL AND revoked_at < ?', new Date(t.getTime() - 864e5).toISOString())
+  } catch {}
+  // 超出上限就踢最久没动静的那几条
+  try {
+    // rowid 是插入顺序：同一秒内登录十几台设备时，last_seen_at 分辨不出先后
+    const live = all(`SELECT id FROM sessions WHERE user_id = ? AND revoked_at IS NULL AND expires_at > ?
+      ORDER BY rowid DESC`, userId, t.toISOString())
+    for (const extra of live.slice(MAX_SESSIONS_PER_USER)) {
+      run('UPDATE sessions SET revoked_at = ?, revoked_by = 0 WHERE id = ?', t.toISOString(), extra.id)
+    }
+  } catch {}
   return { token, id }
 }
 
