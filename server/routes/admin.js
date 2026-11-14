@@ -71,9 +71,10 @@ export default function register(r) {
     const where = []
     const args = []
     if (keyword) { where.push('(u.username LIKE ? OR u.nickname LIKE ?)'); args.push(`%${keyword}%`, `%${keyword}%`) }
-    const rows = all(`SELECT u.id, u.username, u.nickname, u.email, u.phone, u.avatar, u.role_id, u.dept_id, u.status, u.last_login_at, u.created_at,
-      r.name AS role_name, d.name AS dept_name
+    const rows = all(`SELECT u.id, u.username, u.nickname, u.email, u.phone, u.avatar, u.role_id, u.dept_id, u.position_id, u.status, u.last_login_at, u.created_at,
+      r.name AS role_name, d.name AS dept_name, p.name AS position_name
       FROM users u LEFT JOIN roles r ON r.id = u.role_id LEFT JOIN depts d ON d.id = u.dept_id
+      LEFT JOIN positions p ON p.id = u.position_id
       ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY u.id ASC`, ...args)
     // 通讯录不是公开资料。普通用户带 form:read 就能拿到全站账号、邮箱、手机号，
     // 前端那一栏明明写着「用户与权限（仅管理员）」——非管理员只回自己这一条。
@@ -88,9 +89,10 @@ export default function register(r) {
     if (!body.username || !body.password) fail(400, '账号和密码必填')
     if (String(body.password).length < 6) fail(400, '密码至少 6 位')
     if (get('SELECT id FROM users WHERE username = ?', body.username)) fail(409, '账号已存在')
-    run('INSERT INTO users(username, nickname, password, email, phone, role_id, dept_id, status, created_at) VALUES(?,?,?,?,?,?,?,?,?)',
+    run(`INSERT INTO users(username, nickname, password, email, phone, role_id, dept_id, position_id, status, created_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?)`,
       body.username, body.nickname || body.username, hashPassword(body.password), body.email || '', body.phone || '',
-      Number(body.role_id) || 2, Number(body.dept_id) || 0, body.status === 0 ? 0 : 1, now())
+      Number(body.role_id) || 2, Number(body.dept_id) || 0, Number(body.position_id) || 0, body.status === 0 ? 0 : 1, now())
     log(me, '新增用户', body.username)
     sendJson(res, 201, { ok: true })
   })
@@ -109,6 +111,7 @@ export default function register(r) {
     if (can(me, '*')) {
       if (body.role_id !== undefined) { sets.push('role_id = ?'); args.push(Number(body.role_id)) }
       if (body.dept_id !== undefined) { sets.push('dept_id = ?'); args.push(Number(body.dept_id)) }
+      if (body.position_id !== undefined) { sets.push('position_id = ?'); args.push(Number(body.position_id)) }
       if (body.status !== undefined) { sets.push('status = ?'); args.push(body.status ? 1 : 0) }
     }
     if (body.password) {
@@ -141,6 +144,9 @@ export default function register(r) {
     if (target.id === me.id) fail(400, '不能删除自己')
     if (target.username === 'admin') fail(400, '内置管理员不可删除')
     run('DELETE FROM users WHERE id = ?', target.id)
+    // 人没了，协作关系也得跟着走：留在 bank_members 里就是一个指向空气的权限位，
+    // 而 id 会被新注册的账号复用，于是新用户凭空继承了一个题库的编辑权。
+    run('DELETE FROM bank_members WHERE user_id = ?', target.id)
     revokeUserSessions(target.id, { byUserId: me.id })
     log(me, '删除用户', target.username)
     sendJson(res, 200, { ok: true })
@@ -201,24 +207,134 @@ export default function register(r) {
     sendJson(res, 200, { ok: true })
   })
 
+  /*
+   * 组织架构。以前 depts 只有「加一个」和「删一个」：
+   * 不能改名、不能设上级、父部门可以随便写成任意数字（包括它自己），
+   * 删除也不看有没有人挂在这部门下面——删完用户还在，只是部门名变成了空白。
+   * 部门树一旦塌了，后面所有「按部门筛数据」的口径都跟着错。
+   */
+  const deptRows = () => all(`SELECT d.*,
+      (SELECT COUNT(*) FROM users u WHERE u.dept_id = d.id) AS user_count,
+      (SELECT COUNT(*) FROM depts c WHERE c.parent_id = d.id) AS child_count,
+      (SELECT COUNT(*) FROM positions p WHERE p.dept_id = d.id) AS position_count
+    FROM depts d ORDER BY d.sort, d.id`)
+
+  /** 把扁平部门拼成树。前端要画树，后端算一次比每个组件各算一遍省事 */
+  const deptTree = (rows, parentId = 0, depth = 0) => rows
+    .filter(d => Number(d.parent_id) === Number(parentId))
+    .map(d => ({ ...d, depth, children: deptTree(rows, d.id, depth + 1) }))
+
   r.get('/api/depts', async (req, res) => {
     requireUser(req)
-    sendJson(res, 200, { ok: true, data: all('SELECT * FROM depts ORDER BY sort, id') })
+    const rows = deptRows()
+    sendJson(res, 200, { ok: true, data: rows, tree: deptTree(rows) })
   })
 
   r.post('/api/depts', async (req, res) => {
     const me = requirePerm(req, 'form:create')
     if (!can(me, '*')) fail(403, '权限不足')
     const body = await readJson(req)
-    if (!body.name) fail(400, '请填写部门名称')
-    const result = run('INSERT INTO depts(name, parent_id, sort) VALUES(?,?,?)', body.name, Number(body.parent_id) || 0, Number(body.sort) || 0)
+    const name = String(body.name || '').trim()
+    if (!name) fail(400, '请填写部门名称')
+    const parentId = Number(body.parent_id) || 0
+    if (parentId && !get('SELECT id FROM depts WHERE id = ?', parentId)) fail(400, '上级部门不存在')
+    if (get('SELECT id FROM depts WHERE name = ? AND parent_id = ?', name, parentId)) fail(409, '同一上级下已有同名部门')
+    const result = run('INSERT INTO depts(name, parent_id, sort) VALUES(?,?,?)', name, parentId, Number(body.sort) || 0)
+    log(me, '新增部门', name)
     sendJson(res, 201, { ok: true, id: Number(result.lastInsertRowid) })
+  })
+
+  /** 改名 / 换上级 / 排序。换上级要防「把部门挂到自己的子孙下面」——那会做出一棵环 */
+  r.put('/api/depts/:id', async (req, res, { params }) => {
+    const me = requirePerm(req, 'form:create')
+    if (!can(me, '*')) fail(403, '权限不足')
+    const dept = get('SELECT * FROM depts WHERE id = ?', Number(params.id))
+    if (!dept) fail(404, '部门不存在')
+    const body = await readJson(req)
+    const name = body.name === undefined ? dept.name : String(body.name).trim()
+    if (!name) fail(400, '部门名称不能为空')
+    const parentId = body.parent_id === undefined ? dept.parent_id : Number(body.parent_id) || 0
+    if (parentId === dept.id) fail(400, '上级部门不能是自己')
+    if (parentId) {
+      if (!get('SELECT id FROM depts WHERE id = ?', parentId)) fail(400, '上级部门不存在')
+      // 沿着目标上级往上走，碰到自己就说明成环了
+      let cur = parentId, guard = 0
+      while (cur && guard++ < 50) {
+        if (cur === dept.id) fail(400, '不能把部门挂到自己的下级部门下面')
+        cur = Number(get('SELECT parent_id FROM depts WHERE id = ?', cur)?.parent_id) || 0
+      }
+    }
+    const dup = get('SELECT id FROM depts WHERE name = ? AND parent_id = ? AND id <> ?', name, parentId, dept.id)
+    if (dup) fail(409, '同一上级下已有同名部门')
+    run('UPDATE depts SET name = ?, parent_id = ?, sort = ? WHERE id = ?',
+      name, parentId, body.sort === undefined ? dept.sort : Number(body.sort) || 0, dept.id)
+    log(me, '修改部门', `${dept.name} → ${name}`)
+    sendJson(res, 200, { ok: true })
   })
 
   r.delete('/api/depts/:id', async (req, res, { params }) => {
     const me = requirePerm(req, 'form:create')
     if (!can(me, '*')) fail(403, '权限不足')
-    run('DELETE FROM depts WHERE id = ?', Number(params.id))
+    const dept = get('SELECT * FROM depts WHERE id = ?', Number(params.id))
+    if (!dept) fail(404, '部门不存在')
+    // 直接删会把一批人留在「不存在的部门」上：他们照常能用系统，但按部门筛选时集体消失
+    const users = get('SELECT COUNT(*) c FROM users WHERE dept_id = ?', dept.id).c
+    if (users) fail(400, `还有 ${users} 个用户在这个部门，请先调整他们的部门`)
+    const children = get('SELECT COUNT(*) c FROM depts WHERE parent_id = ?', dept.id).c
+    if (children) fail(400, `该部门下还有 ${children} 个子部门，请先移动或删除它们`)
+    run('DELETE FROM positions WHERE dept_id = ?', dept.id)
+    run('DELETE FROM depts WHERE id = ?', dept.id)
+    log(me, '删除部门', dept.name)
+    sendJson(res, 200, { ok: true })
+  })
+
+  /* ---------------- 职位 ---------------- */
+  r.get('/api/positions', async (req, res) => {
+    requireUser(req)
+    const rows = all(`SELECT p.*, d.name AS dept_name,
+        (SELECT COUNT(*) FROM users u WHERE u.position_id = p.id) AS user_count
+      FROM positions p LEFT JOIN depts d ON d.id = p.dept_id ORDER BY p.sort, p.id`)
+    sendJson(res, 200, { ok: true, data: rows })
+  })
+
+  r.post('/api/positions', async (req, res) => {
+    const me = requirePerm(req, 'form:create')
+    if (!can(me, '*')) fail(403, '权限不足')
+    const body = await readJson(req)
+    const name = String(body.name || '').trim()
+    if (!name) fail(400, '请填写职位名称')
+    const deptId = Number(body.dept_id) || 0
+    if (deptId && !get('SELECT id FROM depts WHERE id = ?', deptId)) fail(400, '所属部门不存在')
+    if (get('SELECT id FROM positions WHERE name = ? AND dept_id = ?', name, deptId)) fail(409, '该部门下已有同名职位')
+    const result = run('INSERT INTO positions(name, dept_id, sort) VALUES(?,?,?)', name, deptId, Number(body.sort) || 0)
+    log(me, '新增职位', name)
+    sendJson(res, 201, { ok: true, id: Number(result.lastInsertRowid) })
+  })
+
+  r.put('/api/positions/:id', async (req, res, { params }) => {
+    const me = requirePerm(req, 'form:create')
+    if (!can(me, '*')) fail(403, '权限不足')
+    const pos = get('SELECT * FROM positions WHERE id = ?', Number(params.id))
+    if (!pos) fail(404, '职位不存在')
+    const body = await readJson(req)
+    const name = body.name === undefined ? pos.name : String(body.name).trim()
+    if (!name) fail(400, '职位名称不能为空')
+    const deptId = body.dept_id === undefined ? pos.dept_id : Number(body.dept_id) || 0
+    if (deptId && !get('SELECT id FROM depts WHERE id = ?', deptId)) fail(400, '所属部门不存在')
+    run('UPDATE positions SET name = ?, dept_id = ?, sort = ? WHERE id = ?',
+      name, deptId, body.sort === undefined ? pos.sort : Number(body.sort) || 0, pos.id)
+    sendJson(res, 200, { ok: true })
+  })
+
+  r.delete('/api/positions/:id', async (req, res, { params }) => {
+    const me = requirePerm(req, 'form:create')
+    if (!can(me, '*')) fail(403, '权限不足')
+    const pos = get('SELECT * FROM positions WHERE id = ?', Number(params.id))
+    if (!pos) fail(404, '职位不存在')
+    const used = get('SELECT COUNT(*) c FROM users WHERE position_id = ?', pos.id).c
+    if (used) fail(400, `还有 ${used} 个用户的职位是「${pos.name}」，请先调整`)
+    run('DELETE FROM positions WHERE id = ?', pos.id)
+    log(me, '删除职位', pos.name)
     sendJson(res, 200, { ok: true })
   })
 

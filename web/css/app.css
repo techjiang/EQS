@@ -319,6 +319,11 @@ table.table{width:100%;border-collapse:collapse;font-size:13.5px}
   .topbar{padding:0 14px}
   .fill-card{padding:20px;border-radius:16px}
   .modal{border-radius:16px}
+  /* 协作成员行：390px 里「张伟 / zhangwei · 后端组 / 可编辑 只读 移除」挤在一行，
+     名字被压成两行、按钮也探出卡片。窄屏改成上下两段，按钮整行靠右。 */
+  .member-row.flex{flex-direction:column;align-items:stretch;gap:6px}
+  .member-row > .flex:first-child{justify-content:flex-start;flex:0 0 auto}
+  .member-row > .flex:last-child{justify-content:flex-end}
 }
 /* 窄屏横滚提示：只在真的需要横滚时才出现 */
 .scroll-hint{display:none;font-size:12px;color:var(--text-3);padding:8px 14px 0}
@@ -328,6 +333,8 @@ table.table{width:100%;border-collapse:collapse;font-size:13.5px}
 .side-backdrop{position:fixed;inset:0;background:rgba(13,16,32,.42);z-index:25}
 .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px}
 .flex{display:flex;align-items:center;gap:8px}
+/* 协作成员行：左边「头像 + 名字」占满剩余宽度，右边按钮组固定宽度 */
+.member-row > .flex:first-child{flex:1;min-width:0}
 .between{justify-content:space-between}
 .wrap{flex-wrap:wrap}
 .muted{color:var(--text-3)}

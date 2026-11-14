@@ -172,6 +172,28 @@ CREATE TABLE IF NOT EXISTS sessions (
   revoked_by INTEGER DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id, revoked_at);
+/*
+ * 题库协作：一个题库可以有多个维护人。
+ * 以前题库只有 owner_id 一个身份，「两个人一起维护一个题库」这件事没有表达方式，
+ * 只能互相知道对方账号密码，或者干脆各建一个题库然后把题复制一遍。
+ * role: editor 可增删改题与组卷，viewer 只能读（刷题、导出）。
+ */
+CREATE TABLE IF NOT EXISTS bank_members (
+  bank_id INTEGER NOT NULL,
+  user_id INTEGER NOT NULL,
+  role TEXT NOT NULL DEFAULT 'editor',
+  created_by INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (bank_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_bank_members_user ON bank_members(user_id);
+/* 组织架构：职位挂在部门下（0 = 直属公司），用户带一个 position_id */
+CREATE TABLE IF NOT EXISTS positions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  dept_id INTEGER NOT NULL DEFAULT 0,
+  sort INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS i18n (
   lang TEXT NOT NULL,
   key TEXT NOT NULL,
@@ -208,7 +230,7 @@ ensureColumns('api_keys', { owner_id: 'INTEGER NOT NULL DEFAULT 0' })
 ensureColumns('questions', { props: "TEXT NOT NULL DEFAULT '{}'" })
 
 // 改密码之后旧会话必须失效：以前换了密码，别人手里那条 7 天有效的 Cookie 照用不误。
-ensureColumns('users', { pwd_changed_at: 'TEXT' })
+ensureColumns('users', { pwd_changed_at: 'TEXT', position_id: 'INTEGER NOT NULL DEFAULT 0' })
 
 ensureColumns('submissions', {
   manual_scores: "TEXT NOT NULL DEFAULT '{}'",

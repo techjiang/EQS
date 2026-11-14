@@ -22,6 +22,14 @@ export default {
     // 题目筛选：题干/标签关键字 + 标签点选。标签是纯文本字段，前端拆成词片展示
     const qKeyword = ref('')
     const qTag = ref('')
+    const memberOpen = ref(false)
+    const memberData = ref(null)
+    /*
+     * my_role 决定这一屏露出哪些按钮。
+     * 只读协作者点了才知道不行，比按钮干脆不在更让人恼火；
+     * 但也不能只藏按钮——后端同样拦，前端只是别给假希望。
+     */
+    const canWrite = ref(true)
 
     const load = async () => {
       try {
@@ -33,10 +41,53 @@ export default {
 
     const select = async (b) => {
       active.value = b
+      canWrite.value = b?.my_role !== 'viewer'
       qKeyword.value = ''
       qTag.value = ''
       await loadQuestions()
       refreshTags()
+    }
+
+    /* ---------------- 题库协作 ---------------- */
+    const openMembers = async () => {
+      try {
+        const r = await api.get(`/api/banks/${active.value.id}/members`)
+        memberData.value = r.data
+        memberOpen.value = true
+      } catch (e) { err(e.message) }
+    }
+
+    const reloadMembers = async () => {
+      const r = await api.get(`/api/banks/${active.value.id}/members`)
+      memberData.value = r.data
+    }
+
+    const inviteMember = async (userId, role) => {
+      try {
+        await api.post(`/api/banks/${active.value.id}/members`, { userId, role })
+        ok(role === 'viewer' ? '已加入为只读协作者' : '已加入为可编辑协作者')
+        await reloadMembers()
+        load()
+      } catch (e) { err(e.message) }
+    }
+
+    const setMemberRole = async (m, role) => {
+      if (m.role === role) return
+      try {
+        await api.post(`/api/banks/${active.value.id}/members`, { userId: m.user_id, role })
+        ok('已调整权限')
+        await reloadMembers()
+      } catch (e) { err(e.message) }
+    }
+
+    const removeMember = async (m) => {
+      if (!await confirmBox(`移除协作者「${m.nickname || m.username}」？`)) return
+      try {
+        await api.del(`/api/banks/${active.value.id}/members/${m.user_id}`)
+        ok('已移除')
+        await reloadMembers()
+        load()
+      } catch (e) { err(e.message) }
     }
 
     const loadQuestions = async () => {
@@ -184,9 +235,18 @@ export default {
               }, [
                 h('div', { style: 'min-width:0' }, [
                   h('div', { class: 'truncate' }, b.name),
-                  h('div', { class: 'small muted' }, `${b.question_count} 题`)
+                  h('div', { class: 'flex', style: 'gap:4px;align-items:center;margin-top:2px' }, [
+                    h('span', { class: 'small muted' }, `${b.question_count} 题`),
+                    // 被邀请来的题库要点明身份：不然分不清「我建的」和「别人分给我的」
+                    b.my_role === 'editor' ? h('span', { class: 'tag', style: 'padding:0 5px' }, '协作') : null,
+                    b.my_role === 'viewer' ? h('span', { class: 'tag warn', style: 'padding:0 5px' }, '只读') : null,
+                    b.member_count ? h('span', { class: 'small muted' }, `· ${b.member_count} 人`) : null
+                  ])
                 ]),
-                h('button', { class: 'btn ghost sm', onClick: e => { e.stopPropagation(); delBank(b) } }, '×')
+                // 删除是所有者动作：协作者点了只会收到 403，按钮不该摆在那里
+                b.my_role === 'owner'
+                  ? h('button', { class: 'btn ghost sm', onClick: e => { e.stopPropagation(); delBank(b) } }, '×')
+                  : null
               ]))
             : h(Empty, { text: '还没有题库' }))
         ]),
@@ -198,17 +258,28 @@ export default {
                 h('div', { class: 'small muted' }, active.value.description || '暂无描述')
               ]),
               h('div', { class: 'flex wrap', style: 'gap:6px' }, [
-                h('button', { class: 'btn sm', onClick: () => { importTab.value = 'text'; importOpen.value = true } }, '导入题目'),
-                h('button', {
+                active.value.my_role === 'owner'
+                  ? h('button', { class: 'btn sm', onClick: openMembers }, `协作 · ${active.value.member_count || 0}`)
+                  : null,
+                canWrite.value
+                  ? h('button', { class: 'btn sm', onClick: () => { importTab.value = 'text'; importOpen.value = true } }, '导入题目')
+                  : null,
+                // 导出文件带标准答案：只读协作者不给，否则「藏答案」只在界面上成立
+                canWrite.value ? h('button', {
                   class: 'btn sm',
                   onClick: () => api.download(`/api/banks/${active.value.id}/export.xlsx`, `${active.value.name}.xlsx`)
                     .then(() => ok('已导出 Excel')).catch(e => err(e.message))
-                }, '导出 Excel'),
-                h('button', { class: 'btn sm', onClick: addQuestion }, '+ 添加题目'),
-                h('button', { class: 'btn sm', onClick: () => { paper.value = { ...paper.value, title: active.value?.name + ' - 试卷' }; paperOpen.value = true } }, '智能组卷'),
+                }, '导出 Excel') : null,
+                canWrite.value ? h('button', { class: 'btn sm', onClick: addQuestion }, '+ 添加题目') : null,
+                canWrite.value
+                  ? h('button', { class: 'btn sm', onClick: () => { paper.value = { ...paper.value, title: active.value?.name + ' - 试卷' }; paperOpen.value = true } }, '智能组卷')
+                  : null,
                 h('button', { class: 'btn sm primary', onClick: () => practice('sequence') }, '开始刷题')
               ])
             ]),
+            active.value.my_role === 'viewer' ? h('div', {
+              class: 'card-b', style: 'border-top:1px solid var(--line-2)'
+            }, h('div', { class: 'hint' }, '你是这个题库的「只读」协作者：可以看题、刷题，但不能改题、也不能导出（导出文件含标准答案）。需要编辑权限请联系题库所有者。')) : null,
             h('div', { class: 'card-b', style: 'display:flex;gap:8px;flex-wrap:wrap' }, [
               h('button', { class: 'btn sm', onClick: () => practice('sequence') }, '顺序练习'),
               h('button', { class: 'btn sm', onClick: () => practice('random') }, '随机练习'),
@@ -233,6 +304,7 @@ export default {
                 }, '清空') : null
               ])
             ]),
+            !canWrite.value ? h('div', { class: 'small muted', style: 'padding:0 16px 8px' }, '只读身份下不显示标准答案与解析。') : null,
             // 标签云：点一片就筛，再点取消。标签不显示出来，用户根本不知道有这东西
             allTags.value.length ? h('div', {
               class: 'flex wrap', style: 'gap:6px;padding:0 16px 10px'
@@ -257,15 +329,68 @@ export default {
                     onClick: () => { qTag.value = qTag.value === t ? '' : t; loadQuestions() }
                   }, '#' + t))) : null
                 ]),
-                h('div', { class: 'flex', style: 'gap:4px' }, [
+                canWrite.value ? h('div', { class: 'flex', style: 'gap:4px' }, [
                   h('button', { class: 'btn ghost sm', onClick: () => editQ.value = { ...q, label: q.title } }, '编辑'),
                   h('button', { class: 'btn ghost sm danger', onClick: () => delQuestion(q) }, '删除')
-                ])
+                ]) : null
               ])
             ]))) : h(Empty, { text: '题库还没有题目，试试文本导入或手动添加' })
           ])
         ] : h('div', { class: 'card' }, h(Empty, { text: '请选择或新建一个题库' })))
       ]),
+
+      memberOpen.value ? Modal({
+        title: '题库协作 · ' + (active.value?.name || ''), modelValue: true, onClose: () => memberOpen.value = false, wide: true,
+        children: memberData.value ? [
+          h('div', { class: 'hint mb' }, '协作者能一起维护题目：可编辑能增删改题与组卷，只读只能看题与刷题。只有所有者能管理协作者与删除题库。'),
+          h('div', { class: 'field' }, [
+            h('label', {}, '所有者'),
+            h('div', { class: 'flex', style: 'gap:8px;align-items:center' }, [
+              h('img', { src: memberData.value.owner?.avatar || '/assets/eqs-mark.svg', style: 'width:26px;height:26px;border-radius:8px' }),
+              h('span', { style: 'font-weight:540' }, memberData.value.owner?.nickname || memberData.value.owner?.username || '-'),
+              h('span', { class: 'tag brand' }, '所有者')
+            ])
+          ]),
+          h('div', { class: 'field' }, [
+            h('label', {}, `协作者（${memberData.value.members.length}）`),
+            memberData.value.members.length
+              ? memberData.value.members.map(m => h('div', {
+                  class: 'flex between wrap member-row', style: 'padding:8px 0;border-bottom:1px solid var(--line-2);gap:8px'
+                }, [
+                  h('div', { class: 'flex', style: 'gap:8px;align-items:center;min-width:0' }, [
+                    h('img', { src: m.avatar || '/assets/eqs-mark.svg', style: 'width:26px;height:26px;border-radius:8px' }),
+                    h('div', { style: 'min-width:0' }, [
+                      h('div', { class: 'truncate', style: 'font-weight:540' }, m.nickname || m.username),
+                      h('div', { class: 'small muted' }, [m.username, m.dept_name ? ' · ' + m.dept_name : ''].join(''))
+                    ])
+                  ]),
+                  h('div', { class: 'flex', style: 'gap:4px;align-items:center' }, [
+                    h('button', {
+                      class: ['btn', 'sm', m.role === 'editor' ? 'primary' : ''],
+                      onClick: () => setMemberRole(m, 'editor')
+                    }, '可编辑'),
+                    h('button', {
+                      class: ['btn', 'sm', m.role === 'viewer' ? 'primary' : ''],
+                      onClick: () => setMemberRole(m, 'viewer')
+                    }, '只读'),
+                    h('button', { class: 'btn ghost sm danger', onClick: () => removeMember(m) }, '移除')
+                  ])
+                ]))
+              : h(Empty, { text: '还没有协作者，别人看不到这个题库' })
+          ]),
+          memberData.value.candidates?.length ? h('div', { class: 'field' }, [
+            h('label', {}, '添加协作者'),
+            h('div', { class: 'flex wrap', style: 'gap:6px' }, memberData.value.candidates.map(u => h('div', {
+              class: 'flex', style: 'gap:6px;align-items:center;border:1px solid var(--line);border-radius:9px;padding:4px 8px'
+            }, [
+              h('span', { class: 'small' }, u.nickname || u.username),
+              h('button', { class: 'btn sm', onClick: () => inviteMember(u.id, 'editor') }, '可编辑'),
+              h('button', { class: 'btn sm', onClick: () => inviteMember(u.id, 'viewer') }, '只读')
+            ])))
+          ]) : h('div', { class: 'hint' }, '没有可添加的人了（所有启用账号都已经是协作者）')
+        ] : [h('div', { style: 'padding:20px' }, '加载中…')],
+        footer: [h('button', { class: 'btn', onClick: () => memberOpen.value = false }, '关闭')]
+      }) : null,
 
       showNew.value ? Modal({
         title: '新建题库', modelValue: true, onClose: () => showNew.value = false,

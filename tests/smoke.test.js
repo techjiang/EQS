@@ -1782,6 +1782,124 @@ try {
       '报表：排序题给平均名次，而不是「每个选项都一样多」', JSON.stringify([sStat?.series, sStat?.note]))
   }
 
+  console.log('\n[53] 题库协作：多人维护一个题库，权限按角色分档')
+  {
+    /*
+     * 以前题库只有 owner_id 一个身份，「两个人一起维护一个题库」没有表达方式。
+     * 这一节约的是「谁能看、谁能改、谁能让别人进来」这三条边界。
+     */
+    cookie = await asUser('admin', 'test-pass-123')
+    await req('POST', '/api/users', { username: 'collab-a', password: 'collab-pass-1', nickname: '甲' })
+    await req('POST', '/api/users', { username: 'collab-b', password: 'collab-pass-1', nickname: '乙' })
+    await req('POST', '/api/users', { username: 'collab-c', password: 'collab-pass-1', nickname: '丙' })
+    const ckA = await asUser('collab-a', 'collab-pass-1')
+    const ckB = await asUser('collab-b', 'collab-pass-1')
+
+    let r = await call(ckA, 'POST', '/api/banks', { name: '协作测试库' })
+    const bid = r.json.id
+
+    r = await call(ckB, 'GET', `/api/banks/${bid}/questions`)
+    assert(r.status === 404, '未被邀请的人看不到这个题库')
+
+    r = await call(ckA, 'POST', `/api/banks/${bid}/members`, { username: 'collab-b', role: 'editor' })
+    assert(r.status === 201 && r.json.role === 'editor', '所有者可以把人加成可编辑协作者', JSON.stringify(r.json))
+
+    r = await call(ckB, 'GET', '/api/banks')
+    const shared = r.json.data.find(b => b.id === bid)
+    assert(shared?.my_role === 'editor', '协作者的题库列表里带出 my_role=editor', JSON.stringify(shared))
+
+    r = await call(ckB, 'POST', `/api/banks/${bid}/questions`, { type: 'radio', title: '协作添加的题', options: ['A', 'B'], answer: ['A'] })
+    assert(r.status === 201, '可编辑协作者能往题库里加题', String(r.status))
+
+    // 调成只读
+    r = await call(ckA, 'POST', `/api/banks/${bid}/members`, { username: 'collab-b', role: 'viewer' })
+    assert(r.json.role === 'viewer' && r.json.updated === true, '角色可以从可编辑改成只读', JSON.stringify(r.json))
+    r = await call(ckB, 'POST', `/api/banks/${bid}/questions`, { type: 'radio', title: '只读还想加题', options: ['A', 'B'], answer: ['A'] })
+    assert(r.status === 403, '只读协作者加题被拒', String(r.status))
+    r = await call(ckB, 'DELETE', `/api/banks/${bid}`)
+    assert(r.status === 403, '只读协作者不能删题库', String(r.status))
+    r = await call(ckB, 'POST', `/api/banks/${bid}/members`, { username: 'collab-c', role: 'editor' })
+    assert(r.status === 403, '协作者不能自己拉人（只有所有者能管成员）', String(r.status))
+
+    // 只读身份不该读到标准答案，也不能导出带答案的表
+    r = await call(ckB, 'GET', `/api/banks/${bid}/questions`)
+    assert(r.json.redacted === true && r.json.data.every(q => q.answer.length === 0 && !q.analysis),
+      '只读协作者看题时不带标准答案与解析', JSON.stringify(r.json).slice(0, 200))
+    const exp = await fetch(BASE + `/api/banks/${bid}/export.xlsx`, { headers: { Cookie: ckB } })
+    assert(exp.status === 403, '只读协作者不能导出含答案的 Excel', String(exp.status))
+
+    r = await call(ckB, 'GET', `/api/banks/${bid}/practice?mode=sequence`)
+    assert(r.status === 200, '只读协作者照样可以刷题', String(r.status))
+
+    r = await call(ckA, 'GET', `/api/banks/${bid}/members`)
+    assert(r.json.data.members.length === 1 && r.json.data.my_role === 'owner', '成员列表带出所有者与协作者', JSON.stringify(r.json.data.members))
+    assert(Array.isArray(r.json.data.candidates) && r.json.data.candidates.some(u => u.username === 'collab-c'),
+      '所有者能看到可邀请的人', JSON.stringify(r.json.data.candidates?.map(u => u.username)))
+
+    const uB = (await req('GET', '/api/users?keyword=collab-b')).json.data.find(u => u.username === 'collab-b')
+    r = await call(ckA, 'DELETE', `/api/banks/${bid}/members/${uB.id}`)
+    assert(r.json.ok, '所有者可以移除协作者')
+    r = await call(ckB, 'GET', `/api/banks/${bid}/questions`)
+    assert(r.status === 404, '移除后立刻失去访问权', String(r.status))
+
+    // 删除账号时协作关系要跟着清掉：留着就是一个指向空气的权限位
+    await call(ckA, 'POST', `/api/banks/${bid}/members`, { username: 'collab-c', role: 'editor' })
+    const uC = (await req('GET', '/api/users?keyword=collab-c')).json.data.find(u => u.username === 'collab-c')
+    await req('DELETE', `/api/users/${uC.id}`)
+    r = await call(ckA, 'GET', `/api/banks/${bid}/members`)
+    assert(!r.json.data.members.some(m => m.username === 'collab-c'), '账号被删除后协作关系一并清理')
+  }
+
+  console.log('\n[54] 组织架构：部门树可维护，职位挂在部门下')
+  {
+    cookie = await asUser('admin', 'test-pass-123')
+    let r = await req('POST', '/api/depts', { name: '冒烟·技术中心' })
+    const d1 = r.json.id
+    r = await req('POST', '/api/depts', { name: '冒烟·后端组', parent_id: d1 })
+    const d2 = r.json.id
+    r = await req('POST', '/api/depts', { name: '冒烟·后端组', parent_id: d1 })
+    assert(r.status === 409, '同一上级下的同名部门被拒', String(r.status))
+
+    r = await req('PUT', `/api/depts/${d1}`, { parent_id: d2 })
+    assert(r.status === 400, '不能把部门挂到自己的下级下面（会成环）', r.json?.message)
+    r = await req('PUT', `/api/depts/${d1}`, { parent_id: d1 })
+    assert(r.status === 400, '上级不能是自己', r.json?.message)
+    r = await req('PUT', `/api/depts/${d2}`, { name: '冒烟·服务端组' })
+    assert(r.json.ok, '部门可以改名')
+
+    r = await req('GET', '/api/depts')
+    const tree = r.json.tree.find(t => t.id === d1)
+    assert(tree && tree.children.length === 1 && tree.children[0].name === '冒烟·服务端组', '部门接口返回树结构', JSON.stringify(tree))
+    assert(tree.children[0].depth === 1, '树节点带层级，前端不用自己算')
+
+    r = await req('DELETE', `/api/depts/${d1}`)
+    assert(r.status === 400 && /子部门/.test(r.json.message), '有子部门时不能直接删', r.json?.message)
+
+    r = await req('POST', '/api/positions', { name: '冒烟·服务端工程师', dept_id: d2 })
+    const pid = r.json.id
+    r = await req('POST', '/api/positions', { name: '冒烟·服务端工程师', dept_id: d2 })
+    assert(r.status === 409, '同部门下职位重名被拒', String(r.status))
+
+    r = await req('POST', '/api/users', { username: 'org-user', password: 'org-pass-123', nickname: '组织人', dept_id: d2, position_id: pid })
+    assert(r.status === 201, '建用户时可同时指定部门与职位')
+    r = await req('GET', '/api/users?keyword=org-user')
+    const orgUser = r.json.data.find(u => u.username === 'org-user')
+    assert(orgUser.dept_name === '冒烟·服务端组' && orgUser.position_name === '冒烟·服务端工程师',
+      '用户列表带出部门名与职位名', JSON.stringify([orgUser?.dept_name, orgUser?.position_name]))
+
+    r = await req('DELETE', `/api/depts/${d2}`)
+    assert(r.status === 400 && /用户/.test(r.json.message), '部门里还有人时不能删', r.json?.message)
+    r = await req('DELETE', `/api/positions/${pid}`)
+    assert(r.status === 400 && /用户/.test(r.json.message), '职位还有人占着时不能删', r.json?.message)
+
+    // 收尾：把人挪走再删，避免留下脏数据影响后续断言
+    await req('PUT', `/api/users/${orgUser.id}`, { dept_id: 0, position_id: 0 })
+    r = await req('DELETE', `/api/depts/${d2}`)
+    assert(r.json.ok, '清空占用后部门可以删除')
+    r = await req('DELETE', `/api/depts/${d1}`)
+    assert(r.json.ok, '父部门跟着可以删除')
+  }
+
   console.log('\n[44] 前端静态资源')
 
   for (const p of ['/', '/js/main.js', '/css/app.css', '/js/views/Logs.js', '/assets/eqs-mark.svg', '/vendor/echarts.min.js']) {

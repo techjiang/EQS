@@ -53,10 +53,48 @@ function pickQuestions(bankId, body, count) {
   return rows
 }
 
+/*
+ * 题库的访问身份有四档：管理员 / 所有者 / 协作者（editor、viewer）/ 无关。
+ * 以前只有「owner 或管理员」一种判断，写死在七八个接口里，所以「两个人一起维护一个题库」
+ * 根本没法表达，只能各建一个题库把题复制过去——题库协作与权限这一条一直是空的。
+ *
+ * 现在收敛成两个函数：readableBank（能不能看）与 writableBank（能不能改）。
+ * 谁都不能既当裁判又当运动员：只有所有者和管理员能管理成员、删除题库。
+ */
+export function bankRole(user, bank) {
+  if (!bank) return null
+  if (can(user, '*')) return 'owner'
+  if (bank.owner_id === user.id) return 'owner'
+  const m = get('SELECT role FROM bank_members WHERE bank_id = ? AND user_id = ?', bank.id, user.id)
+  return m?.role || null
+}
+
+/** 我能看到哪些题库（自建 + 被邀请协作） */
+function visibleBankWhere(user) {
+  if (can(user, '*')) return { sql: '', args: [] }
+  return { sql: ' AND (b.owner_id = ? OR b.id IN (SELECT bank_id FROM bank_members WHERE user_id = ?))', args: [user.id, user.id] }
+}
+
 function readableBank(user, id) {
   const bank = get('SELECT * FROM banks WHERE id = ? AND deleted_at IS NULL', Number(id))
   if (!bank) return null
-  if (!can(user, '*') && bank.owner_id !== user.id) return null
+  return bankRole(user, bank) ? bank : null
+}
+
+/** 能改题、能组卷：所有者 + editor。viewer 只能读 */
+function writableBank(user, id) {
+  const bank = readableBank(user, id)
+  if (!bank) return null
+  const role = bankRole(user, bank)
+  if (role === 'viewer') fail(403, '你在该题库中是「只读」协作者，无法修改题目')
+  return bank
+}
+
+/** 成员管理与删除题库：只有所有者（含管理员） */
+function ownedBank(user, id) {
+  const bank = readableBank(user, id)
+  if (!bank) return null
+  if (bankRole(user, bank) !== 'owner') fail(403, '只有题库所有者可以执行该操作')
   return bank
 }
 
@@ -67,11 +105,18 @@ export default function register(r) {
     const keyword = url.searchParams.get('keyword')
     const where = ['b.deleted_at IS NULL']
     const args = []
-    if (!can(user, '*')) { where.push('b.owner_id = ?'); args.push(user.id) }
+    const vis = visibleBankWhere(user)
+    if (vis.sql) { where.push('1 = 1' + vis.sql); args.push(...vis.args) }
     if (keyword) { where.push('b.name LIKE ?'); args.push(`%${keyword}%`) }
-    const rows = all(`SELECT b.*, (SELECT COUNT(*) FROM questions q WHERE q.bank_id = b.id AND q.deleted_at IS NULL) AS question_count
+    const rows = all(`SELECT b.*,
+        (SELECT COUNT(*) FROM questions q WHERE q.bank_id = b.id AND q.deleted_at IS NULL) AS question_count,
+        (SELECT COUNT(*) FROM bank_members m WHERE m.bank_id = b.id) AS member_count
       FROM banks b WHERE ${where.join(' AND ')} ORDER BY b.id DESC`, ...args)
-    sendJson(res, 200, { ok: true, data: rows })
+    /*
+     * 每一行都带上「我和这个题库是什么关系」：前端据此收起导入/删除按钮，
+     * 而不是让只读协作者点下去才收到 403——点了才知道不行，比没有按钮更让人恼火。
+     */
+    sendJson(res, 200, { ok: true, data: rows.map(b => ({ ...b, my_role: bankRole(user, b) })) })
   })
 
   r.post('/api/banks', async (req, res) => {
@@ -85,9 +130,8 @@ export default function register(r) {
 
   r.put('/api/banks/:id', async (req, res, { params }) => {
     const user = requirePerm(req, 'bank:write')
-    const bank = get('SELECT * FROM banks WHERE id = ? AND deleted_at IS NULL', Number(params.id))
+    const bank = writableBank(user, params.id)
     if (!bank) fail(404, '题库不存在')
-    if (!can(user, '*') && bank.owner_id !== user.id) fail(403, '无权修改')
     const body = await readJson(req)
     run('UPDATE banks SET name = ?, description = ? WHERE id = ?', body.name ?? bank.name, body.description ?? bank.description, bank.id)
     sendJson(res, 200, { ok: true })
@@ -95,11 +139,109 @@ export default function register(r) {
 
   r.delete('/api/banks/:id', async (req, res, { params }) => {
     const user = requirePerm(req, 'bank:write')
-    const bank = get('SELECT * FROM banks WHERE id = ? AND deleted_at IS NULL', Number(params.id))
+    const bank = ownedBank(user, params.id)
     if (!bank) fail(404, '题库不存在')
-    if (!can(user, '*') && bank.owner_id !== user.id) fail(403, '无权删除')
     run('UPDATE banks SET deleted_at = ? WHERE id = ?', now(), bank.id)
+    log(user, '删除题库', `${bank.name} #${bank.id}`)
     sendJson(res, 200, { ok: true })
+  })
+
+  /* ---------------- 题库协作 ---------------- */
+  /*
+   * 「多人一起维护一个题库」这件事以前完全没有表达方式：题库只有 owner_id，
+   * 团队要么共用一个管理员账号（审计日志里全是一个人），要么各建一个题库把题复制来复制去。
+   * 现在引入协作者：editor 能增删改题与组卷，viewer 只能看和刷题。
+   * 成员管理本身只有所有者能碰——把「谁能拉人」也放开，协作关系就自己长腿跑掉了。
+   */
+  const MEMBER_ROLES = ['editor', 'viewer']
+
+  r.get('/api/banks/:id/members', async (req, res, { params }) => {
+    const user = requireUser(req)
+    const bank = readableBank(user, params.id)
+    if (!bank) fail(404, '题库不存在')
+    const owner = get('SELECT id, username, nickname, avatar FROM users WHERE id = ?', bank.owner_id)
+    const rows = all(`SELECT m.user_id, m.role, m.created_at, u.username, u.nickname, u.avatar, d.name AS dept_name
+      FROM bank_members m
+      JOIN users u ON u.id = m.user_id
+      LEFT JOIN depts d ON d.id = u.dept_id
+      WHERE m.bank_id = ? ORDER BY m.rowid ASC`, bank.id)
+    const cnt = get(`SELECT COUNT(*) c FROM questions WHERE bank_id = ? AND deleted_at IS NULL`, bank.id).c
+    const myRole = bankRole(user, bank)
+    /*
+     * 可邀请的人只发给所有者。协作者（哪怕是 editor）能看见这个名单，
+     * 就等于看得见「全站还有哪些账号」—— 而账号清单是管理员信息，不是协作信息。
+     */
+    const candidates = myRole === 'owner' ? all(`SELECT u.id, u.username, u.nickname, u.avatar, d.name AS dept_name
+      FROM users u LEFT JOIN depts d ON d.id = u.dept_id
+      WHERE u.status = 1 AND u.id <> ?
+        AND u.id NOT IN (SELECT user_id FROM bank_members WHERE bank_id = ?)
+      ORDER BY u.id ASC`, bank.owner_id, bank.id) : []
+    sendJson(res, 200, {
+      ok: true,
+      data: {
+        bank: { id: bank.id, name: bank.name, owner_id: bank.owner_id, question_count: cnt },
+        my_role: myRole,
+        candidates,
+        owner: owner || null,
+        members: rows.map(m => ({
+          user_id: m.user_id, role: m.role, created_at: m.created_at,
+          username: m.username, nickname: m.nickname, avatar: m.avatar, dept_name: m.dept_name
+        }))
+      }
+    })
+  })
+
+  r.post('/api/banks/:id/members', async (req, res, { params }) => {
+    const user = requirePerm(req, 'bank:write')
+    const bank = ownedBank(user, params.id)
+    if (!bank) fail(404, '题库不存在')
+    const body = await readJson(req)
+    const role = MEMBER_ROLES.includes(body.role) ? body.role : 'editor'
+    // 账号或用户 id 都收：界面上是「输账号」，接口也允许直接给 id
+    const target = body.userId
+      ? get('SELECT id, username, nickname, status FROM users WHERE id = ?', Number(body.userId))
+      : get('SELECT id, username, nickname, status FROM users WHERE username = ?', String(body.username || '').trim())
+    if (!target) fail(404, '用户不存在')
+    if (target.id === bank.owner_id) fail(400, '所有者本人不需要加入协作者')
+    // 停用的账号拉进来等于给了一个「登录不上的人」的权限位，等它被启用那天自动生效
+    if (target.status !== 1) fail(400, '该账号已被停用，无法加入协作')
+    const exist = get('SELECT role FROM bank_members WHERE bank_id = ? AND user_id = ?', bank.id, target.id)
+    if (exist) {
+      if (exist.role === role) fail(400, `${target.nickname || target.username} 已经是该题库的协作者（${role === 'editor' ? '可编辑' : '只读'}）`)
+      run('UPDATE bank_members SET role = ? WHERE bank_id = ? AND user_id = ?', role, bank.id, target.id)
+      log(user, '调整题库协作者', `${bank.name} #${bank.id} → ${target.username} ${role}`)
+      return sendJson(res, 200, { ok: true, updated: true, user_id: target.id, role })
+    }
+    run('INSERT INTO bank_members(bank_id, user_id, role, created_by, created_at) VALUES(?,?,?,?,?)',
+      bank.id, target.id, role, user.id, now())
+    log(user, '新增题库协作者', `${bank.name} #${bank.id} → ${target.username} ${role}`)
+    sendJson(res, 201, { ok: true, user_id: target.id, role })
+  })
+
+  r.delete('/api/banks/:id/members/:userId', async (req, res, { params }) => {
+    const user = requirePerm(req, 'bank:write')
+    const bank = ownedBank(user, params.id)
+    if (!bank) fail(404, '题库不存在')
+    const targetId = Number(params.userId)
+    const row = get('SELECT * FROM bank_members WHERE bank_id = ? AND user_id = ?', bank.id, targetId)
+    if (!row) fail(404, '该用户不是这个题库的协作者')
+    run('DELETE FROM bank_members WHERE bank_id = ? AND user_id = ?', bank.id, targetId)
+    const t = get('SELECT username FROM users WHERE id = ?', targetId)
+    log(user, '移除题库协作者', `${bank.name} #${bank.id} → ${t?.username || targetId}`)
+    sendJson(res, 200, { ok: true })
+  })
+
+  /** 可邀请的人：有题库写权限、账号启用、还没在这个题库里 */
+  r.get('/api/banks/:id/members/candidates', async (req, res, { params }) => {
+    const user = requirePerm(req, 'bank:write')
+    const bank = ownedBank(user, params.id)
+    if (!bank) fail(404, '题库不存在')
+    const rows = all(`SELECT u.id, u.username, u.nickname, u.avatar, d.name AS dept_name
+      FROM users u LEFT JOIN depts d ON d.id = u.dept_id
+      WHERE u.status = 1 AND u.id <> ?
+        AND u.id NOT IN (SELECT user_id FROM bank_members WHERE bank_id = ?)
+      ORDER BY u.id ASC`, bank.owner_id, bank.id)
+    sendJson(res, 200, { ok: true, data: rows })
   })
 
   /** 回收中心：题库列表（含被删题库下的题目数） */
@@ -107,6 +249,7 @@ export default function register(r) {
     const user = requireUser(req)
     const where = ['b.deleted_at IS NOT NULL']
     const args = []
+    // 回收站里只回「自己删的」：协作者不该看见别人删掉、还可能被恢复的题库
     if (!can(user, '*')) { where.push('b.owner_id = ?'); args.push(user.id) }
     const rows = all(`SELECT b.*, (SELECT COUNT(*) FROM questions q WHERE q.bank_id = b.id AND q.deleted_at IS NULL) AS question_count
       FROM banks b WHERE ${where.join(' AND ')} ORDER BY b.id DESC`, ...args)
@@ -140,7 +283,7 @@ export default function register(r) {
     const q = get('SELECT * FROM questions WHERE id = ?', Number(params.id))
     if (!q) fail(404, '题目不存在')
     const bank = get('SELECT * FROM banks WHERE id = ?', q.bank_id)
-    if (!can(user, '*') && bank?.owner_id !== user.id) fail(403, '无权恢复')
+    if (bank && bankRole(user, bank) !== 'owner') fail(403, '无权恢复')
     if (bank?.deleted_at) fail(400, '题目所属题库还在回收站里，请先恢复题库')
     run('UPDATE questions SET deleted_at = NULL WHERE id = ?', q.id)
     log(user, '恢复题目', `#${q.id} ${q.title}`)
@@ -152,7 +295,7 @@ export default function register(r) {
     const user = requirePerm(req, 'bank:write')
     const bank = get('SELECT * FROM banks WHERE id = ?', Number(params.id))
     if (!bank) fail(404, '题库不存在')
-    if (!can(user, '*') && bank.owner_id !== user.id) fail(403, '无权删除')
+    if (bankRole(user, bank) !== 'owner') fail(403, '只有题库所有者可以彻底删除')
     if (!bank.deleted_at) fail(400, '请先把题库移入回收中心，再彻底删除')
     const count = get('SELECT COUNT(*) c FROM questions WHERE bank_id = ?', bank.id).c
     run('DELETE FROM questions WHERE bank_id = ?', bank.id)
@@ -177,6 +320,19 @@ export default function register(r) {
     const tag = url.searchParams.get('tag')
     if (tag) { where.push("(',' || tags || ',') LIKE ?"); args.push(`%,${String(tag).trim()},%`) }
     const rows = all(`SELECT * FROM questions WHERE ${where.join(' AND ')} ORDER BY id ASC`, ...args).map(parseQ)
+    /*
+     * 只读协作者看题是为了刷题和了解题库内容，把标准答案一起发下去，
+     * 这一屏的每一道题就都提前剧透了——「只读」也就失去了意义。
+     * 所以对 viewer 把答案与解析摘掉（练习接口本来就不下发答案，两边口径一致）。
+     */
+    if (bankRole(user, bank) === 'viewer') {
+      return sendJson(res, 200, {
+        ok: true,
+        redacted: true,
+        data: rows.map(q => ({ ...q, answer: [], analysis: '' })),
+        total: rows.length
+      })
+    }
     sendJson(res, 200, { ok: true, data: rows, total: rows.length })
   })
 
@@ -187,7 +343,7 @@ export default function register(r) {
    */
   r.post('/api/banks/:id/questions', async (req, res, { params }) => {
     const user = requirePerm(req, 'bank:write')
-    const bank = readableBank(user, params.id)
+    const bank = writableBank(user, params.id)
     if (!bank) fail(404, '题库不存在')
     const body = await readJson(req)
     const items = Array.isArray(body.items) ? body.items : [body]
@@ -213,7 +369,7 @@ export default function register(r) {
     const user = requirePerm(req, 'bank:write')
     const q = get('SELECT * FROM questions WHERE id = ? AND deleted_at IS NULL', Number(params.id))
     if (!q) fail(404, '题目不存在')
-    if (!readableBank(user, q.bank_id)) fail(403, '无权修改该题目')
+    if (!writableBank(user, q.bank_id)) fail(403, '无权修改该题目')
     const body = await readJson(req)
     const f = normalizeField({ ...parseQ(q), ...body })
     coerceAnswerToField(f)
@@ -227,7 +383,7 @@ export default function register(r) {
     const user = requirePerm(req, 'bank:write')
     const q = get('SELECT * FROM questions WHERE id = ?', Number(params.id))
     if (!q) fail(404, '题目不存在')
-    if (!readableBank(user, q.bank_id)) fail(403, '无权删除该题目')
+    if (!writableBank(user, q.bank_id)) fail(403, '无权删除该题目')
     run('UPDATE questions SET deleted_at = ? WHERE id = ?', now(), q.id)
     sendJson(res, 200, { ok: true })
   })
@@ -235,7 +391,7 @@ export default function register(r) {
   /** 批量导入题目（文本） */
   r.post('/api/banks/:id/import-text', async (req, res, { params }) => {
     const user = requirePerm(req, 'bank:write')
-    const bank = readableBank(user, params.id)
+    const bank = writableBank(user, params.id)
     if (!bank) fail(404, '题库不存在')
     const { text } = await readJson(req)
     // 题库导入的默认分值不能是 0：recalculate 里 `f.score || 5` 会把 0 变成 5，
@@ -280,6 +436,8 @@ export default function register(r) {
     const user = requireUser(req)
     const bank = readableBank(user, params.id)
     if (!bank) fail(404, '题库不存在')
+    // 导出的表带答案和解析：只读协作者能导出，等于刚才那层答案隐藏白做了
+    if (bankRole(user, bank) === 'viewer') fail(403, '只读协作者不能导出题库（导出文件包含全部标准答案）')
     const questions = all('SELECT * FROM questions WHERE bank_id = ? AND deleted_at IS NULL ORDER BY id ASC', bank.id).map(parseQ)
     const buf = questionsXlsx(questions, bank.name)
     res.writeHead(200, {
@@ -293,7 +451,7 @@ export default function register(r) {
   /** Excel 批量导入题目 */
   r.post('/api/banks/:id/import-xlsx', async (req, res, { params }) => {
     const user = requirePerm(req, 'bank:write')
-    const bank = readableBank(user, params.id)
+    const bank = writableBank(user, params.id)
     if (!bank) fail(404, '题库不存在')
     const buf = await readXlsxUpload(req)
     if (!buf?.length) fail(400, '请上传 xlsx 文件')
@@ -318,7 +476,7 @@ export default function register(r) {
   /** 组卷：按题库随机抽题生成考试 */
   r.post('/api/banks/:id/paper', async (req, res, { params }) => {
     const user = requirePerm(req, 'bank:write')
-    const bank = readableBank(user, params.id)
+    const bank = writableBank(user, params.id)
     if (!bank) fail(404, '题库不存在')
     const body = await readJson(req)
     const count = Math.max(1, Math.min(200, Number(body.count) || 10))
@@ -355,9 +513,13 @@ export default function register(r) {
     const user = requirePerm(req, 'bank:write')
     const body = await readJson(req)
     const count = Math.max(1, Math.min(200, Number(body.count) || 10))
-    const visible = can(user, '*')
-      ? all('SELECT * FROM banks WHERE deleted_at IS NULL')
-      : all('SELECT * FROM banks WHERE deleted_at IS NULL AND owner_id = ?', user.id)
+    const visPaper = visibleBankWhere(user)
+    // 只读协作者的题库能抽题吗：不能。组卷产出的是自己的新表单，但用的是别人的题，
+    // 而只读身份的含义就是「不参与生产」
+    const allVisible = all(`SELECT b.* FROM banks b WHERE b.deleted_at IS NULL${visPaper.sql}`, ...visPaper.args)
+    const visible = allVisible.filter(b => bankRole(user, b) !== 'viewer')
+    // 只有只读题库时给一句能看懂的话：默认的「没有可用的题库」会让人以为题库被删了
+    if (!visible.length && allVisible.length) fail(400, '你参与的题库都是「只读」身份，组卷需要可编辑权限')
     const byId = new Map(visible.map(b => [b.id, b]))
     // 指定了题库就只在指定范围内抽，没指定就全库
     let ids = Array.isArray(body.bankIds) ? body.bankIds.map(Number).filter(id => byId.has(id)) : []

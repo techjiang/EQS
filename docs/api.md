@@ -191,8 +191,8 @@ POST /api/banks/paper
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET/POST | `/api/banks` | 题库列表 / 创建 |
-| PUT/DELETE | `/api/banks/:id` | 更新 / 删除 |
+| GET/POST | `/api/banks` | 题库列表 / 创建。列表每行带 `my_role`（`owner` / `editor` / `viewer`），前端据此收起按钮 |
+| PUT/DELETE | `/api/banks/:id` | 更新 / 删除（删除只有所有者能做） |
 | GET/POST | `/api/banks/:id/questions` | 题目列表 / 新增 |
 | PUT/DELETE | `/api/questions/:id` | 更新 / 删除题目 |
 | POST | `/api/banks/:id/import-text` | 文本批量导入（`答案：` `分值：` `解析：` `标签：`），返回 `{imported, droppedAnswers}` |
@@ -203,6 +203,24 @@ POST /api/banks/paper
 | GET | `/api/banks/:id/practice?mode=sequence\|random\|wrong\|favorite` | 拉取练习题目（不含答案） |
 | POST | `/api/banks/:id/practice/answer` | 提交作答 `{questionId, value, progress?, note?, favorite?}` |
 | GET | `/api/banks/:id/progress` | 练习进度 |
+| GET | `/api/banks/:id/members` | 协作者列表 + `my_role` + `candidates`（仅所有者返回可邀请的人） |
+| POST | `/api/banks/:id/members` | 加协作者 `{username\|userId, role: "editor"\|"viewer"}`；同一个人再传一次即改角色（返回 `updated: true`） |
+| DELETE | `/api/banks/:id/members/:userId` | 移除协作者 |
+
+### 题库协作的权限边界
+
+题库的访问身份分四档：管理员 / 所有者 / `editor` / `viewer`。
+
+| 能做什么 | 管理员 | 所有者 | editor | viewer |
+| --- | --- | --- | --- | --- |
+| 看题目、刷题 | ✓ | ✓ | ✓ | ✓ |
+| 看到标准答案与解析 | ✓ | ✓ | ✓ | ✗（接口返回 `redacted: true`，`answer`/`analysis` 摘空） |
+| 增删改题、导入、组卷 | ✓ | ✓ | ✓ | ✗ |
+| 导出 Excel（含答案） | ✓ | ✓ | ✓ | ✗ |
+| 改名、管理协作者 | ✓ | ✓ | ✗ | ✗ |
+| 删除 / 恢复题库 | ✓ | ✓ | ✗ | ✗ |
+
+只读身份刻意看不到答案、也不能导出：否则「只读」在界面上成立、在数据上不成立。
 
 ## 模板
 
@@ -227,7 +245,10 @@ POST /api/banks/paper
 | GET/POST | `/api/users` | 用户列表 / 新增 |
 | PUT/DELETE | `/api/users/:id` | 更新 / 删除 |
 | GET/POST | `/api/roles` | 角色 |
-| GET/POST | `/api/depts` | 部门 |
+| GET/POST | `/api/depts` | 部门列表（返回扁平 `data` 与 `tree`）/ 新增 `{name, parent_id?, sort?}` |
+| PUT/DELETE | `/api/depts/:id` | 改名 / 换上级 / 排序；删除时部门内有人或有子部门一律拒绝 |
+| GET/POST | `/api/positions` | 职位列表 / 新增 `{name, dept_id?, sort?}` |
+| PUT/DELETE | `/api/positions/:id` | 更新 / 删除（有人占着该职位时拒绝） |
 | GET | `/api/settings` | 全部配置（密钥脱敏） |
 | GET | `/api/settings/public` | 公开配置 |
 | PUT | `/api/settings/:key` | 更新分组配置 |
