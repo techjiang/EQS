@@ -324,6 +324,17 @@ table.table{width:100%;border-collapse:collapse;font-size:13.5px}
   .member-row.flex{flex-direction:column;align-items:stretch;gap:6px}
   .member-row > .flex:first-child{justify-content:flex-start;flex:0 0 auto}
   .member-row > .flex:last-child{justify-content:flex-end}
+  /* 刷题页头部：模式按钮一行、错题阈值一行，别把七件东西挤进一条 flex 再折三行 */
+  .practice-toolbar{display:flex;flex-wrap:wrap;gap:8px 14px;margin-top:10px;align-items:center}
+  .practice-streak{display:flex;align-items:center;gap:6px}
+  /* 答题卡与卡片按钮在 390px 上不换行挤压 */
+  .practice-card .flex.between{flex-wrap:wrap;gap:8px}
+  /* 页头右侧那个按钮不该被挤到下一行独占一行：「返回题库」跑到标题下面，
+     会让人以为它是页面主体的一部分。让标题区可收缩，标题折行、按钮留在原位。 */
+  /* flex-basis 必须是 0 而不是 auto：auto 会拿子内容的 max-content（模式按钮那一整排）当基准，
+     于是「标题区 + 返回按钮」超宽，按钮照样被折到下一行。 */
+  .page-head > div:first-child{min-width:0;flex:1 1 0}
+  .page-head > .btn,.page-head > .flex{flex:0 0 auto}
 }
 /* 窄屏横滚提示：只在真的需要横滚时才出现 */
 .scroll-hint{display:none;font-size:12px;color:var(--text-3);padding:8px 14px 0}

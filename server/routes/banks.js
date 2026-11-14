@@ -726,6 +726,37 @@ function cleanIds(raw, pool) {
     })
   })
 
+  /**
+   * 刷题「AI 解析」。
+   *
+   * README 里写着「题目收藏、学习笔记和 AI 解析」，注释里也写着「README 也有、代码没有」，
+   * 但界面上一直没有入口——这轮补上。三条口径：
+   *  1. 只读协作者不下发答案，AI 解析也不能替它把答案说了（withAnswers 跟随题库身份）；
+   *  2. AI 没配置 / 调用失败时退回本地解析并标明来源，不让人以为一段模板话是模型推的；
+   *  3. 解析结果写回题目（仅有编辑权限时），下次别人问同一题不必再花一次 token。
+   */
+  r.post('/api/banks/:id/explain', async (req, res, { params }) => {
+    const user = requireUser(req)
+    const bank = readableBank(user, params.id)
+    if (!bank) fail(404, '题库不存在')
+    const body = await readJson(req)
+    const q = get('SELECT * FROM questions WHERE id = ? AND bank_id = ? AND deleted_at IS NULL', Number(body.questionId), bank.id)
+    if (!q) fail(404, '题目不存在')
+    const parsed = parseQ(q)
+    const role = bankRole(user, bank)
+    const withAnswers = role !== 'viewer'
+    if (withAnswers && parsed.analysis && body.force !== true) {
+      return sendJson(res, 200, { ok: true, text: parsed.analysis, source: 'stored' })
+    }
+    const { explainQuestion } = await import('../lib/ai.js')
+    const r2 = await explainQuestion(parsed, body.value, { withAnswers, lang: body.lang, model: body.model })
+    // 写得回的才写回：只读身份拿到的解析里不含答案，存进去会把别人的解析覆盖成残缺版
+    if (withAnswers && r2.source === 'ai' && r2.text) {
+      run('UPDATE questions SET analysis = ? WHERE id = ?', r2.text, q.id)
+    }
+    sendJson(res, 200, { ok: true, text: r2.text, source: r2.source, warning: r2.warning || '' })
+  })
+
   r.get('/api/banks/:id/progress', async (req, res, { params }) => {
     const user = requireUser(req)
     if (!readableBank(user, params.id)) fail(404, '题库不存在')

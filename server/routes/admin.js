@@ -498,30 +498,82 @@ export default function register(r) {
     const body = await readJson(req)
     if (!body.prompt) fail(400, '请描述你想要的表单')
     try {
-      const result = await generateForm(body.prompt, { lang: body.lang || 'zh', kind: body.kind || 'survey' })
-      sendJson(res, 200, { ok: true, data: result, source: 'ai' })
+      const result = await generateForm(body.prompt, { lang: body.lang || 'zh', kind: body.kind || 'survey', model: body.model })
+      sendJson(res, 200, { ok: true, data: result, source: 'ai', model: body.model || aiConfig().model })
     } catch (e) {
       log(me, 'AI 生成失败', e.message)
       sendJson(res, 200, { ok: true, data: localGenerate(body.prompt, body.kind), source: 'local', warning: e.message })
     }
   })
 
+  /**
+   * 流式生成。
+   *
+   * 以前每帧只发 `delta`，前端拿到一长串 JSON 文本，只能自己盯着看或者干等——
+   * 「流式生成实时预览」这句话在界面上等于没有。现在每帧额外带 `fields`：
+   * 服务端把已经配平的题目对象切出来发下来，前端能一道一道往画布上画。
+   * 收尾时补一帧 `done`，带完整的 title / description / schema，
+   * 让前端不必自己再从拼串里 parse 一遍（拼串和多帧之间的边界最容易出岔子）。
+   */
   r.post('/api/ai/stream', async (req, res) => {
     requirePerm(req, 'form:create')
     const body = await readJson(req)
-    res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache', Connection: 'keep-alive' })
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache, no-transform',
+      Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no'
+    })
+    const send = (obj) => res.write(`data: ${JSON.stringify(obj)}\n\n`)
     try {
-      const { streamForm } = await import('../lib/ai.js')
-      for await (const chunk of streamForm(body.prompt || '', { lang: body.lang, kind: body.kind })) {
-        res.write(`data: ${JSON.stringify({ delta: chunk.delta })}\n\n`)
+      const { streamForm, extractJson } = await import('../lib/ai.js')
+      const { normalizeSchema } = await import('../lib/forms.js')
+      let acc = ''
+      let fields = []
+      for await (const chunk of streamForm(body.prompt || '', { lang: body.lang, kind: body.kind, model: body.model })) {
+        acc = chunk.acc
+        fields = chunk.fields
+        send({ delta: chunk.delta, fields })
       }
-      res.write('data: [DONE]\n\n')
+      const parsed = extractJson(acc)
+      // 完整解析成功就用它（带 title/description）；只剩半截 JSON 时用已经剖出来的题，别把用户画的题弄丢
+      send({
+        done: true,
+        title: parsed?.title || '',
+        description: parsed?.description || '',
+        schema: Array.isArray(parsed?.fields) && parsed.fields.length ? normalizeSchema(parsed.fields) : fields
+      })
     } catch (e) {
       const local = localGenerate(body.prompt || '', body.kind)
-      res.write(`data: ${JSON.stringify({ error: e.message, fallback: local })}\n\n`)
-      res.write('data: [DONE]\n\n')
+      send({ error: e.message, fallback: local, done: true })
     }
     res.end()
+  })
+
+  /**
+   * 模型列表：Issue 原文的「模型列表与默认模型配置」。
+   * 顺手把「生成语言」的候选也一起给出来——之前 AI 多语言生成要靠人记住 zh / en / ja 这些码，
+   * 而前端连传都没传（`kind` 传了，`lang` 一直是默认值）。
+   */
+  r.get('/api/ai/models', async (req, res) => {
+    const me = requireUser(req)
+    if (!can(me, '*')) fail(403, '权限不足')
+    const cfg = aiConfig()
+    const langs = [
+      { code: 'zh', label: '简体中文' }, { code: 'zhtw', label: '繁體中文' },
+      { code: 'en', label: 'English' }, { code: 'ja', label: '日本語' }, { code: 'ko', label: '한국어' }
+    ]
+    if (!cfg.enabled || !cfg.apiKey) {
+      return sendJson(res, 200, { ok: true, data: { models: [], current: cfg.model, langs, reachable: false, reason: 'AI 未启用或未配置 API Key' } })
+    }
+    try {
+      const { listModels } = await import('../lib/ai.js')
+      const models = await listModels({ force: new URL(req.url, 'http://x').searchParams.get('refresh') === '1' })
+      sendJson(res, 200, { ok: true, data: { models, current: cfg.model, langs, reachable: true } })
+    } catch (e) {
+      // 拿不到列表不是错误：有的兼容服务没有 /models，手填模型名照样能用
+      sendJson(res, 200, { ok: true, data: { models: [], current: cfg.model, langs, reachable: false, reason: e.message } })
+    }
   })
 
   r.get('/api/ai/config', async (req, res) => {

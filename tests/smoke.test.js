@@ -2271,6 +2271,134 @@ try {
     assert(maskName('13800138000') === '匿名考生', '纯数字（手机号当昵称）直接匿名', maskName('13800138000'))
   }
 
+  console.log('\n[44] AI 能力：模型列表 / 流式生成 / AI 解析')
+  {
+    /*
+     * 用真的 HTTP 上游，不打桩。
+     * 上一轮的经验：凡是「只在代码里看起来对」的东西，都得拿真请求打一遍——
+     * 这几条能力（/models、流式帧、解析）以前根本没有入口，更没有测过。
+     */
+    const http = await import('node:http')
+    const seen = { bodies: [] }
+    const FULL = {
+      title: '员工满意度调查',
+      description: '由 AI 生成',
+      fields: [
+        { type: 'rate', label: '整体满意度', required: true, props: { max: 5 } },
+        { type: 'radio', label: '最满意的方面（必填）', options: ['环境', '协作', '薪酬'] },
+        { type: 'textarea', label: '其他建议' }
+      ]
+    }
+    const chunks = JSON.stringify(FULL).match(/[\s\S]{1,60}/g)
+    const mock = http.createServer(async (req, res) => {
+      if (req.url.startsWith('/v1/models')) {
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        return res.end(JSON.stringify({ data: [{ id: 'mock-small' }, { id: 'mock-large' }] }))
+      }
+      let body = ''
+      for await (const c of req) body += c
+      let parsed = {}
+      try { parsed = JSON.parse(body) } catch {}
+      seen.bodies.push(parsed)
+      if (req.url.startsWith('/bad')) { res.writeHead(500); return res.end('boom') }
+      if (parsed.stream) {
+        res.writeHead(200, { 'Content-Type': 'text/event-stream' })
+        for (const c of chunks) {
+          res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: c } }] })}\n\n`)
+        }
+        res.write('data: [DONE]\n\n')
+        return res.end()
+      }
+      // 同一个兼容端点既要用它造表单、又要用它造解析：按系统提示词区分
+      const isExplain = /答疑助手/.test(String(parsed.messages?.[0]?.content || ''))
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({
+        choices: [{ message: { content: isExplain ? '这是模型给出的解析：先看题干限定词，再逐项排除。' : JSON.stringify(FULL) } }]
+      }))
+    })
+    await new Promise(r => mock.listen(0, '127.0.0.1', r))
+    const aiPort = mock.address().port
+
+    // 未配置时不能装作能用
+    r = await req('GET', '/api/ai/models')
+    assert(r.status === 200 && r.json.data.reachable === false, '未配置 AI 时模型列表直说原因，不报错', String(r.status))
+    assert(/API Key|未启用/.test(r.json.data.reason || ''), '未配置时给出可读原因', r.json.data.reason)
+
+    // 地址填错：不是 500，而是 reachable false + 原因
+    await req('PUT', '/api/settings/ai', { enabled: true, apiKey: 'sk-mock', baseUrl: `http://127.0.0.1:${aiPort}/bad`, model: 'mock-small' })
+    r = await req('GET', '/api/ai/models?refresh=1')
+    assert(r.status === 200 && r.json.data.reachable === false, '上游 /models 失败时降级成「手填」，不是 500', String(r.status))
+
+    // 正常上游：拉到真实模型列表
+    await req('PUT', '/api/settings/ai', { enabled: true, apiKey: 'sk-mock', baseUrl: `http://127.0.0.1:${aiPort}/v1`, model: 'mock-small' })
+    r = await req('GET', '/api/ai/models?refresh=1')
+    assert(r.json.data.reachable === true, '配置正确时模型列表可达')
+    assert(r.json.data.models.includes('mock-large'), '模型列表来自上游真实数据', JSON.stringify(r.json.data.models))
+    assert(r.json.data.langs.some(l => l.code === 'en'), '同时给出生成语言候选')
+
+    // 一次性生成：模型名透传
+    seen.bodies.length = 0
+    r = await req('POST', '/api/ai/generate', { prompt: '员工满意度', kind: 'survey', model: 'mock-large' })
+    assert(r.json.source === 'ai' && r.json.data.schema.length === 3, '一次性生成走的是真上游', JSON.stringify(r.json).slice(0, 200))
+    assert(seen.bodies.at(-1)?.model === 'mock-large', '请求体里的模型名透传到上游（模型切换）', seen.bodies.at(-1)?.model)
+
+    // 生成语言：以前前端根本没传 lang
+    seen.bodies.length = 0
+    await req('POST', '/api/ai/generate', { prompt: 'survey', lang: 'en' })
+    assert(/English/.test(seen.bodies.at(-1)?.messages?.[1]?.content || ''), '生成语言进入提示词', seen.bodies.at(-1)?.messages?.[1]?.content)
+
+    // 流式：逐帧带 fields，最后一帧带完整 schema
+    r = await fetch(BASE + '/api/ai/stream', {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie },
+      body: JSON.stringify({ prompt: '员工满意度', kind: 'survey' })
+    })
+    const text = await r.text()
+    const frames = text.split('\n\n').filter(Boolean).map(l => { try { return JSON.parse(l.replace(/^data:\s*/, '')) } catch { return null } }).filter(Boolean)
+    const withFields = frames.filter(f => Array.isArray(f.fields))
+    assert(withFields.length > 0, '流式帧里带已配平的题目（实时预览的依据）', String(frames.length))
+    assert(withFields.at(-1).fields.length === 3, '吐完时帧里的题目数量正确', String(withFields.at(-1)?.fields?.length))
+    const done = frames.find(f => f.done)
+    assert(done && done.schema.length === 3 && done.title === FULL.title, '收尾帧给出完整 title 与 schema', JSON.stringify(done)?.slice(0, 160))
+
+    // 半个对象不上屏：配平没走完的题不能出现在 fields 里
+    const { partialFields } = await import('../server/lib/ai.js')
+    assert(partialFields('{"fields":[{"type":"text","label":"甲"},{"type":"text","lab').length === 1, '半截题目不会被当成一道完整题')
+    assert(partialFields('{"fields":[{"type":"radio","label":"是否（必填）"},{"type":"text","label":"乙"}]}').length === 2, '题干里的中文括号不影响配平')
+    assert(partialFields('{"fields":[{"type":"text","label":"带 \\"引号\\" 的题"},{"type":"text","label":"乙"}]}').length === 2, '转义引号不会让配平错位')
+
+    // AI 解析：写回题目，第二次直接读库
+    r = await req('POST', '/api/banks', { name: '解析题库' })
+    const exBank = r.json.id
+    r = await req('POST', `/api/banks/${exBank}/questions`, {
+      type: 'radio', label: 'HTTP 默认端口？', options: [{ label: '21', value: '21' }, { label: '80', value: '80' }], answer: ['80'], score: 5
+    })
+    const exQ = r.json.ids[0]
+    r = await req('POST', `/api/banks/${exBank}/explain`, { questionId: exQ, value: '21' })
+    assert(r.json.source === 'ai' && /模型给出的解析/.test(r.json.text), 'AI 解析返回模型内容', JSON.stringify(r.json).slice(0, 160))
+    r = await req('POST', `/api/banks/${exBank}/explain`, { questionId: exQ })
+    assert(r.json.source === 'stored', '解析过的题第二次直接读库，不重复烧 token', r.json.source)
+
+    // 只读协作者：AI 解析不能替他把答案说了
+    await req('POST', '/api/users', { username: 'ai-viewer', password: 'ai-viewer-1', nickname: '只读' })
+    r = await req('POST', `/api/banks/${exBank}/members`, { userId: (await req('GET', '/api/users?keyword=ai-viewer')).json.data[0].id, role: 'viewer' })
+    const viewerCookie = await asUser('ai-viewer', 'ai-viewer-1')
+    seen.bodies.length = 0
+    const vo = await call(viewerCookie, 'POST', `/api/banks/${exBank}/explain`, { questionId: exQ, force: true })
+    assert(vo.status === 200, '只读协作者也能问解析', String(vo.status))
+    const promptText = String(seen.bodies.at(-1)?.messages?.[1]?.content || '')
+    assert(!/标准答案/.test(promptText), '只读身份问解析时，提示词里不含标准答案', promptText.slice(0, 120))
+
+    // AI 挂掉时降级成本地解析，并标明来源
+    await req('PUT', '/api/settings/ai', { enabled: true, apiKey: 'sk-mock', baseUrl: `http://127.0.0.1:${aiPort}/bad`, model: 'mock-small' })
+    r = await req('POST', `/api/banks/${exBank}/explain`, { questionId: exQ, force: true })
+    assert(r.status === 200 && r.json.source === 'local' && r.json.text.length > 0, 'AI 失败时退回本地解析，不报 500', JSON.stringify(r.json).slice(0, 160))
+    assert(r.json.warning, '降级时带上失败原因，别让人以为这是模型说的', r.json.warning)
+
+    // 恢复成未配置，免得影响后面的用例
+    await req('PUT', '/api/settings/ai', { enabled: false, apiKey: '', baseUrl: 'https://api.openai.com/v1', model: 'gpt-4o-mini' })
+    await new Promise(res => mock.close(res))
+  }
+
   console.log('\n[44] 前端静态资源')
 
   for (const p of ['/', '/js/main.js', '/css/app.css', '/js/views/Logs.js', '/assets/eqs-mark.svg', '/vendor/echarts.min.js']) {

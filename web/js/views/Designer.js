@@ -29,6 +29,15 @@ export default {
     const aiOpen = ref(false)
     const aiPrompt = ref('')
     const aiBusy = ref(false)
+    // 流式生成：边吐边画，liveFields 是「已经完整吐出来的题」
+    const aiStreaming = ref(false)
+    const aiLiveFields = ref([])
+    const aiChars = ref(0)
+    const aiModel = ref('')
+    const aiLang = ref('zh')
+    const aiModels = ref([])
+    const aiLangOpts = ref([{ code: 'zh', label: '简体中文' }, { code: 'en', label: 'English' }])
+    const aiModelReason = ref('')
     const importOpen = ref(false)
     const importText = ref('')
     const importTab = ref('text')
@@ -132,23 +141,59 @@ export default {
       navigator.clipboard.writeText(url).then(() => ok('填写链接已复制')).catch(() => prompt('复制链接', url))
     }
 
+    /**
+     * 加载可选模型与语言。
+     * 之前「模型」只有一个手填输入框：填错一个字要等到生成时才报 404，还报得看不懂。
+     * 现在从 OpenAI Compatible 的 /models 拉真实列表；拿不到就退回手填并说明原因，
+     * 不凭空编一串模型名让人挑。
+     */
+    const loadAiMeta = async () => {
+      try {
+        const r = await api.get('/api/ai/models')
+        aiModels.value = r.data.models || []
+        aiLangOpts.value = r.data.langs || aiLangOpts.value
+        if (!aiModel.value) aiModel.value = r.data.current || ''
+        aiModelReason.value = r.data.reachable ? '' : (r.data.reason || '')
+      } catch (e) { aiModelReason.value = e.message }
+    }
+
+    /**
+     * AI 生成：走流式，边收边画。
+     * 原来是一次性 POST，几秒里界面只有「生成中…」。Issue 写的是「流式生成实时预览」，
+     * 那这句话就得能看见：每来一帧，已经完整的题直接画到画布上。
+     * 生成仍会整体替换现有题目，所以先确认；确认后才把画布清空。
+     */
     const doAi = async () => {
       if (!aiPrompt.value.trim()) return err('请先描述你想要的表单')
-      // 生成会整体替换现有题目。已经画了半天的表单被一句提示词清空，是不可撤销的操作
-      // 先问再进 busy：否则确认框这段时间按钮已经写着「生成中…」
       if (form.value.schema?.length) {
         const yes = await confirmBox(`AI 生成会替换当前 ${form.value.schema.length} 道题，确定继续？`)
         if (!yes) return
       }
       aiBusy.value = true
+      aiStreaming.value = true
+      aiLiveFields.value = []
+      aiChars.value = 0
+      let done = null
+      let failure = ''
       try {
-        const r = await api.post('/api/ai/generate', { prompt: aiPrompt.value, kind: form.value.kind })
-        form.value.schema = r.data.schema
-        if (!form.value.description) form.value.description = r.data.description
-        aiOpen.value = false
+        await api.stream('/api/ai/stream', { prompt: aiPrompt.value, kind: form.value.kind, model: aiModel.value || undefined, lang: aiLang.value }, (msg) => {
+          if (msg.error) { failure = msg.error; return }
+          if (msg.done) { done = msg; return }
+          if (Array.isArray(msg.fields)) aiLiveFields.value = msg.fields
+          if (msg.delta) aiChars.value += String(msg.delta).length
+        })
+        const schema = done?.schema?.length ? done.schema : aiLiveFields.value
+        if (!schema.length) throw new Error(failure || 'AI 没有返回可用的题目')
+        form.value.schema = schema
+        if (done?.title) form.value.title = done.title
+        if (!form.value.description && done?.description) form.value.description = done.description
         await save(true)
-        ok(r.source === 'ai' ? 'AI 已生成题目' : 'AI 未配置，已用本地模板生成')
-      } catch (e) { err(e.message) } finally { aiBusy.value = false }
+        aiOpen.value = false
+        ok(failure ? `AI 未配置，已用本地模板生成（${failure}）` : `AI 已生成 ${schema.length} 道题`)
+      } catch (e) { err(e.message) } finally {
+        aiBusy.value = false
+        aiStreaming.value = false
+      }
     }
 
     const doImport = async () => {
@@ -502,7 +547,7 @@ export default {
             h('button', { class: 'btn ghost sm', onClick: () => navigate('/forms') }, '← 返回')
           ]),
           h('div', { class: 'flex', style: 'gap:6px;margin-bottom:10px' }, [
-            h('button', { class: 'btn sm', style: 'flex:1', onClick: () => aiOpen.value = true }, '🤖 AI'),
+            h('button', { class: 'btn sm', style: 'flex:1', onClick: () => { aiOpen.value = true; loadAiMeta() } }, '🤖 AI'),
             h('button', { class: 'btn sm', style: 'flex:1', onClick: () => { importTab.value = 'text'; importOpen.value = true } }, '📥 导入')
           ]),
           FIELD_GROUPS.map(g => [
@@ -581,22 +626,57 @@ export default {
           tab.value === 'field' ? fieldInspector() : settingsInspector()
         ]),
         // AI 弹窗
-        aiOpen.value ? h('div', { class: 'modal-mask', onClick: e => { if (e.target.classList.contains('modal-mask')) aiOpen.value = false } },
-          h('div', { class: 'modal' }, [
-            h('div', { class: 'modal-h' }, [h('h3', {}, '🤖 AI 生成表单'), h('button', { class: 'btn ghost sm', onClick: () => aiOpen.value = false }, '关闭')]),
+        aiOpen.value ? h('div', { class: 'modal-mask', onClick: e => { if (e.target.classList.contains('modal-mask') && !aiBusy.value) aiOpen.value = false } },
+          h('div', { class: 'modal wide' }, [
+            h('div', { class: 'modal-h' }, [
+              h('h3', {}, '🤖 AI 生成表单'),
+              h('div', { class: 'flex', style: 'gap:6px;align-items:center' }, [
+                aiStreaming.value ? h('span', { class: 'tag brand' }, `流式接收中 · ${aiChars.value} 字`) : null,
+                h('button', { class: 'btn ghost sm', disabled: aiBusy.value, onClick: () => aiOpen.value = false }, '关闭')
+              ])
+            ]),
             h('div', { class: 'modal-b' }, [
               h('div', { class: 'field' }, [
                 h('label', {}, '描述你想要的表单'),
                 h('textarea', {
-                  class: 'textarea', style: 'min-height:110px', placeholder: '例如：做一份员工满意度调查，包含对办公环境、团队协作、薪酬福利的评分，以及开放建议',
+                  class: 'textarea', style: 'min-height:96px', placeholder: '例如：做一份员工满意度调查，包含对办公环境、团队协作、薪酬福利的评分，以及开放建议',
                   value: aiPrompt.value, onInput: e => aiPrompt.value = e.target.value
                 })
               ]),
-              h('div', { class: 'hint' }, '需要先在系统设置 → AI 中配置 OpenAI Compatible API；未配置时会使用本地模板生成。')
+              // 模型与语言并排：模型来自服务端 /models 的真实列表，拿不到就退回手填
+              h('div', { class: 'flex', style: 'gap:10px;flex-wrap:wrap' }, [
+                h('div', { class: 'field', style: 'flex:1;min-width:200px' }, [
+                  h('label', {}, '模型'),
+                  aiModels.value.length
+                    ? h('select', { class: 'select', value: aiModel.value, onChange: e => aiModel.value = e.target.value },
+                        aiModels.value.map(m => h('option', { value: m }, m)))
+                    : h('input', {
+                        class: 'input', value: aiModel.value, placeholder: 'gpt-4o-mini',
+                        onInput: e => aiModel.value = e.target.value
+                      })
+                ]),
+                h('div', { class: 'field', style: 'width:150px' }, [
+                  h('label', {}, '生成语言'),
+                  h('select', { class: 'select', value: aiLang.value, onChange: e => aiLang.value = e.target.value },
+                    aiLangOpts.value.map(l => h('option', { value: l.code }, l.label)))
+                ])
+              ]),
+              aiModelReason.value ? h('div', { class: 'hint' }, `模型列表没取到：${aiModelReason.value}；手填模型名同样可用。`) : null,
+              // 实时预览：已经完整吐出来的题直接画出来，而不是等全部完成
+              aiLiveFields.value.length ? h('div', { style: 'margin-top:6px' }, [
+                h('div', { class: 'hint mb' }, `实时预览：已生成 ${aiLiveFields.value.length} 道题`),
+                h('div', { style: 'max-height:240px;overflow:auto;border:1px solid var(--line);border-radius:10px;padding:10px' },
+                  aiLiveFields.value.map((f, i) => h('div', { style: 'padding:6px 0;border-bottom:1px solid var(--line)' }, [
+                    h('div', { class: 'small muted' }, `${i + 1}. ${fieldMeta(f.type).label}${f.required ? ' · 必填' : ''}`),
+                    h('div', { style: 'font-size:13.5px' }, f.label),
+                    f.options?.length ? h('div', { class: 'small muted' }, f.options.map(o => o.label).join(' / ')) : null
+                  ])))
+              ]) : null,
+              h('div', { class: 'hint' }, '需要先在系统设置 → AI 中配置 OpenAI Compatible API；未配置时会使用本地模板生成，并在结果里标明来源。')
             ]),
             h('div', { class: 'modal-f' }, [
-              h('button', { class: 'btn', onClick: () => aiOpen.value = false }, '取消'),
-              h('button', { class: 'btn primary', disabled: aiBusy.value, onClick: doAi }, aiBusy.value ? '生成中…' : '生成题目')
+              h('button', { class: 'btn', disabled: aiBusy.value, onClick: () => aiOpen.value = false }, '取消'),
+              h('button', { class: 'btn primary', disabled: aiBusy.value, onClick: doAi }, aiBusy.value ? (aiStreaming.value ? '生成中…（实时预览）' : '生成中…') : '生成题目')
             ])
           ])) : null,
         // 导入弹窗（文本 / Excel）

@@ -21,6 +21,8 @@ export default {
     const hookEditing = ref(null)
     const i18nData = ref({})
     const lang = ref('zh')
+    const aiModels = ref([])
+    const aiModelNote = ref('')
 
     const load = async () => {
       loading.value = true
@@ -55,6 +57,21 @@ export default {
           state.site = { ...state.site, ...p.data }
         }
       } catch (e) { err(e.message) } finally { saving.value = false }
+    }
+
+    /** 先保存再拉列表：列表接口读的是库里存的 Key，刚改完没保存就拉会拿到旧 Key 的结果 */
+    const fetchModels = async () => {
+      try {
+        await save('ai')
+        const r = await api.get('/api/ai/models?refresh=1')
+        aiModels.value = r.data.models || []
+        const a = ensure('ai')
+        if (!a.model && r.data.current) a.model = r.data.current
+        aiModelNote.value = r.data.reachable
+          ? `已取到 ${aiModels.value.length} 个模型`
+          : `没取到模型列表：${r.data.reason || '未知原因'}；手填模型名同样可用`
+        if (aiModelNote.value) ok(aiModelNote.value)
+      } catch (e) { err(e.message) }
     }
 
     const testMail = async () => {
@@ -300,8 +317,18 @@ export default {
             sw(a, 'enabled', '启用 AI 能力'),
             field('接口地址（OpenAI Compatible）', txt(a, 'baseUrl', 'https://api.openai.com/v1'), '支持 SiliconFlow、DeepSeek、Qwen、Llama 等兼容接口'),
             field('API Key', txt(a, 'apiKey', '', 'password')),
-            field('模型名称', txt(a, 'model', 'gpt-4o-mini')),
-            field('温度（0-2）', txt(a, 'temperature', '0.7', 'number'))
+            // 模型列表来自服务端 /models：手填容易把 gpt-4o-mini 写成 gpt4o-mini，
+            // 报错要等到第一次生成，还是一条看不懂的 404。拉一次真实列表就能选。
+            field('默认模型', aiModels.value.length
+              ? h('select', { class: 'select', value: a.model || '', onChange: e => a.model = e.target.value },
+                  aiModels.value.map(m => h('option', { value: m }, m)))
+              : txt(a, 'model', 'gpt-4o-mini'),
+              aiModelNote.value || '点右侧「拉取模型列表」从服务端读取可选模型；取不到时手填即可'),
+            h('div', { class: 'flex', style: 'gap:8px;flex-wrap:wrap' }, [
+              h('button', { class: 'btn', onClick: fetchModels }, '拉取模型列表'),
+              h('button', { class: 'btn primary', onClick: () => save('ai') }, '保存 AI 配置')
+            ]),
+            field('温度（0-2）', txt(a, 'temperature', '0.7', 'number'), '越高越发散，做问卷建议 0.6-0.8')
           ])
         }
         case 'webhook': {

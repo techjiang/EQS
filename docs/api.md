@@ -293,8 +293,25 @@ POST /api/banks/paper
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| POST | `/api/ai/generate` | `{prompt, kind, lang}` → 生成表单 schema |
-| POST | `/api/ai/stream` | SSE 流式生成 |
+| POST | `/api/ai/generate` | `{prompt, kind, lang, model?}` → 生成表单 schema；`source` 为 `ai`（真模型）或 `local`（降级模板），后者带 `warning` |
+| POST | `/api/ai/stream` | SSE 流式生成，见下 |
+| GET | `/api/ai/models?refresh=1` | 模型列表（透传上游 `/models`）+ 生成语言候选；上游不可用时 `reachable:false` 并给 `reason`，前端退回手填 |
+| GET | `/api/ai/config` | 当前 AI 配置（Key 已脱敏） |
+| POST | `/api/banks/:id/explain` | `{questionId, value?, force?}` → `{text, source}`，`source` 为 `ai` / `local` / `stored` |
+
+### 流式生成的帧
+
+```
+data: {"delta":"...","fields":[{...}]}   ← 每帧带上「已配平的题目」，前端据此一道一道画
+data: {"done":true,"title":"...","description":"...","schema":[...]}
+data: {"error":"...","fallback":{...},"done":true}   ← AI 不可用时降级
+```
+
+`fields` 里只会有 JSON 已经配平完成的题目：半个对象（`{"type":"radio","la`）不会被当成一道题下发。
+题干里的中文括号、转义引号都不影响配平。
+
+`/api/ai/models`、`/api/ai/config` 需要管理员权限；`/api/banks/:id/explain` 跟随题库身份——
+「只读」协作者问解析时，提示词与返回内容都不含标准答案。
 
 ## WebHook 事件
 
