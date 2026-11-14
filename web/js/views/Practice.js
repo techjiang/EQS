@@ -147,7 +147,9 @@ export default {
                 style: `padding:12px 14px;border-radius:11px;background:${feedback.value.correct ? 'rgba(16,185,129,.1)' : 'rgba(239,68,68,.08)'}`
               }, [
                 h('div', { style: 'font-weight:600;margin-bottom:4px' }, feedback.value.correct ? '✓ 回答正确' : '✕ 回答错误'),
-                h('div', { class: 'small' }, '正确答案：' + (feedback.value.answer.join(', ') || '—')),
+                // 服务端给的 answerText 已按题型排版（矩阵逐行、排序带箭头），
+                // 直接 join 数组的话矩阵是「5, 5」、排序完全看不出顺序
+                h('div', { class: 'small' }, '正确答案：' + (feedback.value.answerText || feedback.value.answer.join('、') || '—')),
                 feedback.value.analysis ? h('div', { class: 'small muted', style: 'margin-top:4px' }, '解析：' + feedback.value.analysis) : null
               ]) : null,
               h('div', { class: 'flex between mt2' }, [

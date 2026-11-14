@@ -9,7 +9,9 @@ import { buildXlsx, readXlsx } from './xlsx.js'
  * 列可以按表头名认（不要求顺序），也可以没有表头（按上面的顺序读）。
  */
 
-const HEADERS = ['题型', '题干', '选项', '答案', '分值', '解析', '标签']
+// 「矩阵行」是矩阵量表专用：行不是选项，是「评价对象」（速度 / 稳定 / 服务）。
+// 没有这一列，矩阵题导出再导入就只剩列选项、没有行——题还在，但谁也答不了。
+const HEADERS = ['题型', '题干', '选项', '答案', '分值', '解析', '标签', '矩阵行']
 
 /** 中英文表头别名，兼容用户自己攒的模板 */
 const ALIAS = {
@@ -20,7 +22,8 @@ const ALIAS = {
   score: ['分值', '分数', '分', '得分', 'score', 'point', 'points'],
   analysis: ['解析', '答案解析', 'analysis', 'explain'],
   // 标签放最后：老表格没有这一列照样能导，新表格多一列也不会顶掉前六列的位置
-  tags: ['标签', '分类', '知识点', 'tags', 'tag']
+  tags: ['标签', '分类', '知识点', 'tags', 'tag'],
+  rows: ['矩阵行', '行', 'rows', 'row']
 }
 
 const TYPE_ALIAS = {
@@ -94,7 +97,7 @@ export function rowsToFields(rows) {
   let map = headerMap(rows[0])
   let start = 0
   if (map) start = 1
-  else map = { type: 0, label: 1, options: 2, answer: 3, score: 4, analysis: 5, tags: 6 }
+  else map = { type: 0, label: 1, options: 2, answer: 3, score: 4, analysis: 5, tags: 6, rows: 7 }
 
   const fields = []
   const skipped = []
@@ -128,13 +131,17 @@ export function rowsToFields(rows) {
       if (options.length < 2) { skipped.push({ row: i + 1, reason: '选择题至少需要两个选项' }); continue }
     }
 
+    // 矩阵的行必须在这里就交给 normalizeField：它看到「没有行」会把选项覆盖成内置的
+    // 很满意/满意/一般三档，表里写的选项连同答案一起被顶掉，导进来的题面目全非
+    const matrixRows = type === 'matrix' ? splitOptions(at('rows')) : []
     const field = normalizeField({
       type,
       label,
       options: options.map(o => ({ label: o, value: o })),
       score: scoreRaw === '' ? 0 : Number(scoreRaw),
       analysis: at('analysis'),
-      tags: at('tags')
+      tags: at('tags'),
+      props: matrixRows.length ? { rows: matrixRows } : undefined
     })
     // 表里写「单选」、选项却是「正确/错误」，本质就是判断题；
     // 不认这层，导出来再导回去题型会一路显示成「单选」，判断和单选就分不开了
@@ -143,6 +150,7 @@ export function rowsToFields(rows) {
       field.options = [{ label: '正确', value: '正确' }, { label: '错误', value: '错误' }]
       field.declType = 'judge'
     }
+
     field.answer = splitAnswer(answerRaw)
     if (field.score < 0 || !Number.isFinite(field.score)) field.score = 0
     coerceAnswerToField(field)
@@ -190,7 +198,9 @@ export function questionsToRows(questions) {
       (q.answer || []).join(','),
       Number(q.score) || 0,
       q.analysis || '',
-      q.tags || ''
+      q.tags || '',
+      // 矩阵题的行必须跟着导出，否则「导出 → 改 → 导回」这一圈下来题目就废了
+      q.type === 'matrix' ? ((q.props?.rows || []).join('\n')) : ''
     ])
   }
   return rows
@@ -216,7 +226,8 @@ export function templateXlsx() {
     ['单选', 'EQS 内置的数据库是？', 'A.MySQL\nB.SQLite 内嵌\nC.Oracle', 'B', 5, '内置 SQLite，开箱即用', '数据库,基础'],
     ['多选', '以下哪些是 EQS 的题型？', 'A.单选\nB.矩阵量表\nC.子表单', 'A,B,C', 10, '', '题型'],
     ['判断', 'EQS 支持私有化部署。', '', '正确', 5, '', '部署'],
-    ['简答', '简述你对条件显隐的理解。', '', '', 10, '主观题，交卷后人工批阅', '表单逻辑']
+    ['简答', '简述你对条件显隐的理解。', '', '', 10, '主观题，交卷后人工批阅', '表单逻辑'],
+    ['矩阵', '请评价这些方面', 'A.满意\nB.一般\nC.不满意', '满意,一般', 5, '按行依次给答案', '矩阵', '速度\n稳定']
   ])
 }
 

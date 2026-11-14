@@ -2,7 +2,7 @@ import crypto from 'node:crypto'
 import { get, all, run, now, log } from '../lib/db.js'
 import { readJson, fail, sendJson, clientIp } from '../lib/http.js'
 import { requireUser, requirePerm, currentUser, can } from '../lib/auth.js'
-import { pickForm, validateSubmission, gradeSubmission, computeStats, submissionData, paginate, fieldVisible, passLineOf, manualScoresOf, passHintOf, captchaChallenge, safeJson } from '../lib/forms.js'
+import { pickForm, validateSubmission, gradeSubmission, computeStats, submissionData, paginate, fieldVisible, passLineOf, manualScoresOf, passHintOf, captchaChallenge, safeJson, isAnswerCorrect, answerText } from '../lib/forms.js'
 
 /** 对外答卷编号：不可猜、无业务含义，只给提交者本人用 */
 export function newPublicId() {
@@ -25,8 +25,6 @@ function findSubmission(formId, raw) {
   return null
 }
 
-const flatAnswer = v => (Array.isArray(v) ? v.map(String) : v === undefined || v === null || v === '' ? [] : [String(v)])
-const sameSet = (a, b) => a.length === b.length && [...a].sort().every((x, i) => x === [...b].sort()[i])
 import { notifySubmission, dispatchWebhooks } from '../lib/notify.js'
 import { submissionsXlsx } from '../lib/sheet.js'
 
@@ -234,10 +232,10 @@ export default function register(r) {
     for (const f of schema) {
       if (['divider', 'richtext', 'html', 'image'].includes(f.type)) continue
       if (!fieldVisible(f, data)) continue
-      const given = flatAnswer(data[f.id])
       const right = (f.answer || []).map(String)
       const auto = right.length > 0
-      const correct = auto && sameSet(given, right)
+      // 与 gradeSubmission 同一套判分口径：排序题看顺序、矩阵题逐行比
+      const correct = auto && isAnswerCorrect(f, data[f.id])
       const manualGiven = manual?.[f.id]
       const hasManual = !auto && manualGiven !== undefined && manualGiven !== null && manualGiven !== ''
       const score = Number(f.score) || 0
@@ -245,8 +243,12 @@ export default function register(r) {
         id: f.id,
         label: f.label,
         type: f.type,
-        given,
+        // 作答/答案都要变成人能读的字：矩阵是对象、排序是顺序、子表单是行
+        given: answerText(f, data[f.id]) ? [answerText(f, data[f.id])] : [],
+        givenRaw: data[f.id] === undefined ? null : data[f.id],
         answer: right,
+        // 矩阵答案是「每行各选哪一列」，直接 join 出来是「5、5」，看不出哪行是哪行
+        answerText: answerText(f, right),
         judged: auto || hasManual,
         manual: hasManual,
         correct,

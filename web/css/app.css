@@ -244,6 +244,15 @@ table.table{width:100%;border-collapse:collapse;font-size:13.5px}
 .q-title{font-weight:600;font-size:14.5px;margin-bottom:8px;display:flex;gap:5px}
 .q-title .req{color:var(--danger)}
 .q-desc{font-size:12.5px;color:var(--text-3);margin:-4px 0 8px}
+/* 矩阵量表：列数不定（2~5 档），窄屏也要一眼看全，不能靠横滚 */
+.matrix-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
+.matrix-tbl{width:100%;border-collapse:collapse;font-size:13px;min-width:0}
+.matrix-tbl th{font-weight:600;color:var(--text-2);font-size:12px;padding:8px 6px;border-bottom:1px solid var(--line);white-space:normal;line-height:1.35}
+.matrix-tbl td{padding:9px 6px;border-bottom:1px solid var(--line-2);vertical-align:middle}
+.matrix-tbl tbody tr:last-child td{border-bottom:none}
+.matrix-tbl td:first-child,.matrix-tbl th:first-child{text-align:left;font-weight:520;width:38%}
+.matrix-tbl input[type=radio]{accent-color:var(--brand);width:17px;height:17px;margin:0}
+
 .opt{display:flex;align-items:center;gap:8px;padding:9px 12px;border:1px solid var(--line);border-radius:10px;margin-bottom:7px;cursor:pointer;transition:.14s;font-size:13.5px}
 .opt:hover{border-color:var(--brand);background:rgba(91,124,250,.04)}
 .opt.sel{border-color:var(--brand);background:rgba(91,124,250,.08);color:var(--brand);font-weight:560}

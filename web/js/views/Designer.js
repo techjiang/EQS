@@ -276,7 +276,12 @@ export default {
           class: 'input', value: f.props?.src || '', placeholder: 'https://…',
           onInput: e => f.props.src = e.target.value
         })) : null,
-        ['radio', 'checkbox', 'select', 'rate', 'nps', 'text', 'textarea', 'number', 'date', 'subform'].includes(f.type) ? h('div', {}, [
+        /*
+         * 计分面板必须覆盖「能计分」的全部题型。
+         * 以前这张清单里没有 sort / matrix，于是排序题、矩阵题在设计器里连分值都设不了——
+         * 而它们恰恰是最需要按顺序/按行判分的两类。
+         */
+        ['radio', 'checkbox', 'select', 'rate', 'nps', 'text', 'textarea', 'number', 'date', 'subform', 'sort', 'matrix', 'judge'].includes(f.type) ? h('div', {}, [
           f.type !== 'subform' ? h('div', { class: 'field' }, [h('label', {}, '默认值'), h('input', {
             class: 'input', value: f.defaultValue,
             onInput: e => f.defaultValue = e.target.value
@@ -287,7 +292,42 @@ export default {
               onInput: e => f.score = Number(e.target.value)
             }))
           ]),
-          hasOptions(f.type) ? h('div', { class: 'field' }, [
+          // 排序：答案是顺序本身，逗号分隔的输入框写不出「第几位」，只能按顺序点
+          f.type === 'sort' ? h('div', { class: 'field' }, [
+            h('label', {}, '正确顺序（按顺序点选，再点一次取消）'),
+            h('div', { class: 'flex wrap', style: 'gap:6px' }, f.options.map((o, i) => {
+              const at = (f.answer || []).indexOf(o.value)
+              return h('button', {
+                class: ['btn', 'sm', at >= 0 ? 'primary' : ''],
+                onClick: () => {
+                  const ans = [...(f.answer || [])]
+                  const pos = ans.indexOf(o.value)
+                  if (pos >= 0) ans.splice(pos, 1); else ans.push(o.value)
+                  f.answer = ans
+                }
+              }, at >= 0 ? `${at + 1}. ${o.label}` : `${String.fromCharCode(65 + i)}. ${o.label}`)
+            })),
+            h('div', { class: 'hint' }, (f.answer || []).length === f.options.length
+              ? '已排完整顺序，判分按这个顺序逐位比'
+              : `还有 ${f.options.length - (f.answer || []).length} 个选项没排，答案不完整会让所有人都答错`)
+          ]) : f.type === 'matrix' ? h('div', { class: 'field' }, [
+            // 矩阵的答案是「每行各选哪一列」，必须逐行给，一个逗号串表达不了
+            h('label', {}, '每行的正确答案'),
+            (f.props?.rows || []).map((row, i) => h('div', { class: 'flex', style: 'gap:6px;align-items:center;margin-bottom:6px' }, [
+              h('span', { class: 'small muted', style: 'min-width:90px' }, row || `第 ${i + 1} 行`),
+              h('select', {
+                class: 'select', style: 'height:32px',
+                value: f.answer?.[i] ?? '',
+                onChange: e => {
+                  const ans = [...(f.answer || [])]
+                  while (ans.length < i) ans.push('')
+                  ans[i] = e.target.value
+                  f.answer = ans
+                }
+              }, [h('option', { value: '' }, '不计分'), ...f.options.map(o => h('option', { value: o.value }, o.label))])
+            ])),
+            h('div', { class: 'hint' }, '每行选一个；留空的行不参与判分')
+          ]) : hasOptions(f.type) ? h('div', { class: 'field' }, [
             h('label', {}, '正确答案（逗号分隔，用于自动评分）'),
             h('input', {
               class: 'input', value: (f.answer || []).join(','),

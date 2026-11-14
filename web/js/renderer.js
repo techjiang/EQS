@@ -162,8 +162,10 @@ export function renderControl(field, model, opts = {}) {
     case 'matrix': {
       const rows = field.props?.rows || []
       const obj = (val && typeof val === 'object') ? val : {}
-      return h('div', { style: 'overflow-x:auto' }, [
-        h('table', { class: 'table', style: 'font-size:13px' }, [
+      // 用自带样式的矩阵表，不要复用 .table：那张表在窄屏有 620px 的 min-width，
+      // 于是 390px 的手机上矩阵题只能看见「行名 + 第一列」，剩下的列要横滚才找得到
+      return h('div', { class: 'matrix-wrap' }, [
+        h('table', { class: 'matrix-tbl' }, [
           h('thead', {}, h('tr', {}, [
             h('th', {}, ''),
             ...field.options.map(o => h('th', { style: 'text-align:center' }, o.label))
@@ -173,7 +175,10 @@ export function renderControl(field, model, opts = {}) {
             ...field.options.map(o => h('td', { style: 'text-align:center' }, h('input', {
               type: 'radio', name: `${field.id}_${row}`, checked: obj[row] === o.value, disabled: dis,
               style: 'accent-color:var(--brand)',
-              onChange: () => set({ ...obj, [row]: o.value })
+              // 必须从 model 取当前值再合并：obj 是渲染那一刻的快照，
+              // 连点几行时每一行都拿旧快照覆盖，最后只剩最后点的那一行——
+              // 「请评价这几个方面」变成只答了一个方面，必填校验和判分都跟着错
+              onChange: () => set({ ...(model[field.id] && typeof model[field.id] === 'object' ? model[field.id] : {}), [row]: o.value })
             })))
           ])))
         ])
@@ -452,6 +457,39 @@ function initSignature(canvas, onChange) {
   canvas.addEventListener('touchstart', start, { passive: false })
   canvas.addEventListener('touchmove', move, { passive: false })
   canvas.addEventListener('touchend', end)
+}
+
+/**
+ * 作答 → 人能读的一行。与服务端 lib/forms.js 的 answerText 同一口径：
+ * 排序题的数组顺序就是答案，用 → 连起来才看得出「他排成了这样」；
+ * 矩阵题是 {行: 列}，join('、') 出来是「5、5」，看不出哪行是哪行；
+ * 子表单是对象数组，直接 join 是一串 [object Object]。
+ */
+export function answerDisplay(field, value) {
+  const type = field?.type
+  if (value === undefined || value === null || value === '') return ''
+  if (type === 'matrix') {
+    const rows = Array.isArray(field?.props?.rows) ? field.props.rows : []
+    if (Array.isArray(value)) return value.map((v, i) => (rows[i] ? `${rows[i]}：${v}` : String(v))).join(' · ')
+    const obj = value && typeof value === 'object' ? value : {}
+    const keys = rows.length ? rows : Object.keys(obj)
+    return keys.map(r => [r, obj[r]]).filter(([, v]) => v !== undefined && v !== null && String(v) !== '')
+      .map(([r, v]) => `${r}：${v}`).join(' · ')
+  }
+  if (type === 'subform') {
+    const labels = Object.fromEntries((field.props?.fields || []).map(sf => [sf.id, sf.label]))
+    return (Array.isArray(value) ? value : []).map((row, i) => {
+      const text = Object.entries(row || {}).filter(([, v]) => v !== undefined && v !== null && String(v).trim() !== '')
+        .map(([k, v]) => `${labels[k] || k}：${v}`).join(' / ')
+      return text ? `${i + 1}. ${text}` : ''
+    }).filter(Boolean).join('\n')
+  }
+  if (Array.isArray(value)) {
+    if (type === 'sort') return value.map(String).join(' → ')
+    return value.map(v => (v && typeof v === 'object' ? (v.name || v.url || JSON.stringify(v)) : String(v))).join('、')
+  }
+  if (typeof value === 'object') return Object.entries(value).map(([k, v]) => `${k}：${v}`).join('；')
+  return String(value).length > 200 ? String(value).slice(0, 200) + '…' : String(value)
 }
 
 /** 渲染整张表单（预览 / 公开填写） */

@@ -81,6 +81,9 @@ export function coerceAnswerToField(field) {
   const opts = Array.isArray(field.options) ? field.options : []
   const values = new Set(opts.map(o => String(o.value)))
   const labels = new Map(opts.map(o => [String(o.label), String(o.value)]))
+  // 矩阵题的答案是「每行各选哪一列」，同一个值出现多次是常态（两行都打 5 分）。
+  // 以前统一去重，两行答案塌成一条，逐行比对永远对不上——这题从此谁答都错。
+  const perRow = field.type === 'matrix'
   // 判据只看选项本身：「正确/错误」两个选项就是判断题，与题干里有没有写「判断」两字无关。
   // 之前要求题干含「判断」，于是「WebSocket 是建立在 TCP 之上的。」这种题干干净的判断题
   // 写了「答案：对」也映射不到选项上，标准答案被剔除，谁答都算错。
@@ -104,8 +107,9 @@ export function coerceAnswerToField(field) {
     }
     mapped.push(tok)
   }
-  // 判分逻辑对单选/多选都按数组比较，这里保持数组，只保证元素是选项值
-  field.answer = [...new Set(mapped)]
+  // 判分逻辑对单选/多选都按数组比较，这里保持数组，只保证元素是选项值。
+  // 排序题尤其不能去重后重排：数组顺序就是答案本身。
+  field.answer = perRow ? mapped : [...new Set(mapped)]
   return field
 }
 
@@ -198,6 +202,90 @@ export function validateSubmission(schema, data) {
 const isBlank = v => v === undefined || v === null || v === '' || (Array.isArray(v) && v.length === 0)
 
 /**
+ * 判分口径：全站只此一份。
+ *
+ * 之前每个入口各写一套比较：交卷（gradeSubmission）、交卷回顾（buildReview）、
+ * 刷题判题（routes/banks.js）三处各自 sort 一下数组就算「比对」。于是：
+ *  - 排序题按集合比，怎么排都算对，这道题等于白送分；
+ *  - 矩阵题的作答是 {行: 列}，被 String() 成 "[object Object]"，全对也判错；
+ *  - 文本答案里的首尾空格、数字 3306 与 "3306.0" 各算各的。
+ * 三处一起改才叫修，所以抽成这一个函数。
+ */
+
+/** 文本类题：答案的大小写不该决定对错（HTTP / http 是同一个答案） */
+const TEXT_LIKE = new Set(['text', 'textarea', 'email', 'phone', 'idcard', 'qrcode', 'date', 'time', 'datetime'])
+
+/** 答案归一：去首尾空白、内部空白压成一个；纯数字按数值（3306.0 与 3306 是同一个） */
+export function answerToken(v, { ignoreCase = false } = {}) {
+  let s = String(v ?? '').trim().replace(/\s+/g, ' ')
+  if (s !== '' && /^-?\d+(\.\d+)?$/.test(s)) s = String(Number(s))
+  return ignoreCase ? s.toLowerCase() : s
+}
+
+/** 这道题是否判对 */
+export function isAnswerCorrect(field, value) {
+  const right = (field?.answer || []).filter(v => v !== undefined && v !== null && String(v) !== '')
+  if (!right.length) return false
+  const type = field?.type
+  const opts = { ignoreCase: TEXT_LIKE.has(type) }
+
+  if (type === 'sort') {
+    // 排序题问的是顺序。按集合比的话「把选项全选上」就算对，顺序这回事根本不存在
+    const given = (Array.isArray(value) ? value : []).map(v => answerToken(v, opts))
+    const want = right.map(v => answerToken(v, opts))
+    return given.length === want.length && given.every((x, i) => x === want[i])
+  }
+
+  if (type === 'matrix') {
+    // 矩阵题的作答是 {行: 列值}，答案是「每行各选哪一列」
+    const obj = value && typeof value === 'object' && !Array.isArray(value) ? value : {}
+    const rows = Array.isArray(field.props?.rows) ? field.props.rows : []
+    if (!rows.length) return false
+    const want = right.map(v => answerToken(v, opts))
+    // 答案逐行写了就逐行比；只写一个值时按「每行都是它」处理
+    if (want.length === rows.length) return rows.every((r, i) => answerToken(obj[r], opts) === want[i])
+    return want.length === 1 && rows.every(r => answerToken(obj[r], opts) === want[0])
+  }
+
+  const given = (Array.isArray(value) ? value : value === undefined || value === null || value === '' ? [] : [value])
+    .map(v => answerToken(v, opts)).sort()
+  const want = right.map(v => answerToken(v, opts)).sort()
+  // 多选按集合比：勾选顺序不是答案的一部分
+  return given.length === want.length && given.every((x, i) => x === want[i])
+}
+
+/** 把作答 / 答案渲染成人能读的一行——回顾、刷题反馈都用它 */
+export function answerText(field, value) {
+  const type = field?.type
+  if (value === undefined || value === null || value === '') return ''
+  if (type === 'matrix') {
+    const rows = Array.isArray(field.props?.rows) ? field.props.rows : []
+    // 作答是 {行: 列}；标准答案是「每行各选哪一列」的数组，同样按行贴出去
+    if (Array.isArray(value)) {
+      return value.map((v, i) => (rows[i] ? `${rows[i]}：${v}` : String(v))).join(' · ')
+    }
+    const obj = value && typeof value === 'object' ? value : {}
+    return (rows.length ? rows : Object.keys(obj))
+      .map(r => [r, obj[r]]).filter(([, v]) => v !== undefined && v !== null && String(v) !== '')
+      .map(([r, v]) => `${r}：${v}`).join(' · ')
+  }
+  if (type === 'subform') {
+    const labels = Object.fromEntries((field.props?.fields || []).map(sf => [sf.id, sf.label]))
+    return (Array.isArray(value) ? value : []).map(row => Object.entries(row || {})
+      .filter(([, x]) => x !== undefined && x !== null && String(x).trim() !== '')
+      .map(([k, x]) => `${labels[k] || '字段'}：${x}`).join(' / ')).filter(Boolean).join('；')
+  }
+  if (Array.isArray(value)) {
+    // 排序题：数组顺序就是答案，用箭头连起来才看得出「他排成了这样」
+    if (type === 'sort') return value.map(String).join(' → ')
+    return value.map(v => (v && typeof v === 'object' ? (v.name || v.url || JSON.stringify(v)) : String(v))).join('、')
+  }
+  if (typeof value === 'object') return Object.values(value).map(String).join('、')
+  // 图片/定位等长值截断，别把一张 dataURL 塞进反馈框
+  return String(value).length > 80 ? String(value).slice(0, 80) + '…' : String(value)
+}
+
+/**
  * 考试评分
  * 三类题分开算：有标准答案的自动判；没标准答案但有人工给分的按人工分计；
  * 既没答案也没人批的主观题，只算进卷面总分，不进可判分总分——否则「全对也永远不及格」。
@@ -215,10 +303,8 @@ export function gradeSubmission(schema, data, settings = {}, manual = {}) {
     if (f.answer?.length) {
       total += f.score
       scored++
-      const v = data[f.id]
-      const given = (Array.isArray(v) ? v : v === undefined || v === null || v === '' ? [] : [v]).map(String).sort()
-      const right = f.answer.map(String).sort()
-      if (given.length === right.length && given.every((x, i) => x === right[i])) got += f.score
+      // 判分口径统一在 isAnswerCorrect：排序看顺序、矩阵逐行比、文本忽略大小写与空格
+      if (isAnswerCorrect(f, data[f.id])) got += f.score
       continue
     }
     const m = manual?.[f.id]
@@ -266,7 +352,32 @@ export function computeStats(form, submissions) {
     if (['divider', 'richtext', 'html', 'image', 'captcha'].includes(f.type)) continue
     const values = submissions.map(s => s.data[f.id]).filter(v => v !== undefined && v !== null && v !== '')
     const item = { id: f.id, label: f.label, type: f.type, count: values.length }
-    if (['radio', 'select', 'checkbox', 'sort', 'carousel', 'rate', 'nps', 'switch'].includes(f.type)) {
+    /*
+     * 排序题单独算。它是「顺序」，不是「选没选上」：
+     * 按选项统计只会得到「每个选项 13 人」——全选项都在数组里，这根柱子没有任何信息量。
+     * 真正能看的是「这个选项平均被排在第几位」，越小越靠前。
+     */
+    if (f.type === 'sort') {
+      const ranks = new Map(f.options.map(o => [String(o.value), []]))
+      for (const v of values) {
+        if (!Array.isArray(v)) continue
+        v.forEach((val, i) => {
+          const key = String(val)
+          if (!ranks.has(key)) ranks.set(key, [])
+          ranks.get(key).push(i + 1)
+        })
+      }
+      const rows = [...ranks.entries()].map(([value, list]) => {
+        const opt = f.options.find(o => String(o.value) === value)
+        return {
+          name: opt?.label || value,
+          value: list.length ? Math.round((list.reduce((a, b) => a + b, 0) / list.length) * 100) / 100 : 0,
+          count: list.length
+        }
+      })
+      item.series = rows
+      item.note = '平均名次（越小越靠前）'
+    } else if (['radio', 'select', 'checkbox', 'carousel', 'rate', 'nps', 'switch'].includes(f.type)) {
       const counts = {}
       for (const v of values) {
         for (const one of (Array.isArray(v) ? v : [v])) counts[String(one)] = (counts[String(one)] || 0) + 1
@@ -286,11 +397,28 @@ export function computeStats(form, submissions) {
         item.average = values.length ? Math.round((values.reduce((a, b) => a + (Number(flat(b)) || 0), 0) / values.length) * 100) / 100 : 0
       }
     } else if (f.type === 'matrix') {
-      item.series = (f.props?.rows || []).map(row => {
-        const rowVals = values.map(v => v?.[row]).filter(Boolean)
-        const avg = rowVals.length ? rowVals.reduce((a, b) => a + (Number(b) || 0), 0) / rowVals.length : 0
-        return { name: row, value: Math.round(avg * 100) / 100 }
-      })
+      /*
+       * 矩阵题的作答是 {行: 列值}，选项值是「满意/一般/不满意」这种文字。
+       * 以前拿 Number('满意') 去求平均，全是 NaN→0，整题四根柱子高度为零：
+       * 看着像「没人答」，其实每份答卷都答了。现在按「列」统计人数分布。
+       */
+      const counts = {}
+      for (const v of values) {
+        if (!v || typeof v !== 'object' || Array.isArray(v)) continue
+        for (const one of Object.values(v)) counts[String(one)] = (counts[String(one)] || 0) + 1
+      }
+      item.series = f.options.map(o => ({ name: o.label, value: counts[String(o.value)] || 0 }))
+      item.note = '各评分列被选中的次数'
+      // 选项是数字分值时（1-5 分那种）顺手给平均分，否则不给——对文字档位求平均是假的
+      const numeric = f.options.every(o => Number.isFinite(Number(o.value)) && String(o.value).trim() !== '')
+      if (numeric && values.length) {
+        const nums = []
+        for (const v of values) {
+          if (!v || typeof v !== 'object') continue
+          for (const one of Object.values(v)) if (Number.isFinite(Number(one))) nums.push(Number(one))
+        }
+        item.average = nums.length ? Math.round((nums.reduce((a, b) => a + b, 0) / nums.length) * 100) / 100 : 0
+      }
     } else if (f.type === 'number' || f.type === 'slider') {
       const nums = values.map(Number).filter(n => !Number.isNaN(n))
       item.average = nums.length ? Math.round((nums.reduce((a, b) => a + b, 0) / nums.length) * 100) / 100 : 0

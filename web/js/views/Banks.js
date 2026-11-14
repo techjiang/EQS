@@ -84,9 +84,10 @@ export default {
 
     const saveQuestion = async () => {
       try {
-        const payload = { ...editQ.value, title: editQ.value.label, items: [{ ...editQ.value, title: editQ.value.label }] }
-        if (editQ.value.id && !String(editQ.value.id).startsWith('f_')) await api.put(`/api/questions/${editQ.value.id}`, { ...editQ.value, title: editQ.value.label })
-        else await api.post(`/api/banks/${active.value.id}/questions`, { ...editQ.value, title: editQ.value.label })
+        // props 必须一起提交：矩阵的行、评分的上限都在里面，漏了就等于把这题的结构清了
+        const body = { ...editQ.value, title: editQ.value.label, props: editQ.value.props || {} }
+        if (editQ.value.id && !String(editQ.value.id).startsWith('f_')) await api.put(`/api/questions/${editQ.value.id}`, body)
+        else await api.post(`/api/banks/${active.value.id}/questions`, body)
         ok('题目已保存')
         editQ.value = null
         await loadQuestions()
@@ -377,7 +378,8 @@ export default {
                   tags: editQ.value.tags || '', answer: []
                 }
               }
-            }, ['radio', 'checkbox', 'text', 'textarea', 'select'].map(t => h('option', { value: t }, fieldMeta(t).label)))]),
+            // 题库能导入排序题、矩阵题，编辑器却只给五种题型 —— 导进来的题没法在这里改
+            }, ['radio', 'checkbox', 'text', 'textarea', 'select', 'sort', 'matrix', 'rate', 'nps'].map(t => h('option', { value: t }, fieldMeta(t).label)))]),
             h('div', { class: 'field' }, [h('label', {}, '分值'), h('input', {
               class: 'input', type: 'number', value: editQ.value.score, onInput: e => editQ.value.score = Number(e.target.value)
             })])
@@ -401,7 +403,70 @@ export default {
               h('button', { onClick: () => { editQ.value.answer = (editQ.value.answer || []).filter(a => a !== o.value); editQ.value.options.splice(i, 1) } }, '×')
             ]))
           ]) : null,
-          editQ.value.options.length ? h('div', { class: 'field' }, [
+          // 矩阵题的「行」是评价对象，和列选项是两个维度；不在这里编辑，行就永远只有默认那三行
+          editQ.value.type === 'matrix' ? h('div', { class: 'field' }, [
+            h('label', { class: 'flex between' }, [
+              h('span', {}, '矩阵行（评价对象，答案按行的顺序给）'),
+              h('button', {
+                class: 'btn ghost sm', onClick: () => {
+                  editQ.value.props = editQ.value.props || {}
+                  editQ.value.props.rows = editQ.value.props.rows || []
+                  editQ.value.props.rows.push('行 ' + (editQ.value.props.rows.length + 1))
+                }
+              }, '+ 添加行')
+            ]),
+            (editQ.value.props?.rows || []).map((row, i) => h('div', { class: 'opt-row' }, [
+              h('input', {
+                class: 'input', value: row,
+                onInput: e => editQ.value.props.rows[i] = e.target.value
+              }),
+              h('button', {
+                onClick: () => {
+                  if (editQ.value.props.rows.length <= 1) return err('矩阵至少保留一行')
+                  editQ.value.props.rows.splice(i, 1)
+                  editQ.value.answer = (editQ.value.answer || []).filter((_, j) => j !== i)
+                }
+              }, '×')
+            ]))
+          ]) : null,
+          // 矩阵：每行各选一列，答案是「按行的顺序」一串列值，不能按集合勾选
+          editQ.value.type === 'matrix' ? h('div', { class: 'field' }, [
+            h('label', {}, '每行的正确答案'),
+            (editQ.value.props?.rows || []).map((row, i) => h('div', { class: 'flex', style: 'gap:6px;align-items:center;margin-bottom:6px' }, [
+              h('span', { class: 'small muted', style: 'min-width:96px' }, row || `第 ${i + 1} 行`),
+              h('select', {
+                class: 'select', style: 'height:32px',
+                value: editQ.value.answer?.[i] ?? '',
+                onChange: e => {
+                  const ans = [...(editQ.value.answer || [])]
+                  while (ans.length < i) ans.push('')
+                  ans[i] = e.target.value
+                  editQ.value.answer = ans.filter((v, j) => j === i || v !== undefined)
+                }
+              }, [h('option', { value: '' }, '不计分'), ...editQ.value.options.map(o => h('option', { value: o.value }, o.label))])
+            ])),
+            h('div', { class: 'hint' }, '每行选一个；留空表示该行不判分')
+          ]) : null,
+          // 排序：答案是顺序本身，必须按顺序点；这里复用「点选」按钮，点几次就是第几位
+          editQ.value.type === 'sort' ? h('div', { class: 'field' }, [
+            h('label', {}, '正确顺序（按顺序点选，再点一次取消）'),
+            h('div', { class: 'flex wrap', style: 'gap:6px' }, editQ.value.options.map((o, i) => {
+              const at = (editQ.value.answer || []).indexOf(o.value)
+              return h('button', {
+                class: ['btn', 'sm', at >= 0 ? 'primary' : ''],
+                onClick: () => {
+                  const ans = [...(editQ.value.answer || [])]
+                  const pos = ans.indexOf(o.value)
+                  if (pos >= 0) ans.splice(pos, 1); else ans.push(o.value)
+                  editQ.value.answer = ans
+                }
+              }, at >= 0 ? `${at + 1}. ${o.label}` : `${String.fromCharCode(65 + i)}. ${o.label}`)
+            })),
+            h('div', { class: 'hint' }, editQ.value.answer?.length === editQ.value.options.length
+              ? '已排完整顺序'
+              : `还有 ${editQ.value.options.length - (editQ.value.answer?.length || 0)} 个选项没排进去，不完整的答案会造成「谁答都错」`)
+          ]) : null,
+          editQ.value.options.length && !['matrix', 'sort'].includes(editQ.value.type) ? h('div', { class: 'field' }, [
             h('label', {}, editQ.value.type === 'checkbox' ? '正确答案（可勾选多个）' : '正确答案（点选，也可直接写 A/B）'),
             h('div', { class: 'flex wrap', style: 'gap:6px' },
               editQ.value.options.map((o, i) => h('label', {

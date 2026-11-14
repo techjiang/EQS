@@ -1156,7 +1156,7 @@ try {
     ])
     const tplRows = readXlsx.readXlsx(tplBuf)
     assert(Array.isArray(tplRows) && tplRows[0]?.[0] === '题型', '模板的表头是「题型」开头的六列', JSON.stringify(tplRows?.[0]))
-    assert(tplRows.length === 5, '模板含 1 行表头 + 4 行示例', String(tplRows.length))
+    assert(tplRows.length === 6, '模板含 1 行表头 + 5 行示例（含一行矩阵）', String(tplRows.length))
 
     // 导入：模板原样传回题库
     r = await req('POST', '/api/banks', { name: 'Excel 导入题库' })
@@ -1165,7 +1165,7 @@ try {
     fd.append('file', new Blob([tplBuf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }), 'tpl.xlsx')
     res = await fetch(BASE + `/api/banks/${bankId}/import-xlsx`, { method: 'POST', headers: { Cookie: cookie }, body: fd })
     const imported = await res.json()
-    assert(res.ok && imported.imported === 4, 'Excel 导入 4 道题', JSON.stringify(imported))
+    assert(res.ok && imported.imported === 5, 'Excel 导入 5 道题', JSON.stringify(imported))
     r = await req('GET', `/api/banks/${bankId}/questions`)
     const qs = r.json.data
     assert(qs[0].type === 'radio' && qs[0].answer[0] === 'SQLite 内嵌', '单选的字母答案映射成选项值', JSON.stringify([qs[0].type, qs[0].answer]))
@@ -1174,6 +1174,8 @@ try {
     assert(qs[2].answer[0] === '正确', '判断题的「正确」落成选项值', JSON.stringify(qs[2].answer))
     assert(qs[3].type === 'textarea' && qs[3].answer.length === 0, '简答题没有标准答案（进人工批阅）', JSON.stringify([qs[3].type, qs[3].answer]))
     assert(qs[0].score === 5 && qs[3].score === 10, '分值按行落库', JSON.stringify([qs[0].score, qs[3].score]))
+    // 矩阵题：行与列是两个维度。行没进库，导入的矩阵在卷面上就没有行可填
+    assert(qs[4].type === 'matrix' && (qs[4].props?.rows || []).join('/') === '速度/稳定', '矩阵题的行跟着表格落库', JSON.stringify([qs[4].type, qs[4].props]))
 
     // 题干里没有「判断」二字时，「答案：对」同样要落到「正确」选项上
     {
@@ -1716,6 +1718,68 @@ try {
     assert(first.status === 401, '最老的会话被自动踢掉（新设备照常能登）', String(first.status))
     const newest = await call(last, 'GET', '/api/forms')
     assert(newest.status === 200, '最新登录的会话仍然有效', String(newest.status))
+  }
+
+  console.log('\n[52] 判分口径：排序看顺序、矩阵逐行、文本忽略大小写')
+  {
+    /*
+     * 三个入口各写一套「sort 一下再比」，于是同一道题在交卷、回顾、刷题里
+     * 可能得出三种结论。这里把容易判错的三类题一起过一遍。
+     */
+    cookie = await asUser('admin', 'test-pass-123')
+    let r = await req('POST', '/api/banks', { name: '判分口径题库' })
+    const bankId = r.json.id
+    r = await req('POST', `/api/banks/${bankId}/questions`, { items: [
+      { type: 'sort', title: '按重要性排序', label: '按重要性排序', options: ['甲', '乙', '丙'], answer: ['甲', '乙', '丙'], score: 10 },
+      { type: 'matrix', title: '满意度', label: '满意度', props: { rows: ['速度', '稳定'] }, options: [{ label: '好', value: '5' }, { label: '差', value: '1' }], answer: ['5', '5'], score: 10 },
+      { type: 'text', title: '数据库名', label: '数据库名', answer: ['MySQL'], score: 5 }
+    ] })
+    const qs = (await req('GET', `/api/banks/${bankId}/questions`)).json.data
+    const [qSort, qMatrix, qText] = qs
+    assert((qMatrix.props?.rows || []).join('/') === '速度/稳定', '矩阵题的行存进了题库（以前这一层直接丢了）', JSON.stringify(qMatrix.props))
+    assert(qMatrix.answer.length === 2, '矩阵题每行的答案都留着（以前去重塌成一条）', JSON.stringify(qMatrix.answer))
+
+    const play = async (id, value) => (await req('POST', `/api/banks/${bankId}/practice/answer`, { questionId: id, value, judge: true })).json
+    assert((await play(qSort.id, ['丙', '甲', '乙'])).correct === false, '排序题：打乱顺序算错')
+    assert((await play(qSort.id, ['甲', '乙', '丙'])).correct === true, '排序题：正确顺序才算对')
+    assert((await play(qMatrix.id, { 速度: '5', 稳定: '5' })).correct === true, '矩阵题：每行都对就判对')
+    assert((await play(qMatrix.id, { 速度: '5', 稳定: '1' })).correct === false, '矩阵题：错一行就判错')
+    const textRes = await play(qText.id, '  mysql  ')
+    assert(textRes.correct === true, '文本题：大小写与首尾空格不影响判定', JSON.stringify(textRes))
+    assert(/MySQL/.test(textRes.answerText || ''), '刷题反馈给出人能读的答案', JSON.stringify(textRes.answerText))
+
+    // 交卷与回顾必须与刷题同口径
+    r = await req('POST', `/api/forms`, {
+      title: '判分口径考试', kind: 'exam',
+      schema: [
+        { id: 's1', type: 'sort', label: '按重要性排序', options: ['甲', '乙', '丙'], answer: ['甲', '乙', '丙'], score: 10 },
+        { id: 'm1', type: 'matrix', label: '满意度', props: { rows: ['速度', '稳定'] }, options: [{ label: '好', value: '5' }, { label: '差', value: '1' }], answer: ['5', '5'], score: 10 },
+        { id: 't1', type: 'text', label: '数据库名', answer: ['MySQL'], score: 5 }
+      ],
+      settings: { passPercent: 60 }
+    })
+    const examId = r.json.id
+    await req('PUT', `/api/forms/${examId}`, { status: 'published' })
+
+    const submit = async (data) => (await req('POST', `/api/public/forms/${examId}/submit`, { data })).json
+    const allRight = await submit({ s1: ['甲', '乙', '丙'], m1: { 速度: '5', 稳定: '5' }, t1: 'mysql' })
+    assert(allRight.score === 25, '交卷：排序对 + 矩阵全对 + 文本忽略大小写 = 满分', String(allRight.score))
+    const mixed = await submit({ s1: ['丙', '乙', '甲'], m1: { 速度: '5', 稳定: '1' }, t1: 'MySQL' })
+    assert(mixed.score === 5, '交卷：排序错、矩阵错一行，只剩填空题的分', String(mixed.score))
+    const sortItem = mixed.review.items.find(i => i.id === 's1')
+    assert(/→/.test(sortItem.given[0]), '回顾：排序作答按顺序展示，不是逗号拼接', JSON.stringify(sortItem.given))
+    assert(sortItem.correct === false, '回顾：排序错的题在逐题回顾里也判错')
+    const matrixItem = mixed.review.items.find(i => i.id === 'm1')
+    assert(/速度/.test(matrixItem.answerText || ''), '回顾：矩阵答案逐行给出，不是一串 "5、5"', JSON.stringify(matrixItem.answerText))
+
+    // 报表口径：矩阵题的作答是「满意/一般」这类文字，拿 Number() 求平均会全成 0
+    r = await req('GET', `/api/forms/${examId}/report`)
+    const statQ = r.json.data.questions
+    const mStat = statQ.find(x => x.type === 'matrix')
+    assert(mStat && mStat.series.some(s2 => s2.value > 0), '报表：矩阵题按列统计人数，不是一排零', JSON.stringify(mStat?.series))
+    const sStat = statQ.find(x => x.type === 'sort')
+    assert(sStat && sStat.series.every(s2 => s2.value > 0) && /名次/.test(sStat.note || ''),
+      '报表：排序题给平均名次，而不是「每个选项都一样多」', JSON.stringify([sStat?.series, sStat?.note]))
   }
 
   console.log('\n[44] 前端静态资源')

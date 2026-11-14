@@ -173,7 +173,7 @@ export default {
                       // 「未设答案」在阅卷环节是错的：主观题不是没设答案，是等人给分
                       it.judged ? (it.correct ? `✓ +${it.score}` : `✕ 0/${it.score}`) : (it.score > 0 ? '待人工批阅' : '不计分'))
                   ]),
-                  it.judged && !it.correct ? h('div', { class: 'small muted', style: 'margin-top:4px' }, `你的作答：${it.given.join('、') || '（空）'} · 正确答案：${it.answer.join('、')}`) : null,
+                  it.judged && !it.correct ? h('div', { class: 'small muted', style: 'margin-top:4px' }, `你的作答：${it.given.join('') || '（空）'} · 正确答案：${it.answerText || it.answer.join('、')}`) : null,
                   it.analysis ? h('div', { class: 'small muted', style: 'margin-top:4px' }, '解析：' + it.analysis) : null
                 ]))
               ]) : null,

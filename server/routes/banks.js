@@ -1,12 +1,12 @@
 import { get, all, run, now, log } from '../lib/db.js'
 import { readJson, fail, sendJson } from '../lib/http.js'
 import { requireUser, requirePerm, can } from '../lib/auth.js'
-import { normalizeField, paginate, safeJson, gradeSubmission, coerceAnswerToField } from '../lib/forms.js'
+import { normalizeField, paginate, safeJson, gradeSubmission, coerceAnswerToField, isAnswerCorrect, answerText } from '../lib/forms.js'
 import { parseTextToFields, normalizeTags } from './forms.js'
 import { readXlsxUpload } from './files.js'
 import { parseXlsx, rowsToFields, questionsXlsx, templateXlsx } from '../lib/sheet.js'
 
-const parseQ = q => ({ ...q, options: safeJson(q.options, []), answer: safeJson(q.answer, []) })
+const parseQ = q => ({ ...q, options: safeJson(q.options, []), answer: safeJson(q.answer, []), props: safeJson(q.props, {}) })
 
 /**
  * 题库是「我的」资源：列表、组卷、删除都按 owner 过滤，
@@ -202,8 +202,8 @@ export default function register(r) {
       // 分值：`f.score || 5` 会把用户明说的「不计分」写成 5 分，
       // 组卷时它就变成计分题，答错直接扣分
       const score = item.score === undefined || item.score === '' ? 5 : Math.max(0, Number(f.score) || 0)
-      const result = run('INSERT INTO questions(bank_id, type, title, options, answer, analysis, score, tags, created_at) VALUES(?,?,?,?,?,?,?,?,?)',
-        bank.id, f.type, f.label, JSON.stringify(f.options), JSON.stringify(f.answer), f.analysis, score, tags, now())
+      const result = run('INSERT INTO questions(bank_id, type, title, options, answer, analysis, score, tags, props, created_at) VALUES(?,?,?,?,?,?,?,?,?,?)',
+        bank.id, f.type, f.label, JSON.stringify(f.options), JSON.stringify(f.answer), f.analysis, score, tags, JSON.stringify(f.props || {}), now())
       ids.push(Number(result.lastInsertRowid))
     }
     sendJson(res, 201, { ok: true, ids })
@@ -218,8 +218,8 @@ export default function register(r) {
     const f = normalizeField({ ...parseQ(q), ...body })
     coerceAnswerToField(f)
     const tags = body.tags === undefined ? q.tags : normalizeTags(body.tags)
-    run('UPDATE questions SET type = ?, title = ?, options = ?, answer = ?, analysis = ?, score = ?, tags = ? WHERE id = ?',
-      f.type, f.label, JSON.stringify(f.options), JSON.stringify(f.answer), f.analysis, f.score, tags, q.id)
+    run('UPDATE questions SET type = ?, title = ?, options = ?, answer = ?, analysis = ?, score = ?, tags = ?, props = ? WHERE id = ?',
+      f.type, f.label, JSON.stringify(f.options), JSON.stringify(f.answer), f.analysis, f.score, tags, JSON.stringify(f.props || {}), q.id)
     sendJson(res, 200, { ok: true })
   })
 
@@ -257,8 +257,8 @@ export default function register(r) {
       coerceAnswerToField(f)
       // 「分值：0」是用户明说的「这题不计分」，nullish 兜底不能写成 `|| 5`
       const score = f.score ?? 5
-      run('INSERT INTO questions(bank_id, type, title, options, answer, analysis, score, tags, created_at) VALUES(?,?,?,?,?,?,?,?,?)',
-        bank.id, f.type, f.label, JSON.stringify(f.options), JSON.stringify(f.answer), f.analysis, score, normalizeTags(f.tags || ''), now())
+      run('INSERT INTO questions(bank_id, type, title, options, answer, analysis, score, tags, props, created_at) VALUES(?,?,?,?,?,?,?,?,?,?)',
+        bank.id, f.type, f.label, JSON.stringify(f.options), JSON.stringify(f.answer), f.analysis, score, normalizeTags(f.tags || ''), JSON.stringify(f.props || {}), now())
     }
     sendJson(res, 200, { ok: true, imported: fields.length, droppedAnswers: dropped })
   })
@@ -307,8 +307,8 @@ export default function register(r) {
     for (const f of fields) {
       if (f.dropped?.length) droppedAnswers.push(`${f.label}（${f.dropped.join('、')}）`)
       delete f.dropped
-      run('INSERT INTO questions(bank_id, type, title, options, answer, analysis, score, tags, created_at) VALUES(?,?,?,?,?,?,?,?,?)',
-        bank.id, f.type, f.label, JSON.stringify(f.options), JSON.stringify(f.answer), f.analysis, f.score ?? 0, normalizeTags(f.tags || ''), now())
+      run('INSERT INTO questions(bank_id, type, title, options, answer, analysis, score, tags, props, created_at) VALUES(?,?,?,?,?,?,?,?,?,?)',
+        bank.id, f.type, f.label, JSON.stringify(f.options), JSON.stringify(f.answer), f.analysis, f.score ?? 0, normalizeTags(f.tags || ''), JSON.stringify(f.props || {}), now())
       imported++
     }
     log(user, 'Excel 导入题目', `${bank.name} #${bank.id} → ${imported} 道`)
@@ -329,7 +329,10 @@ export default function register(r) {
       // 直接把题库里的答案搬进卷面，会出现「卷面显示作答 A 却判 0 分」——所以入库前统一口径。
       const f = normalizeField({
         type: q.type, label: q.title, options: q.options, answer: q.answer,
-        analysis: q.analysis, score: q.score
+        analysis: q.analysis, score: q.score,
+        // 矩阵的行、评分的上限、子表单的字段都在 props 里：不带过来，
+        // 卷面上的矩阵题只剩余项、没有行，答题框根本渲染不出来
+        props: q.props
       })
       if (!f.answer.length && q.answer?.length) f.answer = q.answer
       coerceAnswerToField(f)
@@ -393,7 +396,7 @@ export default function register(r) {
     }
     const schema = picked.map(q => {
       const p = parseQ(q)
-      const f = normalizeField({ type: p.type, label: p.title, options: p.options, answer: p.answer, analysis: p.analysis, score: p.score })
+      const f = normalizeField({ type: p.type, label: p.title, options: p.options, answer: p.answer, analysis: p.analysis, score: p.score, props: p.props })
       if (!f.answer.length && p.answer?.length) f.answer = p.answer
       coerceAnswerToField(f)
       return f
@@ -455,8 +458,21 @@ function cleanIds(raw, pool) {
     // 进度停在题库末尾时，错题/收藏模式不能直接给出空列表，否则「错题 1」点进去一片空白
     const rawProgress = Number(record?.progress) || 0
     const resumeAt = rawProgress < list.length ? rawProgress : 0
+    /*
+     * 组件的结构性属性要一起下发，否则刷题页渲染不出题：
+     * 矩阵题的行在 props.rows，评分的上限在 props.max，子表单的字段在 props.fields。
+     * 但 props 是用户自由填的，标准答案可能被塞在任何自定义键里——所以走白名单，不是整个吐出去。
+     */
+    const PLAY_PROPS = ['rows', 'max', 'min', 'step', 'fields', 'multiple', 'maxSize', 'accept', 'minLength', 'maxLength', 'unit', 'precision', 'labels']
+    const playProps = (p) => {
+      const src = p && typeof p === 'object' ? p : {}
+      const out = {}
+      for (const k of PLAY_PROPS) if (src[k] !== undefined) out[k] = src[k]
+      return out
+    }
     const safeList = list.map(q => ({
       id: q.id, type: q.type, title: q.title, options: q.options, analysis: '',
+      props: playProps(q.props),
       score: q.score, favorite: favoriteIds.has(Number(q.id)), note: notes[q.id] || ''
     }))
     sendJson(res, 200, {
@@ -482,18 +498,27 @@ function cleanIds(raw, pool) {
     const parsed = parseQ(q)
     // 只有真的提交了答案才判题；收藏 / 写笔记不应把题目算成答错
     const judging = body.judge === true || Array.isArray(body.value) || (typeof body.value === 'string' && body.value.trim() !== '')
-    const raw = judging ? (Array.isArray(body.value) ? body.value : [body.value]).filter(v => v !== undefined && v !== null && v !== '') : []
-    // 允许前端直接传选项字母（A/B/…），统一归一化为选项值
-    const given = raw.map(v => {
+    /*
+     * 手写的作答可能直接给选项字母（A/B/…）。只对「按字母选」的题型映射：
+     * 排序题的值是顺序、矩阵题是对象，逐个字母映射会把它们拆成一堆无意义的字符串。
+     */
+    const LETTER_TYPES = new Set(['radio', 'checkbox', 'select', 'carousel', 'cascader'])
+    const toValue = (v) => {
+      if (!LETTER_TYPES.has(parsed.type)) return v
       const tok = String(v).trim()
-      if (/^[A-Za-z]$/.test(tok)) {
-        const opt = parsed.options[tok.toUpperCase().charCodeAt(0) - 65]
-        if (opt) return String(opt.value)
-      }
-      return tok
-    }).sort()
-    const right = parsed.answer.map(String).sort()
-    const correct = judging && given.length === right.length && given.every((x, i) => x === right[i])
+      if (!/^[A-Za-z]$/.test(tok)) return v
+      const opt = parsed.options[tok.toUpperCase().charCodeAt(0) - 65]
+      return opt ? String(opt.value) : v
+    }
+    const givenValue = Array.isArray(body.value) ? body.value.map(toValue) : toValue(body.value)
+    /*
+     * 判分只在 lib/forms.js 里维护一份口径。
+     * 之前这里是自己写的「sort 一下数组再逐位比」，于是：
+     *  - 排序题怎么排都算对（比的是集合，顺序根本不在比的范围里）；
+     *  - 矩阵题的作答是 {行: 列}，被 String 成 [object Object]，全对也判错。
+     * 传整个题目对象进去，题型 / 选项 / 矩阵行它自己会看。
+     */
+    const correct = judging && isAnswerCorrect(parsed, givenValue)
     let record = get('SELECT * FROM practice_records WHERE bank_id = ? AND user_id = ?', bank.id, user.id)
     if (!record) {
       run('INSERT INTO practice_records(bank_id, user_id, mode, progress, right_ids, wrong_ids, favorite_ids, notes, updated_at) VALUES(?,?,?,?,?,?,?,?,?)',
@@ -531,6 +556,8 @@ function cleanIds(raw, pool) {
       correct: judging ? correct : null,
       judged: judging,
       answer: parsed.answer,
+      // 人能读的版本：矩阵答案是逐行的、排序答案带顺序，直接 join 出来是「5, 5」
+      answerText: answerText(parsed, parsed.answer),
       analysis: parsed.analysis,
       wrongCount: wrongIds.size,
       favorite: favoriteIds.has(q.id)

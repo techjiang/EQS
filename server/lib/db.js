@@ -199,6 +199,14 @@ ensureColumns('files', { owner_id: 'INTEGER NOT NULL DEFAULT 0' })
 // 于是任何登录用户自己签一把 Key 就等于拿到全站管理员权限（实测能读全站备份、建管理员账号）。
 ensureColumns('api_keys', { owner_id: 'INTEGER NOT NULL DEFAULT 0' })
 
+/*
+ * 题库题目也要能带 props。
+ * 矩阵量表的「行」= props.rows、评分题的满分 = props.max、子表单的字段 = props.fields：
+ * 这些都不在 questions 的列里，以前入库时被整个丢掉——矩阵题从题库搬进卷面就只剩选项，
+ * 卷面上连行都没有，答题框渲染不出来。
+ */
+ensureColumns('questions', { props: "TEXT NOT NULL DEFAULT '{}'" })
+
 // 改密码之后旧会话必须失效：以前换了密码，别人手里那条 7 天有效的 Cookie 照用不误。
 ensureColumns('users', { pwd_changed_at: 'TEXT' })
 

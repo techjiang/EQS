@@ -79,6 +79,20 @@
   此时前端展示「待批阅」而不是 0 分，避免“全对也不及格”的误判。
 - `passed` 由 `score / total` 与 `settings.passPercent` 比较得出，全部主观题时返回 `null`。
 
+判分口径（三个入口共用 `lib/forms.js` 的 `isAnswerCorrect`，不要各写一套）：
+
+| 题型 | 判据 |
+| --- | --- |
+| 单选 / 下拉 / 轮播 / 级联 | 选项值相等 |
+| 多选 / 复选框 | 选项集合相等，勾选顺序无关 |
+| 判断 | 落到「正确 / 错误」选项值上比 |
+| 填空 / 简答 / 电话 / 邮箱 / 日期 | 文本相等，忽略首尾与连续空白、忽略大小写；`3306` 与 `3306.0` 视为同一个 |
+| 排序 | 数组**顺序**逐位相等（不是集合比对——否则把选项全排进去就算对） |
+| 矩阵 | 作答 `{行: 答案}` 与答案数组逐行相等；答案只写一个值时按「每行都是它」 |
+
+交卷后的 `review.items` 除 `answer`（原始数组）外还带 `answerText`（人能读的一行）：
+矩阵会展开成「响应速度：满意 · 稳定性：一般」，排序用 `→` 连接。
+
 `GET /api/public/forms/:id` 返回的 `settings` 已按白名单裁剪：只含外观与开关
 （`submitText`、`buttonText`、`redirectUrl`、`headerImage`、`bgImage`、`bgColor`、`buttonColor`、
 `allowQuery`、`onlyWechat`、`recordWechat`、`needPassword`、`passPercent`、`showResult`、`duration`），
@@ -264,6 +278,8 @@ POST /api/banks/paper
 | 答案 | 正确答案 / answer | `A`、`A,C`、`正确`；越界字母会被剔除并在 `droppedAnswers` 里回报 |
 | 分值 | 分数 / score | 不填按 0，0 分表示不计分（不是「没填」） |
 | 解析 | analysis | 判题后的解析文案 |
+| 标签 | 分类 / tags | 逗号分隔，用于筛题与按标签组卷 |
+| 矩阵行 | 行 / rows | 仅矩阵量表使用，一行一个评价对象（`速度` 换行 `稳定`）；缺这一列时矩阵题导入后只剩列、没有行 |
 
 `skipped` 会逐行给出跳过原因（题干为空、选择题选项不足两个）；`unknownColumns` 列出表头里
 既不是已知字段又有内容的列——静默忽略会让人以为那列导进去了。
