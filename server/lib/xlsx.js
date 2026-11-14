@@ -30,21 +30,16 @@ function cell(ref, value) {
   return `<c r="${ref}" t="inlineStr"><is><t xml:space="preserve">${esc(value)}</t></is></c>`
 }
 
-/**
- * 生成 xlsx。
- * @param {string} sheetName 工作表名（Excel 限制 31 字符且不许出现 : \ / ? * [ ]）
- * @param {Array<Array<any>>} rows 第一行会被冻结并加粗
- */
-export function buildXlsx(sheetName, rows) {
-  const safeName = String(sheetName || 'Sheet1').replace(/[:\\/?*[\]]/g, '_').slice(0, 31) || 'Sheet1'
-  const body = rows.map((row, ri) => {
-    const cells = row.map((v, ci) => cell(colName(ci) + (ri + 1), v)).join('')
-    return `<row r="${ri + 1}">${cells}</row>`
-  }).join('')
-  const lastCol = colName(Math.max(0, (rows[0]?.length || 1) - 1))
-  const sheet = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews><sheetFormatPr defaultRowHeight="18"/><cols>${rows[0]?.map((_, i) => `<col min="${i + 1}" max="${i + 1}" width="${i === 0 ? 22 : 18}" customWidth="1"/>`).join('') || ''}</cols><sheetData>${body}</sheetData><autoFilter ref="A1:${lastCol}${Math.max(1, rows.length)}"/></worksheet>`
-  const files = [
+const sheetName_ = (name) => String(name || 'Sheet1').replace(/[:\\/?*[\]]/g, '_').slice(0, 31) || 'Sheet1'
+
+const sheetHead = (rows0) => `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews><sheetFormatPr defaultRowHeight="18"/><cols>${rows0?.map((_, i) => `<col min="${i + 1}" max="${i + 1}" width="${i === 0 ? 22 : 18}" customWidth="1"/>`).join('') || ''}</cols><sheetData>`
+const sheetRowXml = (row, ri) => `<row r="${ri + 1}">${row.map((v, ci) => cell(colName(ci) + (ri + 1), v)).join('')}</row>`
+const sheetTail = (lastCol, rowCount) => `</sheetData><autoFilter ref="A1:${lastCol}${Math.max(1, rowCount)}"/></worksheet>`
+
+/** 除工作表之外的固定部件 */
+function fixedParts(safeName) {
+  return [
     {
       name: '[Content_Types].xml',
       data: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -69,10 +64,61 @@ export function buildXlsx(sheetName, rows) {
       name: 'xl/styles.xml',
       data: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts><fills count="1"><fill><patternFill patternType="none"/></fill></fills><borders count="1"><border/></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/></cellXfs></styleSheet>`
-    },
-    { name: 'xl/worksheets/sheet1.xml', data: sheet }
+    }
   ]
-  return buildZip(files)
+}
+
+/**
+ * 生成 xlsx。
+ * @param {string} sheetName 工作表名（Excel 限制 31 字符且不许出现 : \ / ? * [ ]）
+ * @param {Array<Array<any>>} rows 第一行会被冻结并加粗
+ */
+export function buildXlsx(sheetName, rows) {
+  const body = rows.map((row, ri) => sheetRowXml(row, ri)).join('')
+  const lastCol = colName(Math.max(0, (rows[0]?.length || 1) - 1))
+  const sheet = sheetHead(rows[0]) + body + sheetTail(lastCol, rows.length)
+  return buildZip([...fixedParts(sheetName_(sheetName)), { name: 'xl/worksheets/sheet1.xml', data: sheet }])
+}
+
+/**
+ * 流式生成 xlsx。
+ *
+ * 用在「行数由数据决定」的导出上（答卷导出：一份问卷几十万份答卷）。
+ * buildXlsx 需要先有一整个二维数组，行一多就同时存在三份完整数据
+ * （行数组、拼好的 XML 字符串、压缩副本），实测 93 万行直接 range error。
+ * 这里改成边遍历边吐块：内存只跟一行有关。
+ *
+ * @param {string} sheetName
+ * @param {AsyncIterable<Array<any>>|Iterable<Array<any>>} rows 第一行是表头
+ * @param {import('node:stream').Writable} out
+ */
+export async function writeXlsxStream(sheetName, rows, out) {
+  const { writeZipStream } = await import('./zip.js')
+  const { Readable } = await import('node:stream')
+
+  // 表头要用来定列宽与 autoFilter，必须先看一行
+  const it = rows[Symbol.asyncIterator] ? rows[Symbol.asyncIterator]() : rows[Symbol.iterator]()
+  const first = await it.next()
+  const head = first.done ? [] : first.value
+  let count = first.done ? 0 : 1
+
+  const parts = fixedParts(sheetName_(sheetName))
+  const sheetNameText = 'xl/worksheets/sheet1.xml'
+  const forward = {
+    async *[Symbol.asyncIterator]() {
+      yield sheetHead(head)
+      let ri = 0
+      if (!first.done) yield sheetRowXml(head, ri++)
+      let r = await it.next()
+      while (!r.done) { yield sheetRowXml(r.value, ri++) ; r = await it.next() }
+      count = ri
+      yield sheetTail(colName(Math.max(0, (head.length || 1) - 1)), ri)
+    }
+  }
+  // 工作表放在最后：Excel 不在乎顺序，但把小的静态部件先写出来，
+  // 客户端能更早开始收内容
+  const entries = [...parts.map(p => ({ name: p.name, data: p.data })), { name: sheetNameText, data: forward }]
+  return writeZipStream(entries, out)
 }
 
 /** 反解 XML 实体 */

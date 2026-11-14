@@ -418,8 +418,12 @@ function stripInlineTag(text, tag) {
   const head = text.slice(0, tag.start)
   const tail = text.slice(tag.end)
   const atEnd = !tail.trim()
+  // 行首也要算：`[单选] 下列哪个不是 HTTP 方法？` 里的标签在开头，
+  // head 是空串，之前只判「前面有标点 / 贴着句尾」时它两条都不满足，
+  // 于是标签被原样留在题干里 —— 用户看到的是每道题都顶着个 `[单选]`。
+  const atStart = !head.trim()
   const standalone = /[\s，。；：、,.;:]/.test(head.slice(-1)) || tag.start >= text.trimEnd().length - tag.end + head.length
-  return (atEnd || standalone ? head + ' ' + tail : text).replace(/\s+/g, ' ')
+  return (atEnd || atStart || standalone ? head + ' ' + tail : text).replace(/\s+/g, ' ').trim()
 }
 
 /** 分节小标题：`第一部分`、`一、`、`（二）`、`三、填空题`、`## 单选` —— 是排版，不是题目 */

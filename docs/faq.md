@@ -61,7 +61,19 @@ EQS 运行时零第三方依赖，`package.json` 的 `dependencies` 是空的，
 ## 集成
 
 **Q：外部系统怎么拉数据？**
-`GET /api/sync/export?formId=1`，带会话 Cookie 或 API Key，返回全量答卷 JSON。
+`GET /api/sync/export?formId=1`，带会话 Cookie 或 API Key，返回答卷 JSON。
+
+**分页拉取**：答卷多的时候不要一次拉完。响应里带 `sinceId` 和 `hasMore`，拿 `sinceId` 当下一次请求的起点：
+
+```
+GET /api/sync/export?formId=1&sinceId=0&limit=1000
+→ { data: [...], sinceId: 1000, hasMore: true }
+
+GET /api/sync/export?formId=1&sinceId=1000&limit=1000
+→ { data: [...], sinceId: 2000, hasMore: false }   // hasMore=false 说明拉完了
+```
+
+`limit` 上限 5000。要「整站搬迁」而不是同步，用备份导出（`/api/backup/export`）。
 
 **Q：WebHook 怎么验签？**
 请求头 `X-EQS-Signature` 是 `sha256=` + HMAC-SHA256(secret, 原始 body)，用配置里的密钥自行计算比对。

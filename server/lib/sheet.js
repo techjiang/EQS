@@ -237,15 +237,14 @@ export function questionsXlsx(questions, sheetName = '题目') {
 }
 
 /** 答卷导出：列来自表单 schema */
-export function submissionsXlsx(form, rows) {
-  const schema = (form.schema || []).filter(f => !['divider', 'richtext', 'html', 'image'].includes(f.type))
-  const head = ['答卷编号', '提交时间', ...schema.map(f => f.label), '得分', '是否通过', '批阅状态']
+/** 答卷的一行 → 表格一行（导出与流式导出的唯一口径，避免两条实现走偏） */
+export function submissionRow(form, schema, r) {
   const cell = (v, f) => {
     if (v === undefined || v === null || v === '') return ''
     if (Array.isArray(v)) {
       if (v.some(x => x && typeof x === 'object')) {
         const labels = Object.fromEntries((f.props?.fields || []).map(sf => [sf.id, sf.label]))
-        return v.map(r => Object.entries(r || {})
+        return v.map(row => Object.entries(row || {})
           .filter(([, x]) => x !== undefined && x !== null && String(x).trim() !== '')
           .map(([k, x]) => `${labels[k] || k}：${x}`).join(' / ')).filter(Boolean).join('\n')
       }
@@ -254,16 +253,24 @@ export function submissionsXlsx(form, rows) {
     if (typeof v === 'object') return JSON.stringify(v)
     return v
   }
+  return [
+    r.public_id || String(r.id),
+    String(r.created_at || '').replace('T', ' ').slice(0, 19),
+    ...schema.map(f => cell(r.data?.[f.id], f)),
+    r.score ?? '',
+    form.kind === 'exam' ? (r.passed === 1 ? '通过' : r.passed === 0 ? '未通过' : '') : '',
+    r.reviewed_at ? '已批阅' : (form.kind === 'exam' ? '待批阅' : '')
+  ]
+}
+
+export function submissionsHead(form) {
+  const schema = (form.schema || []).filter(f => !['divider', 'richtext', 'html', 'image'].includes(f.type))
+  return { schema, head: ['答卷编号', '提交时间', ...schema.map(f => f.label), '得分', '是否通过', '批阅状态'] }
+}
+
+export function submissionsXlsx(form, rows) {
+  const { schema, head } = submissionsHead(form)
   const out = [head]
-  for (const r of rows) {
-    out.push([
-      r.public_id || String(r.id),
-      String(r.created_at || '').replace('T', ' ').slice(0, 19),
-      ...schema.map(f => cell(r.data?.[f.id], f)),
-      r.score ?? '',
-      form.kind === 'exam' ? (r.passed === 1 ? '通过' : r.passed === 0 ? '未通过' : '') : '',
-      r.reviewed_at ? '已批阅' : (form.kind === 'exam' ? '待批阅' : '')
-    ])
-  }
+  for (const r of rows) out.push(submissionRow(form, schema, r))
   return buildXlsx(form.title || '答卷', out)
 }

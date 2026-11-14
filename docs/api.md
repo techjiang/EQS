@@ -257,7 +257,7 @@ POST /api/banks/paper
 | GET | `/api/logs?action=&keyword=&page=&pageSize=` | 审计日志；返回 `{data, actions, total, page, totalPages}`，`actions` 是动作清单（含各自动作条数，供筛选面板） |
 | DELETE | `/api/logs?days=90` | 清理 `days` 天前的日志（最少 7 天，不提供一键清空） |
 | GET | `/api/i18n/:lang`、PUT | 多语言资源 |
-| GET | `/api/sync/export` | 全量数据同步 |
+| GET | `/api/sync/export?formId=1&sinceId=0&limit=1000` | 增量数据同步（游标分页） |
 | GET | `/api/backup/export` | 备份导出 |
 | POST | `/api/backup/import` | 备份导入 |
 | GET | `/api/system/info` | 系统信息 |

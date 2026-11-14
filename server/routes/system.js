@@ -103,16 +103,38 @@ export default function register(r) {
     })
   })
 
-  /** 数据同步 API：全量导出（供外部系统拉取） */
+  /**
+   * 数据同步 API：供外部系统拉取全量答卷。
+   *
+   * 旧实现一次性把所有答卷读进内存再整体序列化——93 万份答卷时响应 486MB，
+   * 内存先涨到 2GB 才发得出第一个字节；对接方那边也是一个 486MB 的字符串，
+   * 绝大多数 HTTP 客户端到这一步就够了。
+   *
+   * 现在改成一行一行往外吐。同时支持游标（`sinceId`）和分批（`limit`），
+   * 让外部系统能「拉一批、处理完、再拉下一批」——这才是同步该有的样子。
+   */
   r.get('/api/sync/export', async (req, res) => {
     const me = requireUser(req)
     if (!can(me, '*')) fail(403, '权限不足')
     const url = new URL(req.url, 'http://x')
     const formId = Number(url.searchParams.get('formId')) || 0
-    const where = formId ? 'AND s.form_id = ?' : ''
-    const args = formId ? [formId] : []
-    const rows = all(`SELECT s.*, f.title AS form_title FROM submissions s JOIN forms f ON f.id = s.form_id WHERE s.deleted_at IS NULL ${where} ORDER BY s.id`, ...args)
-    sendJson(res, 200, { ok: true, data: rows.map(x => ({ ...x, data: JSON.parse(x.data) })) })
+    const sinceId = Number(url.searchParams.get('sinceId')) || 0
+    // 上限 5000：再大就不是同步而是备份了，备份走 /api/backup/export
+    const limit = Math.min(5000, Math.max(1, Number(url.searchParams.get('limit')) || 1000))
+    const where = ['s.deleted_at IS NULL', 's.id > ?']
+    const args = [sinceId]
+    if (formId) { where.push('s.form_id = ?'); args.push(formId) }
+    const rows = all(`SELECT s.*, f.title AS form_title FROM submissions s JOIN forms f ON f.id = s.form_id
+      WHERE ${where.join(' AND ')} ORDER BY s.id LIMIT ?`, ...args, limit)
+    const lastId = rows.length ? rows[rows.length - 1].id : sinceId
+    sendJson(res, 200, {
+      ok: true,
+      data: rows.map(x => ({ ...x, data: JSON.parse(x.data) })),
+      // 有 nextSinceId 就说明后面还有，拿它继续拉；相等说明拉完了
+      sinceId: lastId,
+      hasMore: rows.length === limit,
+      limit
+    })
   })
 
   /** 第三方登录：Google */

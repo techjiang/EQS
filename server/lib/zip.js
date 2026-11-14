@@ -119,3 +119,122 @@ export function extractZip(buf, destDir) {
   }
   return { ok: true }
 }
+
+/* ---------------- 流式打包 ----------------
+ *
+ * 上面的 buildZip 把所有条目在内存里拼成一个 Buffer。对「几百个附件」够用，
+ * 对「几十万行答卷导出 Excel」就是致命问题：工作表 XML 会先变成一整条几 GB 的字符串，
+ * 再和它自己的压缩副本同时待在内存里。实测 93 万份答卷导出，直接抛
+ * `RangeError: Invalid string length`——V8 单个字符串最多 512MB，连机会都不给。
+ *
+ * 所以另开一条流式路径：内容来源可以是文件（边读边压边发），
+ * 只有真正的元数据留在内存里。CRC 与大小在发送过程中累加，
+ * 按 ZIP 规范用「数据描述符」（bit 3）在内容之后补写。
+ */
+const crc32Update = (c, buf) => {
+  for (let i = 0; i < buf.length; i++) c = CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8)
+  return c >>> 0
+}
+
+function zipLocalHeader(nameBuf, method) {
+  const h = Buffer.alloc(30)
+  h.writeUInt32LE(0x04034b50, 0)
+  h.writeUInt16LE(20, 4)
+  // bit 3（数据描述符）+ bit 11（UTF-8 文件名）：大小与 CRC 要等写完才知道
+  h.writeUInt16LE(0x0808, 6)
+  h.writeUInt16LE(method, 8)
+  h.writeUInt16LE(0, 10)
+  h.writeUInt32LE(0, 12)
+  h.writeUInt32LE(0, 16)
+  h.writeUInt32LE(0, 20)
+  h.writeUInt16LE(nameBuf.length, 26)
+  h.writeUInt16LE(0, 28)
+  return h
+}
+
+/**
+ * 流式写 ZIP 到 out（一个 Writable / ServerResponse）。
+ * entries: [{ name, data?: Buffer|string, file?: 路径, compress?: boolean }]
+ *
+ * 慢客户端会把 write() 变成 false 并积压内存，所以每一块都等 drain。
+ * 「导出大到把服务器搞挂」和「导出慢一点」之间，只能选后者。
+ */
+export async function writeZipStream(entries, out) {
+  const { pipeline } = await import('node:stream/promises')
+  const { Transform, Readable, Writable } = await import('node:stream')
+  const fsmod = await import('node:fs')
+  const zlib = await import('node:zlib')
+
+  let offset = 0
+  const send = async (buf) => {
+    offset += buf.length
+    if (!out.write(buf)) await new Promise(resolve => out.once('drain', resolve))
+  }
+
+  const central = []
+  for (const e of entries) {
+    const nameBuf = Buffer.from(e.name, 'utf8')
+    const compress = e.compress !== false
+    const method = compress ? 8 : 0
+    const startOffset = offset
+    await send(zipLocalHeader(nameBuf, method))
+    await send(nameBuf)
+
+    let crc = 0xffffffff
+    let uncomp = 0
+    let comp = 0
+    const meter = new Transform({
+      transform(chunk, _enc, cb) { crc = crc32Update(crc, chunk); uncomp += chunk.length; cb(null, chunk) }
+    })
+    const collector = new Writable({
+      write(chunk, _enc, cb) {
+        comp += chunk.length
+        offset += chunk.length
+        if (out.write(chunk)) return cb()
+        out.once('drain', cb)
+      }
+    })
+    // data 可以是 Buffer / 字符串，也可以是异步迭代器（几十万行的表格就靠这个边生成边压）
+    const isAsync = e.data && typeof e.data[Symbol.asyncIterator] === 'function'
+    const src = e.file
+      ? fsmod.createReadStream(e.file)
+      : isAsync
+        ? Readable.from(e.data)
+        : Readable.from([Buffer.isBuffer(e.data) ? e.data : Buffer.from(String(e.data ?? ''))])
+    await pipeline(src, meter, ...(compress ? [zlib.default.createDeflateRaw()] : []), collector)
+
+    const finalCrc = (crc ^ 0xffffffff) >>> 0
+    const desc = Buffer.alloc(16)
+    desc.writeUInt32LE(0x08074b50, 0)
+    desc.writeUInt32LE(finalCrc, 4)
+    desc.writeUInt32LE(comp, 8)
+    desc.writeUInt32LE(uncomp, 12)
+    await send(desc)
+
+    const cd = Buffer.alloc(46)
+    cd.writeUInt32LE(0x02014b50, 0)
+    cd.writeUInt16LE(20, 4)
+    cd.writeUInt16LE(20, 6)
+    cd.writeUInt16LE(0x0808, 8)
+    cd.writeUInt16LE(method, 10)
+    cd.writeUInt32LE(0, 12)
+    cd.writeUInt32LE(finalCrc, 16)
+    cd.writeUInt32LE(comp, 20)
+    cd.writeUInt32LE(uncomp, 24)
+    cd.writeUInt16LE(nameBuf.length, 28)
+    cd.writeUInt32LE(startOffset, 42)
+    central.push(cd, nameBuf)
+  }
+
+  const centralStart = offset
+  const centralBuf = Buffer.concat(central)
+  await send(centralBuf)
+  const end = Buffer.alloc(22)
+  end.writeUInt32LE(0x06054b50, 0)
+  end.writeUInt16LE(entries.length, 8)
+  end.writeUInt16LE(entries.length, 10)
+  end.writeUInt32LE(centralBuf.length, 12)
+  end.writeUInt32LE(centralStart, 16)
+  await send(end)
+  return { entries: entries.length, bytes: offset }
+}

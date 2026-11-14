@@ -1900,6 +1900,169 @@ try {
     assert(r.json.ok, '父部门跟着可以删除')
   }
 
+  console.log('\n[55] 大数据量：报表/导出/同步不再把整表搬进内存')
+  {
+    // 造一份「答卷有几千份」的表单：不是压测，是为了让「全表读进内存」这类实现暴露出来
+    r = await req('POST', '/api/forms', {
+      title: '冒烟·大体量报表', kind: 'survey',
+      schema: [
+        { id: 'big_city', type: 'radio', label: '城市', options: [{ label: '北京', value: '北京' }, { label: '上海', value: '上海' }] },
+        { id: 'big_nps', type: 'nps', label: '推荐意愿', props: { max: 10, min: 0 } },
+        { id: 'big_tags', type: 'checkbox', label: '标签', options: [{ label: '甲', value: '甲' }, { label: '乙', value: '乙' }] },
+        { id: 'big_num', type: 'number', label: '数字' }
+      ]
+    })
+    const bigId = r.json.id
+    const bigSchema = r.json.data.schema
+    await req('PUT', `/api/forms/${bigId}`, { status: 'published' })
+
+    // 直接走批量导入：一条一条提交几千次太慢，而且这里要验的是读，不是写
+    const N = 3000
+    const items = []
+    for (let i = 0; i < N; i++) {
+      items.push({ data: {
+        [bigSchema[0].id]: i % 2 ? '北京' : '上海',
+        [bigSchema[1].id]: String(i % 11),
+        [bigSchema[2].id]: i % 3 === 0 ? ['甲', '乙'] : ['甲'],
+        [bigSchema[3].id]: String(i % 100)
+      } })
+    }
+    r = await req('POST', `/api/forms/${bigId}/import`, { items })
+    assert(r.json.imported === N, `${N} 份答卷导入成功`, JSON.stringify(r.json))
+
+    // 报表：数字要对得上（不是「跑得快就行」）
+    r = await req('GET', `/api/forms/${bigId}/report`)
+    assert(r.status === 200 && r.json.data.total === N, '大体量表单的报表条数正确', String(r.json?.data?.total))
+    const city = r.json.data.questions.find(q => q.id === bigSchema[0].id)
+    assert(city.series.find(x => x.name === '北京').value === N / 2, '单选分布在全量数据下仍然准确', JSON.stringify(city.series))
+    const nps = r.json.data.questions.find(q => q.id === bigSchema[1].id)
+    assert(nps.series.length === 11 && nps.series[0].name === '0', 'NPS 的 0 档在流式聚合里没丢', JSON.stringify(nps.series.map(x => x.name)))
+    const num = r.json.data.questions.find(q => q.id === bigSchema[3].id)
+    assert(num.min === 0 && num.max === 99, '数值题的极值正确', JSON.stringify([num.min, num.max]))
+
+    // 缓存：同样的数据第二次应该直接命中（不改数据的情况下结果必须完全一致）
+    r = await req('GET', `/api/forms/${bigId}/report`)
+    const city2 = r.json.data.questions.find(q => q.id === bigSchema[0].id)
+    assert(JSON.stringify(city2.series) === JSON.stringify(city.series), '缓存命中的结果与现算一致')
+
+    // 数据一变，缓存必须失效 —— 否则「刚提交的答卷报表里没有」
+    await req('POST', `/api/public/forms/${bigId}/submit`, { data: { [bigSchema[0].id]: '北京', [bigSchema[1].id]: '10' } })
+    r = await req('GET', `/api/forms/${bigId}/report`)
+    assert(r.json.data.total === N + 1, '新增答卷后报表缓存自动失效', String(r.json?.data?.total))
+
+    // 导出：必须是一次能读完的、结构完整的 xlsx
+    const dl = await fetch(BASE + `/api/forms/${bigId}/submissions.xlsx`, { headers: { Cookie: cookie } })
+    assert(dl.ok, '大体量答卷可以导出 Excel', String(dl.status))
+    const buf = Buffer.from(await dl.arrayBuffer())
+    assert(buf.length > 1000, '导出的 Excel 非空', String(buf.length))
+    // 校验是合法 zip：读得出中央目录与工作表
+    const { readZipEntries } = await import('../server/lib/zip.js')
+    const entries = readZipEntries(buf)
+    assert(!!entries, '导出的 xlsx 是结构完整的 zip')
+    const sheet = entries.find(e => e.name === 'xl/worksheets/sheet1.xml')?.data?.toString('utf8') || ''
+    assert(sheet.includes('big_city') === false, '工作表里是题目文字而不是字段 id')
+    assert((sheet.match(/<row /g) || []).length === N + 2, '导出行数 = 表头 + 全部答卷 + 新提交的那份', String((sheet.match(/<row /g) || []).length))
+    assert(sheet.trimEnd().endsWith('</worksheet>'), '工作表 XML 正常收尾（流式写出没有截断）')
+
+    // 同步 API：第一次不给游标，一次最多 limit 条
+    r = await req('GET', `/api/sync/export?formId=${bigId}&limit=100`)
+    assert(r.json.data.length === 100, '同步 API 按 limit 分批返回', String(r.json?.data?.length))
+    assert(r.json.hasMore === true && r.json.sinceId > 0, '同步 API 给出继续拉取的游标', JSON.stringify([r.json?.hasMore, r.json?.sinceId]))
+    const firstId = r.json.sinceId
+    r = await req('GET', `/api/sync/export?formId=${bigId}&sinceId=${firstId}&limit=100`)
+    assert(r.json.data.length === 100 && r.json.data[0].id > firstId, '用游标可以继续拉到下一批', JSON.stringify([r.json?.data?.[0]?.id, firstId]))
+
+    // 待批阅筛选：调查问卷没有主观题，不该把这 3000 份全扫进阅卷队列判一遍
+    r = await req('GET', '/api/submissions?pending=1&formId=' + bigId)
+    assert(r.status === 200 && r.json.total === 0, '问卷答卷不进阅卷队列', JSON.stringify(r.json?.total))
+
+    // 收尾
+    await req('DELETE', `/api/forms/${bigId}`)
+  }
+
+  console.log('\n[56] 底层：语句复用、流式 zip、报表累加器')
+  {
+    const { writeZipStream, readZipEntries } = await import('../server/lib/zip.js')
+    const { writeXlsxStream, readXlsx } = await import('../server/lib/xlsx.js')
+    const { Writable } = await import('node:stream')
+
+    // 流式 zip：内容能被自己的解析器读回（说明中央目录、CRC、数据描述符都对）
+    const collect = () => {
+      const chunks = []
+      const w = new Writable({ write(c, _e, cb) { chunks.push(c); cb() } })
+      return { w, done: async () => { await new Promise(r => w.end(r)); return Buffer.concat(chunks) } }
+    }
+    let box = collect()
+    await writeZipStream([{ name: 'a.txt', data: '你好 EQS' }, { name: 'b.bin', data: Buffer.alloc(2000, 7), compress: false }], box.w)
+    let zipped = await box.done()
+    let back = readZipEntries(zipped)
+    assert(!!back, '流式 zip 能被 readZipEntries 读回（中央目录正确）')
+    assert(back.find(e => e.name === 'a.txt')?.data?.toString() === '你好 EQS', '流式 zip 的中文内容无损')
+    assert(back.find(e => e.name === 'b.bin')?.data?.length === 2000, 'store 模式的条目长度正确')
+
+    // 流式 xlsx：几千行也走这条路径，读回来行数与内容都要对
+    box = collect()
+    async function* bigRows() {
+      yield ['城市', '分数']
+      for (let i = 0; i < 5000; i++) yield [`城市${i}`, String(i)]
+    }
+    await writeXlsxStream('大数据', bigRows(), box.w)
+    zipped = await box.done()
+    const rows = readXlsx(zipped)
+    assert(rows?.length === 5001, '流式写出的 xlsx 行数正确', String(rows?.length))
+    assert(rows?.[1]?.[0] === '城市0' && rows?.[5000]?.[1] === '4999', '流式写出的 xlsx 首尾内容正确', JSON.stringify(rows?.[5000]))
+
+    // 语句缓存：同一个 SQL 反复用，准备好的语句是同一个对象
+    const dbm = await import('../server/lib/db.js')
+    const t0 = Date.now()
+    for (let i = 0; i < 3000; i++) dbm.get('SELECT COUNT(*) c FROM users')
+    const reused = Date.now() - t0
+    assert(reused < 5000, '复用预编译语句后 3000 次查询仍在毫秒级', reused + 'ms')
+
+    // 报表累加器：自由作答的键不能无限增长（否则「内存与答卷数无关」就成了空话）
+    const { createStatsAccumulator } = await import('../server/lib/forms.js')
+    const acc = createStatsAccumulator({ schema: [{ id: 'free', type: 'text', label: '自由填写' }] })
+    for (let i = 0; i < 6000; i++) acc.push({ data: { free: '答案' + i }, created_at: '2026-01-01T00:00:00Z' })
+    const out = acc.result()
+    assert(out.total === 6000, '累加器统计到的条数正确')
+    assert(out.questions[0].count === 6000, '自由作答的计数不受键上限影响')
+    assert(out.questions[0].samples.length <= 20, '自由作答只留 20 个样本，不会越攒越多', String(out.questions[0].samples.length))
+  }
+
+  console.log('\n[57] 文本导入：题型标签写在行首时不该留在题干里')
+  {
+    const { parseTextToFields } = await import('../server/routes/forms.js')
+    const fields = parseTextToFields([
+      '[单选] 下列哪个不是 HTTP 方法？',
+      'A. GET',
+      'B. POST',
+      'C. FETCH',
+      '答案：C',
+      '分值：5',
+      '',
+      '【多选】以下哪些是关系型数据库？',
+      'A. MySQL',
+      'B. Redis',
+      '答案：A',
+      '分值：10',
+      '',
+      '（判断）HTTP 404 表示资源不存在。',
+      '答案：正确',
+      '分值：5',
+      '',
+      '[简答] 简述事件循环（Event Loop）的作用。',
+      '分值：10'
+    ].join('\n'), { defaultScore: 5 })
+    assert(fields.length === 4, '行首标签的四种写法都能各起一道题', String(fields.length))
+    assert(fields.every(f => !/^[\s\[【（(]/.test(f.label)), '题干不再顶着 [单选] / 【多选】 这类标签', JSON.stringify(fields.map(f => f.label)))
+    assert(fields[0].label === '下列哪个不是 HTTP 方法？' && fields[0].type === 'radio', '行首 [单选] 仍被识别成单选', JSON.stringify([fields[0].label, fields[0].type]))
+    assert(fields[1].type === 'checkbox', '行首【多选】识别成多选', fields[1].type)
+    assert(fields[2].type === 'radio' && JSON.stringify(fields[2].answer) === '["正确"]', '行首（判断）仍然拿到「正确答案：正确」', JSON.stringify(fields[2].answer))
+    assert(fields[3].type === 'textarea', '行首 [简答] 识别成多行文本', fields[3].type)
+    assert(fields[3].label.includes('（Event Loop）'), '题干里的英文括号没有被误当题型标签摘掉', fields[3].label)
+    assert(JSON.stringify(fields[0].answer) === '["FETCH"]', '答案字母仍然折成了选项值', JSON.stringify(fields[0].answer))
+  }
+
   console.log('\n[44] 前端静态资源')
 
   for (const p of ['/', '/js/main.js', '/css/app.css', '/js/views/Logs.js', '/assets/eqs-mark.svg', '/vendor/echarts.min.js']) {

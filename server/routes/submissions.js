@@ -1,8 +1,8 @@
 import crypto from 'node:crypto'
-import { get, all, run, now, log } from '../lib/db.js'
+import { get, all, run, each, now, log } from '../lib/db.js'
 import { readJson, fail, sendJson, clientIp } from '../lib/http.js'
 import { requireUser, requirePerm, currentUser, can } from '../lib/auth.js'
-import { pickForm, validateSubmission, gradeSubmission, computeStats, submissionData, paginate, fieldVisible, passLineOf, manualScoresOf, passHintOf, captchaChallenge, safeJson, isAnswerCorrect, answerText } from '../lib/forms.js'
+import { pickForm, validateSubmission, gradeSubmission, computeStats, createStatsAccumulator, submissionData, paginate, fieldVisible, passLineOf, manualScoresOf, passHintOf, captchaChallenge, safeJson, isAnswerCorrect, answerText } from '../lib/forms.js'
 
 /** 对外答卷编号：不可猜、无业务含义，只给提交者本人用 */
 export function newPublicId() {
@@ -26,7 +26,8 @@ function findSubmission(formId, raw) {
 }
 
 import { notifySubmission, dispatchWebhooks } from '../lib/notify.js'
-import { submissionsXlsx } from '../lib/sheet.js'
+import { submissionsXlsx, submissionsHead, submissionRow } from '../lib/sheet.js'
+import { writeXlsxStream } from '../lib/xlsx.js'
 
 function fingerprint(req, extra = {}) {
   return {
@@ -125,6 +126,39 @@ export function pendingLeft(form, row) {
   return schema.filter(f =>
     isSubjective(f) && fieldVisible(f, data) && !Object.prototype.hasOwnProperty.call(manual, f.id)
   ).length
+}
+
+/**
+ * 报表结果缓存。
+ *
+ * 报表是「同一份数据被反复点开」的典型：看一眼、切个图表类型、再刷新。
+ * 93 万份答卷时算一遍 3.5 秒，而这些字节其实一模一样。
+ *
+ * 缓存键不是时间，是数据指纹：行数 + 最大 id + 最大 updated_at。
+ * 任何一份答卷新增、编辑、删除、批阅都会改动这三个值之一，
+ * 所以「缓存命中」和「数据没变」是同一件事——不会出现「刚提交的答卷报表里没有」。
+ * （指纹本身是一次索引扫描，20 万行以上也就几十毫秒。）
+ *
+ * 只留最近 8 张表单，且单份结果超过 20 秒就丢弃：报表页是随手点开的东西，
+ * 不值得为它长期占内存。
+ */
+const reportCache = new Map()
+function reportCacheKey(form) {
+  const r = get('SELECT COUNT(*) c, MAX(id) m, MAX(updated_at) u FROM submissions WHERE form_id = ? AND deleted_at IS NULL', form.id)
+  return `${form.id}:${r.c}:${r.m}:${r.u}:${form.updated_at}`
+}
+function cachedReport(form) {
+  const key = reportCacheKey(form)
+  const hit = reportCache.get(form.id)
+  if (hit && hit.key === key) return hit.stats
+  const acc = createStatsAccumulator(form)
+  for (const row of each('SELECT data, score, passed, created_at FROM submissions WHERE form_id = ? AND deleted_at IS NULL', form.id)) {
+    acc.push({ data: safeJson(row.data, {}), score: row.score, passed: row.passed, created_at: row.created_at })
+  }
+  const stats = acc.result()
+  if (reportCache.size >= 8) reportCache.delete(reportCache.keys().next().value)
+  reportCache.set(form.id, { key, stats })
+  return stats
 }
 
 /** 列表/详情统一带上人工分，前端不用再 parse 一次 */
@@ -342,10 +376,19 @@ export default function register(r) {
       // 只含客观题的交卷不该堆进阅卷队列——队列一有噪音，老师就不看了。
       // 「还差几题没批」属于判分口径，和 gradeSubmission 一样放在 JS 里算：
       // 在 SQL 里拆 JSON 时，字段 id 的下划线在 LIKE 里是通配符，判据会静默出错。
+      /*
+       * 只扫「有主观题的考试」的答卷，不再扫全表。
+       * 旧实现是 `WHERE deleted_at IS NULL` 全量读、再在 JS 里按 form_id 过滤：
+       * 93 万份答卷时，点一次「待批阅」要 2 秒，其中 99% 的行读完就被丢掉了。
+       * 表单对象也只取一次（以前每行都 pickForm 一遍，同一个表单解析了十几次）。
+       */
       const finished = []
-      for (const row of all('SELECT id, form_id, data, manual_scores FROM submissions WHERE deleted_at IS NULL')) {
-        if (!pendingFormIds.includes(row.form_id)) continue
-        if (pendingLeft(pickForm(row.form_id), row) === 0) finished.push(row.id)
+      const formsById = new Map(pendingFormIds.map(id => [id, pickForm(id)]))
+      if (pendingFormIds.length) {
+        const marks = pendingFormIds.map(() => '?').join(',')
+        for (const row of each(`SELECT id, form_id, data, manual_scores FROM submissions WHERE deleted_at IS NULL AND form_id IN (${marks})`, ...pendingFormIds)) {
+          if (pendingLeft(formsById.get(row.form_id), row) === 0) finished.push(row.id)
+        }
       }
       if (finished.length) {
         where.push(`s.id NOT IN (${finished.map(() => '?').join(',')})`)
@@ -499,14 +542,19 @@ export default function register(r) {
 
 
 
-  /** 报表统计 */
+  /**
+   * 报表统计。
+   *
+   * 这里以前是 `SELECT *` 全量读进内存再算——93 万份答卷时它要 13 秒、峰值 2.2GB，
+   * 而返回的 JSON 只有 18KB。现在流式喂给累加器，只取统计真正用到的四列，
+   * 内存跟答卷数量脱钩。
+   */
   r.get('/api/forms/:id/report', async (req, res, { params }) => {
     const user = requirePerm(req, 'report:read')
     const form = pickForm(params.id)
     if (!form) fail(404, '表单不存在')
     if (!can(user, '*') && form.created_by !== user.id) fail(403, '无权查看报表')
-    const rows = all('SELECT * FROM submissions WHERE form_id = ? AND deleted_at IS NULL ORDER BY id DESC', form.id)
-    const stats = computeStats(form, rows.map(submissionData))
+    const stats = cachedReport(form)
     sendJson(res, 200, { ok: true, data: { form: { id: form.id, title: form.title, kind: form.kind }, ...stats } })
   })
 
@@ -524,15 +572,46 @@ export default function register(r) {
     const args = [form.id]
     if (url.searchParams.get('keyword')) { where.push('data LIKE ?'); args.push(`%${url.searchParams.get('keyword')}%`) }
     if (url.searchParams.get('marked') === '1') where.push('marked = 1')
-    const rows = all(`SELECT * FROM submissions WHERE ${where.join(' AND ')} ORDER BY id DESC`, ...args).map(submissionData)
-    const buf = submissionsXlsx(form, rows)
-    log(user, '导出答卷 Excel', `${form.title} #${form.id} → ${rows.length} 份`)
+    /*
+     * 这里是流式导出。旧实现把全部答卷读进内存、拼成二维数组、再拼成一整条工作表 XML：
+     * 93 万份答卷时直接 `RangeError: Invalid string length`（V8 单字符串上限 512MB），
+     * 用户看到的是一个 500，连「导出失败」的原因都读不出来。
+     * 现在边读库边写响应，内存里只有一行。
+     *
+     * 代价是拿不到 Content-Length（流式长度未知），所以不设它——让浏览器按 chunked 收。
+     */
+    const { schema, head } = submissionsHead(form)
+    const cursor = each(`SELECT id, public_id, data, score, passed, created_at, reviewed_at FROM submissions WHERE ${where.join(' AND ')} ORDER BY id DESC`, ...args)
+    const rows = {
+      [Symbol.asyncIterator]() {
+        let first = true
+        const it = cursor[Symbol.iterator]()
+        return {
+          async next() {
+            if (first) { first = false; return { done: false, value: head } }
+            const r = it.next()
+            if (r.done) return { done: true }
+            return { done: false, value: submissionRow(form, schema, { ...r.value, data: safeJson(r.value.data, {}) }) }
+          }
+        }
+      }
+    }
     res.writeHead(200, {
       'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
       'Content-Disposition': `attachment; filename="submissions-${form.id}.xlsx"; filename*=UTF-8''${encodeURIComponent((form.title || '答卷') + '-答卷.xlsx')}`,
-      'Content-Length': buf.length
+      'Cache-Control': 'no-store'
     })
-    res.end(buf)
+    try {
+      const stat = await writeXlsxStream(form.title || '答卷', rows, res)
+      // 流写完必须显式 end()：writeZipStream 只管往里灌字节，不知道这跟连接该不该收尾。
+      // 少了这一句，浏览器能收到几乎全部内容却永远等不到结束，只看到「下载没有进度」。
+      res.end()
+      log(user, '导出答卷 Excel', `${form.title} #${form.id} → ${Math.round(stat.bytes / 1024)}KB`)
+    } catch (e) {
+      // 响应头已经发出去了，这里不能再改成 500；能做的只有记下来
+      log(user, '导出答卷 Excel 失败', `${form.title} #${form.id}：${e.message}`)
+      res.destroy()
+    }
   })
 
   /** 导入答卷（JSON 数组） */

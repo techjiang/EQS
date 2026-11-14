@@ -199,7 +199,7 @@ bash scripts/start.sh                        # 启动即完成迁移
 | `POST` | `/api/public/forms/:id/submit` | 提交答卷 |
 | `GET` | `/api/forms/:id/report` | 报表统计 |
 | `GET` | `/api/submissions?formId=1` | 答卷列表 |
-| `GET` | `/api/sync/export?formId=1` | 全量数据同步导出 |
+| `GET` | `/api/sync/export?formId=1&sinceId=0&limit=1000` | 增量数据同步（游标分页） |
 | `GET` | `/api/backup/export` | 备份导出 |
 | `GET` | `/api/health` | 健康检查 |
 
