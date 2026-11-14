@@ -3512,6 +3512,156 @@ try {
     await req('DELETE', `/api/banks/${bid}/purge`)
   }
 
+  console.log('\n[46] 作答清洗：服务端不再照抄客户端提交的东西')
+  {
+    // 这一批全部是「浏览器正常操作发不出来、但改一下请求就能发」的作答。
+    // 以前服务端只校验必填和几个格式，然后原样入库，于是：
+    // 选项表里没有的值进了报表、评分题 99 分被算进平均分、文本题塞进对象变成 [object Object]。
+    r = await req('POST', '/api/forms', {
+      title: '冒烟·作答清洗', kind: 'survey',
+      schema: [
+        { id: 'c_radio', type: 'radio', label: '单选', options: [{ label: '甲', value: '甲' }, { label: '乙', value: '乙' }] },
+        { id: 'c_check', type: 'checkbox', label: '多选', options: [{ label: '甲', value: '甲' }, { label: '乙', value: '乙' }] },
+        { id: 'c_text', type: 'text', label: '文本' },
+        { id: 'c_rate', type: 'rate', label: '评分', props: { max: 5 } },
+        { id: 'c_slider', type: 'slider', label: '滑块', props: { min: 0, max: 100 } },
+        { id: 'c_switch', type: 'switch', label: '开关' },
+        { id: 'c_date', type: 'date', label: '日期' },
+        { id: 'c_num', type: 'number', label: '数字' },
+        { id: 'c_sort', type: 'sort', label: '排序', options: [{ label: '一', value: '一' }, { label: '二', value: '二' }] },
+        { id: 'c_matrix', type: 'matrix', label: '矩阵', props: { rows: ['价格'] }, options: [{ label: '好', value: '5' }, { label: '差', value: '1' }] }
+      ]
+    })
+    const cleanId = r.json.id
+    await req('PUT', `/api/forms/${cleanId}`, { status: 'published' })
+    const post = (data) => req('POST', `/api/public/forms/${cleanId}/submit`, { data })
+
+    // 1. 单选：label 与 {label,value} 都是历史数据里真实存在的写法，必须收
+    r = await post({ c_radio: '甲' })
+    assert(r.status === 201, '单选取选项值可以提交', String(r.status))
+    let one = await req('GET', `/api/submissions/${r.json.id}`)
+    assert(one.json.data.data.c_radio === '甲', '单选的作答按选项值入库')
+
+    r = await post({ c_radio: { label: '甲', value: '甲' } })
+    assert(r.status === 201 && r.json.id, '历史格式 {label,value} 仍被接受，不是一刀切拒收')
+    one = await req('GET', `/api/submissions/${r.json.id}`)
+    assert(one.json.data.data.c_radio === '甲', '历史格式会被折成选项值，而不是把对象存进库')
+
+    // 2. 选项表里没有的值：必须拒，而且要说是哪一题、收到了什么
+    r = await post({ c_radio: '丙' })
+    assert(r.status === 422, '选项表里没有的值会被拒绝', String(r.status))
+    assert(/单选/.test(r.json.message) && /丙/.test(r.json.message), '拒收时点名是哪一题、收到了什么', r.json.message)
+    assert(r.status === 422 && !/服务器内部错误/.test(r.json.message), '拒收是 422 而不是 500（用户要知道是自己填错了）')
+
+    // 3. 多选：字符串「甲,乙」和对象数组都折成选项值数组
+    r = await post({ c_check: '甲,乙' })
+    one = await req('GET', `/api/submissions/${r.json.id}`)
+    assert(JSON.stringify(one.json.data.data.c_check) === JSON.stringify(['甲', '乙']), '多选的逗号串会拆成数组', JSON.stringify(one.json.data.data.c_check))
+    r = await post({ c_check: [{ label: '乙', value: '乙' }, { label: '甲', value: '甲' }] })
+    one = await req('GET', `/api/submissions/${r.json.id}`)
+    assert(JSON.stringify(one.json.data.data.c_check) === JSON.stringify(['甲', '乙']), '多选按选项表顺序归一，不留客户端给的顺序')
+
+    // 4. 数值类：超范围一律拒
+    r = await post({ c_rate: 99 })
+    assert(r.status === 422, '评分超出上限会被拒绝', String(r.status))
+    r = await post({ c_rate: 4 })
+    assert(r.status === 201, '评分在范围内正常收')
+    r = await post({ c_slider: 99999 })
+    assert(r.status === 422, '滑块超出范围会被拒绝', String(r.status))
+
+    // 5. 形状不对：对象 / 数组 / 超长文本
+    r = await post({ c_text: { a: 1 } })
+    assert(r.status === 422, '文本题塞对象会被拒绝', String(r.status))
+    r = await post({ c_text: ['a', 'b'] })
+    assert(r.status === 422, '文本题塞数组会被拒绝', String(r.status))
+    r = await post({ c_text: '字'.repeat(5001) })
+    assert(r.status === 422 && /上限/.test(r.json.message), '超长文本会被拒绝并说明上限', r.json.message)
+    r = await post({ c_text: '字'.repeat(5000) })
+    assert(r.status === 201, '刚好到上限的长文本仍然可提交')
+
+    // 6. 开关只收真假
+    r = await post({ c_switch: 'yes' })
+    assert(r.status === 422, '开关收到 "yes" 会被拒绝', String(r.status))
+    r = await post({ c_switch: true })
+    assert(r.status === 201, '开关收布尔值正常')
+
+    // 7. 日期：形状对不等于日期存在
+    r = await post({ c_date: '2026-13-45' })
+    assert(r.status === 422, '2026-13-45 会被拒绝（不是"看着像日期"就算）', String(r.status))
+    r = await post({ c_date: '2026-02-31' })
+    assert(r.status === 422, '2026-02-31 会被拒绝（2 月没有 31 号）')
+    r = await post({ c_date: '2026-02-28' })
+    assert(r.status === 201, '真实存在的日期正常通过')
+
+    // 8. 排序必须是一份完整排列
+    r = await post({ c_sort: ['一'] })
+    assert(r.status === 422, '排序题只排一半会被拒绝（不完整的一列不构成顺序）', String(r.status))
+    r = await post({ c_sort: ['二', '一'] })
+    assert(r.status === 201, '排序题排完整顺序正常')
+
+    // 9. 矩阵只留选项表里真有的列值
+    r = await post({ c_matrix: { 价格: '5' } })
+    assert(r.status === 201, '矩阵正常作答通过')
+    r = await post({ c_matrix: { 价格: '9' } })
+    assert(r.status === 422, '矩阵里不存在的档位会被拒绝', String(r.status))
+
+    // 10. 编辑答卷走同一道清洗：否则「先正常交、再改一份脏的」就绕过去了
+    r = await req('POST', `/api/public/forms/${cleanId}/submit`, { data: { c_radio: '乙' } })
+    const editId = r.json.id
+    r = await req('PUT', `/api/submissions/${editId}`, { data: { c_radio: '不存在' } })
+    assert(r.status === 422, '编辑答卷同样拒绝非法作答', String(r.status))
+
+    // 11. 数字题：字符串 '42' 收下并转成数字
+    r = await post({ c_num: '42' })
+    one = await req('GET', `/api/submissions/${r.json.id}`)
+    assert(one.json.data.data.c_num === 42, '数字题的字符串会转成数字入库', JSON.stringify(one.json.data.data.c_num))
+
+    await req('DELETE', `/api/forms/${cleanId}`)
+    await req('DELETE', `/api/forms/${cleanId}/purge`)
+  }
+
+  console.log('\n[47] 批量导入答卷不能"导入成功但全是空的"')
+  {
+    // sanitizeAnswers 返回 {data, dropped}，把它整个喂给 resolveAnswers 时，
+    // 逻辑引擎找不到任何字段 id，产出一份空答卷 —— 库里有行、报表全 0，接口一路回「导入成功」。
+    r = await req('POST', '/api/forms', {
+      title: '冒烟·导入清洗', kind: 'survey',
+      schema: [
+        { id: 'i_city', type: 'radio', label: '城市', options: [{ label: '北京', value: '北京' }, { label: '上海', value: '上海' }] },
+        { id: 'i_num', type: 'number', label: '数字' }
+      ]
+    })
+    const impId = r.json.id
+    await req('PUT', `/api/forms/${impId}`, { status: 'published' })
+    r = await req('POST', `/api/forms/${impId}/import`, {
+      items: [{ data: { i_city: '北京', i_num: '5' } }, { data: { i_city: '上海', i_num: '7' } }]
+    })
+    assert(r.json.imported === 2, '两条答卷都导入成功', JSON.stringify(r.json))
+    r = await req('GET', `/api/forms/${impId}/report`)
+    const impCity = r.json.data.questions.find(q => q.id === 'i_city')
+    assert(impCity.series.find(x => x.name === '北京').value === 1, '导入的作答真的进了库（不是空答卷）', JSON.stringify(impCity.series))
+    const impNum = r.json.data.questions.find(q => q.id === 'i_num')
+    assert(impNum.max === 7 && impNum.min === 5, '导入的数字题算得出极值', JSON.stringify([impNum.min, impNum.max]))
+    await req('DELETE', `/api/forms/${impId}`)
+    await req('DELETE', `/api/forms/${impId}/purge`)
+  }
+
+  console.log('\n[48] 矩阵题：两条轴都得有东西')
+  {
+    // 只给行不给列时，矩阵在页面上就是个空表头：谁也没法作答，而它还占着分值。
+    r = await req('POST', '/api/forms', {
+      title: '冒烟·矩阵列', kind: 'survey',
+      schema: [{ id: 'm_only_rows', type: 'matrix', label: '评价', props: { rows: ['价格', '服务'] } }]
+    })
+    const matrixId = r.json.id
+    r = await req('GET', `/api/forms/${matrixId}`)
+    const mf = r.json.data.schema.find(f => f.id === 'm_only_rows')
+    assert(Array.isArray(mf.options) && mf.options.length > 0, '只给了行的矩阵会自动补上列', JSON.stringify(mf.options))
+    assert(JSON.stringify(mf.props.rows) === JSON.stringify(['价格', '服务']), '已有的行不会被覆盖')
+    await req('DELETE', `/api/forms/${matrixId}`)
+    await req('DELETE', `/api/forms/${matrixId}/purge`)
+  }
+
   console.log('\n[45] 前端静态资源')
 
   for (const p of ['/', '/js/main.js', '/css/app.css', '/js/views/Logs.js', '/js/views/Dicts.js', '/assets/eqs-mark.svg', '/vendor/echarts.min.js']) {

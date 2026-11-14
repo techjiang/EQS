@@ -61,9 +61,17 @@ export function normalizeField(f, i = 0) {
   if (CHOICE.has(type) && out.options.length === 0 && type !== 'matrix') {
     out.options = [{ label: '选项 1', value: '选项 1' }, { label: '选项 2', value: '选项 2' }]
   }
-  if (type === 'matrix' && !out.props.rows) {
-    out.props.rows = ['行 1', '行 2']
-    out.options = [{ label: '很满意', value: '5' }, { label: '满意', value: '4' }, { label: '一般', value: '3' }]
+  /*
+   * 矩阵题的两条轴都要有东西，否则这题在页面上就是一个空表：只有行没有列。
+   * 以前只在 rows 缺失时才补列，于是「给了行、没给列」的矩阵（接口建的、Excel 导入的
+   * 都可能这样）渲染出来表头空着，谁也没法作答，而它还照样占着分值和必填。
+   */
+  if (type === 'matrix') {
+    if (!Array.isArray(out.props.rows) || !out.props.rows.length) out.props.rows = ['行 1', '行 2']
+    out.props.rows = out.props.rows.map((r, i) => String(r ?? `行 ${i + 1}`))
+    if (!out.options.length) {
+      out.options = [{ label: '很满意', value: '5' }, { label: '满意', value: '4' }, { label: '一般', value: '3' }]
+    }
   }
   if (type === 'nps') {
     out.props.max = Number(out.props.max) || 10
@@ -192,6 +200,23 @@ export function captchaChallenge(id) {
  * 隐藏的题不校验（原有行为），被条件跳转跳过的题同样不校验，
  * 动态必填只看当下满足不满足——否则「选了『无』还要填说明」这种题永远提交不上去。
  */
+/** 真实存在的日期（2026-13-45 / 2026-02-31 都算假） */
+function isRealDate(v) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(v).trim())
+  if (!m) return false
+  const [y, mo, d] = [Number(m[1]), Number(m[2]), Number(m[3])]
+  const dt = new Date(Date.UTC(y, mo - 1, d))
+  return dt.getUTCFullYear() === y && dt.getUTCMonth() === mo - 1 && dt.getUTCDate() === d
+}
+
+/** 真实存在的日期时间：日期部分照上面判，时间部分按 HH:mm(:ss) */
+function isRealDateTime(v) {
+  const s2 = String(v).trim().replace(' ', 'T')
+  const i = s2.indexOf('T')
+  if (i < 0) return false
+  return isRealDate(s2.slice(0, i)) && /^([01]\d|2[0-3]):[0-5]\d(:[0-5]\d)?$/.test(s2.slice(i + 1))
+}
+
 export function validateSubmission(schema, rawData) {
   const errors = []
   const flow = buildFlow(schema, rawData)
@@ -211,6 +236,11 @@ export function validateSubmission(schema, rawData) {
     if (f.type === 'email' && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(v))) errors.push(`${f.label} 邮箱格式不正确`)
     if (f.type === 'idcard' && !/^\d{17}[\dXx]$/.test(String(v))) errors.push(`${f.label} 身份证号格式不正确`)
     if (f.type === 'number' && Number.isNaN(Number(v))) errors.push(`${f.label} 必须是数字`)
+    // 日期形状对不等于日期存在：2026-13-45、2026-02-31 都能通过"看着像日期"的判断，
+    // 但它们会被原样存进答卷、原样进报表和导出，事后没人说得清这一天到底发生过什么
+    if (f.type === 'date' && !isRealDate(String(v))) errors.push(`${f.label} 不是有效日期`)
+    if (f.type === 'datetime' && !isRealDateTime(String(v))) errors.push(`${f.label} 不是有效的日期时间`)
+    if (f.type === 'time' && !/^([01]\d|2[0-3]):[0-5]\d(:[0-5]\d)?$/.test(String(v))) errors.push(`${f.label} 不是有效时间`)
     if (f.type === 'subform') {
       // 子字段同样要按自己的规则校验，否则「必填手机号」的子项可以随便填
       const rows = Array.isArray(v) ? v : []
@@ -235,6 +265,259 @@ export function validateSubmission(schema, rawData) {
 }
 
 const isBlank = v => v === undefined || v === null || v === '' || (Array.isArray(v) && v.length === 0)
+
+/* ------------------------------------------------------------------ *
+ * 作答清洗：把「客户端提交的东西」折成这个题型收得下的形状。
+ *
+ * 之前服务端对作答内容完全不设防，只做必填/格式校验，然后原样入库。实测：
+ *   - 单选题可以提交 {label:'甲',value:'甲'} 这个对象，库里就存了个对象；
+ *   - 可以提交一个根本没出现在选项里的值（「完全不存在」），报表里多出一根没人认识
+ *     的柱子，判分时它和任何标准答案都不相等；
+ *   - 评分题提交 99、滑块提交 99999，报表平均分直接被一个人拉爆；
+ *   - 文本题塞对象 / 数组，导出 Excel 时变成 "[object Object]"；
+ *   - 文本题提交 50 万字，一条答卷撑出半个 MB。
+ * 这些都不是「用户手滑」——手滑的人是改地址栏、写脚本、或者拿着 API Key 直接打接口。
+ * 校验只拦必填是不够的，收上来的值必须先变成「这个题型能表达的值」，再谈判分和统计。
+ *
+ * 原则：能确定的脏值就地纠正（选项值对不上 label 就映射），确定不了的宁可清空也不入库。
+ * ------------------------------------------------------------------ */
+
+/** 「看起来填了东西」：空串、空数组、空对象都算没填 */
+function isBlankLike(v) {
+  if (v === undefined || v === null) return true
+  if (typeof v === 'string') return v.trim() === ''
+  if (Array.isArray(v)) return v.filter(x => !isBlankLike(x)).length === 0
+  if (typeof v === 'object') return Object.values(v).every(isBlankLike)
+  return false
+}
+
+/** 单题文本上限：一份问卷的答案不会比这更长，超了就是灌数据 */
+const MAX_TEXT = 5000
+
+/** 干净的标量：字符串去空白，其余（对象/数组）一律视为空。超长的原样返回，由调用方报错 */
+function scalar(v) {
+  if (v === undefined || v === null) return ''
+  if (typeof v === 'object') return ''
+  return String(v).trim()
+}
+
+/** 超长文本单列出来：截断等于替用户改答案，宁可拒收并说清楚上限 */
+function tooLong(v) {
+  const s = scalar(v)
+  return s.length > MAX_TEXT
+}
+
+/** 一个值都没有的题不算「被丢掉」，只有真提交了内容才需要解释 */
+function droppedReason(field, raw) {
+  const type = field.type
+  const opts = Array.isArray(field.options) ? field.options : []
+  if (['radio', 'select', 'carousel', 'checkbox', 'sort', 'matrix', 'cascader'].includes(type)) {
+    const pick = Array.isArray(raw) ? raw : typeof raw === 'object' && raw ? Object.values(raw) : [raw]
+    // 把「收到的值」原样回给提交方：说「作答不完整」等于让人回去猜，
+    // 而标准答案与选项表的对不齐，恰恰是最需要看见具体值的那类问题
+    const shown = pick.map(x => scalar(x) || (x === null || x === undefined ? '' : JSON.stringify(x))).filter(Boolean)
+    if (shown.some(x => !opts.some(o => String(o.value) === x || String(o.label) === x))) {
+      return `「${String(shown.find(x => !opts.some(o => String(o.value) === x || String(o.label) === x))).slice(0, 20)}」不在选项里`
+    }
+    if (type === 'sort' && shown.length !== opts.length) return '排序要把每个选项都排进去'
+    if (type === 'matrix' && shown.length === 0) return '没有有效的行作答'
+    return '作答不完整'
+  }
+  if (type === 'rate' || type === 'nps' || type === 'slider' || type === 'number') return '不是有效数字或超出范围'
+  if (type === 'switch') return '只能是开或关'
+  if (type === 'upload' || type === 'file') return '附件缺少地址'
+  if (type === 'location') return '坐标格式不对'
+  if (type === 'signature') return '签名不是有效的图片'
+  if (type === 'date' || type === 'datetime' || type === 'time') return '不是有效的时间'
+  if (tooLong(raw)) return `超过 ${MAX_TEXT} 字上限`
+  if (typeof raw === 'object') return '答案只能是一段文本'
+  return '作答格式不对'
+}
+
+/** 把客户端给的值按选项表折成「选项值」：认 value、认 label、也认 A/B/C 序号 */
+function toOptionValue(field, raw) {
+  const opts = Array.isArray(field.options) ? field.options : []
+  // {label, value} 这种形状是早期版本自己写进库里的作答格式，历史数据和
+  // 从旧库导入的答卷里都还是它。直接当非法值退回去，等于把老答卷一起判成脏数据。
+  const obj = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : null
+  const key = scalar(obj ? (obj.value ?? obj.label) : raw)
+  if (!key) return ''
+  const hit = opts.find(o => String(o.value) === key) || opts.find(o => String(o.label) === key)
+  if (hit) return String(hit.value)
+  // 「答案写 A」这类字母序号：只在一个字母、且选项数够时才算，避免把真值 'A' 误伤
+  const letters = /^[A-Za-z]$/.test(key) ? opts[key.toUpperCase().charCodeAt(0) - 65] : null
+  return letters ? String(letters.value) : ''
+}
+
+/** 级联存最末一级，且必须是选项表里真有的节点 */
+function toCascadeValue(field, raw) {
+  const opts = Array.isArray(field.options) ? field.options : []
+  const list = Array.isArray(raw) ? raw : [raw]
+  for (let i = list.length - 1; i >= 0; i--) {
+    const key = scalar(list[i])
+    if (!key) continue
+    const hit = opts.find(o => String(o.value) === key) || opts.find(o => String(o.label) === key)
+    if (hit) return String(hit.value)
+  }
+  return ''
+}
+
+/**
+ * 按题型清洗一份作答。返回新对象，不改入参。
+ * 被清空的值等价于「这题没答」——必填校验随即生效，这是对的：
+ * 「提交了一个选项表里没有的值」本来就不该算答过。
+ */
+export function sanitizeAnswers(schema, rawData) {
+  const src = rawData && typeof rawData === 'object' && !Array.isArray(rawData) ? rawData : {}
+  const out = {}
+  /** 提交里有值、但这题型收不下（选项表里没有、超出范围、形状不对）的题 */
+  const dropped = []
+  for (const f of Array.isArray(schema) ? schema : []) {
+    if (DISPLAY_TYPES.has(f.type)) continue
+    if (!Object.prototype.hasOwnProperty.call(src, f.id)) continue
+    const v = src[f.id]
+    const type = f.type
+    switch (type) {
+      case 'radio': case 'select': case 'carousel': {
+        const one = toOptionValue(f, v)
+        if (one) out[f.id] = one
+        break
+      }
+      case 'checkbox': {
+        const list = (Array.isArray(v) ? v : scalar(v) ? String(v).split(/[,，、]/) : [])
+        const picked = [...new Set(list.map(x => toOptionValue(f, x)).filter(Boolean))]
+        // 顺序按选项表来，不留客户端给的顺序：多选是集合，不是序列
+        const order = (Array.isArray(f.options) ? f.options : []).map(o => String(o.value))
+        picked.sort((a, b) => order.indexOf(a) - order.indexOf(b))
+        if (picked.length) out[f.id] = picked
+        break
+      }
+      case 'sort': {
+        const opts = Array.isArray(f.options) ? f.options : []
+        const list = Array.isArray(v) ? v : []
+        const picked = list.map(x => toOptionValue(f, x)).filter(Boolean)
+        // 排序必须是「全部选项的一次排列」：少一个、多一个都不构成有效顺序
+        if (picked.length === opts.length && new Set(picked).size === opts.length) out[f.id] = picked
+        break
+      }
+      case 'cascader': {
+        const one = toCascadeValue(f, v)
+        if (one) out[f.id] = one
+        break
+      }
+      case 'rate': case 'nps': {
+        const n = Number(scalar(v))
+        if (!Number.isFinite(n) || n === 0 && type === 'rate' && scalar(v) === '') break
+        const max = Number(f.props?.max) || (type === 'nps' ? 10 : 5)
+        const min = type === 'nps' ? (f.props?.min === undefined ? 0 : Number(f.props.min) || 0) : 1
+        if (n >= min && n <= max) out[f.id] = n
+        break
+      }
+      case 'slider': {
+        const n = Number(scalar(v))
+        const min = Number(f.props?.min ?? 0)
+        const max = Number(f.props?.max ?? 100)
+        if (Number.isFinite(n) && n >= Math.min(min, max) && n <= Math.max(min, max)) out[f.id] = n
+        break
+      }
+      case 'switch': {
+        // 开关只收真假：'yes'/'no'/'随便一段话' 都不是开关的答案
+        if (v === true || v === 1 || v === '1' || v === 'true') out[f.id] = true
+        else if (v === false || v === 0 || v === '0' || v === 'false') out[f.id] = false
+        break
+      }
+      case 'matrix': {
+        const obj = v && typeof v === 'object' && !Array.isArray(v) ? v : {}
+        const rows = Array.isArray(f.props?.rows) ? f.props.rows : []
+        const clean = {}
+        for (const r of rows) {
+          const one = toOptionValue(f, obj[r])
+          if (one) clean[r] = one
+        }
+        if (Object.keys(clean).length) out[f.id] = clean
+        break
+      }
+      case 'subform': {
+        const fields = Array.isArray(f.props?.fields) ? f.props.fields : []
+        const rows = (Array.isArray(v) ? v : []).map(row => {
+          const clean = {}
+          for (const sf of fields) {
+            const sv = scalar(row?.[sf.id])
+            if (sv) clean[sf.id] = sv
+          }
+          return clean
+        }).filter(row => Object.keys(row).length)
+        if (rows.length) out[f.id] = rows
+        break
+      }
+      case 'upload': case 'file': {
+        // 只留「有 url 的文件描述」，其余键一律不进库：这是唯一允许对象形状的作答
+        const list = (Array.isArray(v) ? v : [v]).map(x => {
+          if (!x || typeof x !== 'object') return null
+          const url = scalar(x.url)
+          if (!url) return null
+          return { id: Number(x.id) || 0, name: scalar(x.name).slice(0, 200), url }
+        }).filter(Boolean)
+        if (list.length) out[f.id] = list
+        break
+      }
+      case 'location': {
+        // 定位只认「纬度,经度」；「定位失败，请检查权限」这句话不该被当成坐标存起来
+        const s2 = scalar(v)
+        if (/^-?\d+(\.\d+)?\s*,\s*-?\d+(\.\d+)?$/.test(s2)) out[f.id] = s2
+        break
+      }
+      case 'signature': {
+        const s2 = scalar(v)
+        // 签名是 dataURL 图片；别的一律不收（最长 200KB，超了就是拿它当图床）
+        if (/^data:image\/[a-z+]+;base64,/i.test(s2) && s2.length <= 200 * 1024) out[f.id] = s2
+        break
+      }
+      case 'number': {
+        const n = Number(scalar(v))
+        if (scalar(v) !== '' && Number.isFinite(n)) out[f.id] = n
+        break
+      }
+      case 'calculate': {
+        // 计算题的值由服务端算，客户端传什么都会被覆盖；这里不留客户端值
+        break
+      }
+      default: {
+        const s2 = scalar(v)
+        // 超长不收：这不是「用户手滑多打几个字」，而是有人拿答卷当备忘录用
+        if (s2 && s2.length <= MAX_TEXT) out[f.id] = s2
+      }
+    }
+    // 有值进来、没有值出去 —— 记下是哪一题、为什么，交给调用方原样告诉提交方
+    if (!Object.prototype.hasOwnProperty.call(out, f.id) && !isBlankLike(v)) {
+      dropped.push({ id: f.id, label: f.label, reason: droppedReason(f, v) })
+    }
+  }
+  return { data: out, dropped }
+}
+
+/**
+ * 提交入口用这一个：清洗 + 把「被丢掉的值」翻译成人能看的话。
+ *
+ * 直接静默丢弃是最坏的处理方式——用户选了一个选项（哪怕是被改过的请求），
+ * 页面上写着「提交成功」，而库里这题是空的，谁也不知道发生了什么。
+ * 所以这里不吞：告诉提交方哪一题的作答不合法。
+ */
+export function sanitizeSubmission(schema, rawData) {
+  const { data, dropped } = sanitizeAnswers(schema, rawData)
+  if (dropped.length) {
+    // 最多列三题：一份问卷里连着报十句，读的人只会关掉页面
+    const shown = dropped.slice(0, 3).map(f => `「${f.label}」${f.reason}`)
+    const more = dropped.length > 3 ? ` 等 ${dropped.length} 题` : ''
+    const e = new Error(shown.join('；') + more)
+    // 与 http.js 的 HttpError 同一个约定：状态码挂在 err.status 上
+    e.status = 422
+    e.dropped = dropped.map(f => f.id)
+    throw e
+  }
+  return data
+}
+
 
 /**
  * 判分口径：全站只此一份。

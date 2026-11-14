@@ -2,7 +2,7 @@ import crypto from 'node:crypto'
 import { get, all, run, each, now, log } from '../lib/db.js'
 import { readJson, fail, sendJson, clientIp } from '../lib/http.js'
 import { requireUser, requirePerm, currentUser, can } from '../lib/auth.js'
-import { pickForm, formWindow, validateSubmission, isSubjective, pendingLeft, gradeSubmission, computeStats, createStatsAccumulator, submissionData, paginate, fieldVisible, passLineOf, manualScoresOf, passHintOf, captchaChallenge, safeJson, isAnswerCorrect, answerText, DISPLAY_TYPES } from '../lib/forms.js'
+import { pickForm, formWindow, validateSubmission, sanitizeAnswers, sanitizeSubmission, isSubjective, pendingLeft, gradeSubmission, computeStats, createStatsAccumulator, submissionData, paginate, fieldVisible, passLineOf, manualScoresOf, passHintOf, captchaChallenge, safeJson, isAnswerCorrect, answerText, DISPLAY_TYPES } from '../lib/forms.js'
 // 逻辑规则只有一份，浏览器与服务端都跑它：页面上看到几道题、哪几道必填，
 // 与服务端判分时的口径必须完全一致
 import { buildFlow, resolveAnswers, renderText } from '../../web/js/flow.js'
@@ -224,7 +224,10 @@ export default function register(r) {
       userId: user?.id || 0,
       password: body.password
     })
-    const resolved = resolveAnswers(form.schema, body.data)
+    // 先把作答折成这个题型收得下的形状，再走逻辑计算与校验。
+    // 顺序不能反：条件逻辑拿脏值判断显隐会得出错误的「哪些题在作答范围内」，
+    // 而校验又是按那个范围做的——脏值会一路带到判分和统计里。
+    const resolved = resolveAnswers(form.schema, sanitizeSubmission(form.schema, body.data))
     const data = resolved.data
     const errors = validateSubmission(form.schema, data)
     if (errors.length) fail(422, errors.join('；'))
@@ -533,7 +536,10 @@ export default function register(r) {
     if (!form) fail(404, '表单不存在')
     requireFormRole(user, form, 'edit')
     const body = await readJson(req)
-    const data = body.data ?? JSON.parse(row.data)
+    // 编辑同样要过清洗：否则「先正常交卷、再回头改一份脏的」就绕过了提交时的全部约束
+    const data = body.data === undefined
+      ? JSON.parse(row.data)
+      : resolveAnswers(form.schema, sanitizeSubmission(form.schema, body.data)).data
     const errors = validateSubmission(form.schema, data)
     if (errors.length) fail(422, errors.join('；'))
     const manual = manualScoresOf(row)
@@ -748,7 +754,7 @@ export default function register(r) {
     let ok = 0, skipped = 0
     const ts = now()
     for (const item of list) {
-      const data = item.data || item
+      const data = resolveAnswers(form.schema, sanitizeAnswers(form.schema, item.data || item).data).data
       if (validateSubmission(form.schema, data).length) { skipped++; continue }
       const g = form.kind === 'exam' ? gradeSubmission(form.schema, data, form.settings) : null
       run('INSERT INTO submissions(form_id, data, score, passed, user_id, ip, device, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?)',

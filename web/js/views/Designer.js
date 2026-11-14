@@ -603,23 +603,60 @@ export default {
             h('button', { onClick: () => removeOption(i) }, '×')
           ]))
         ]) : null,
-        f.type === 'matrix' ? h('div', { class: 'field' }, [
-          h('label', { class: 'flex between' }, [
-            h('span', {}, '矩阵行'),
-            h('button', {
-              class: 'btn ghost sm', onClick: () => {
-                f.props.rows = f.props.rows || []
-                f.props.rows.push('新行 ' + (f.props.rows.length + 1))
-              }
-            }, '+ 添加')
+        f.type === 'matrix' ? h('div', {}, [
+          /*
+           * 矩阵是「行 × 列」的两条轴，但设计器里以前只有行能改、列一处入口都没有：
+           * 新建出来的四档写着「很满意/满意/一般/不满意」，要评的是「从不/偶尔/经常/总是」就改不了，
+           * 于是这题只能将就用别人的措辞。列现在也能增删改。
+           */
+          h('div', { class: 'field' }, [
+            h('label', { class: 'flex between' }, [
+              h('span', {}, '矩阵行'),
+              h('button', {
+                class: 'btn ghost sm', onClick: () => {
+                  f.props.rows = f.props.rows || []
+                  f.props.rows.push('新行 ' + (f.props.rows.length + 1))
+                }
+              }, '+ 添加')
+            ]),
+            (f.props.rows || []).map((rowName, i) => h('div', { class: 'opt-row' }, [
+              h('input', {
+                class: 'input', value: rowName,
+                onInput: e => f.props.rows[i] = e.target.value
+              }),
+              h('button', { onClick: () => {
+                if ((f.props.rows || []).length <= 1) return err('矩阵至少要保留一行')
+                f.props.rows.splice(i, 1)
+              } }, '×')
+            ])),
+            h('div', { class: 'hint' }, '每行是一个被评价的对象，例如「价格」「服务」')
           ]),
-          (f.props.rows || []).map((rowName, i) => h('div', { class: 'opt-row' }, [
-            h('input', {
-              class: 'input', value: rowName,
-              onInput: e => f.props.rows[i] = e.target.value
-            }),
-            h('button', { onClick: () => f.props.rows.splice(i, 1) }, '×')
-          ]))
+          h('div', { class: 'field' }, [
+            h('label', { class: 'flex between' }, [
+              h('span', {}, '矩阵列（评分档位）'),
+              h('button', {
+                class: 'btn ghost sm', onClick: () => {
+                  f.options = f.options || []
+                  const n = f.options.length
+                  // 新增的一列直接给个能看懂的名，别让人对着「选项 5」猜
+                  f.options.push({ label: '档位 ' + (n + 1), value: String(n + 1) })
+                }
+              }, '+ 添加')
+            ]),
+            (f.options || []).map((o, i) => h('div', { class: 'opt-row' }, [
+              h('input', { class: 'input', value: o.label, onInput: e => { o.label = e.target.value } }),
+              // value 是判分口径：文字档位没法比大小，但分值要能对上「第几档」
+              h('input', {
+                class: 'input', style: 'max-width:70px', value: o.value, title: '判分用的值',
+                onInput: e => { o.value = e.target.value }
+              }),
+              h('button', { onClick: () => {
+                if ((f.options || []).length <= 1) return err('矩阵至少要保留一列')
+                f.options.splice(i, 1)
+              } }, '×')
+            ])),
+            h('div', { class: 'hint' }, '左框是显示给填的人的档位文字，右框是判分和统计用的值')
+          ])
         ]) : null,
         ['rate', 'nps', 'slider'].includes(f.type) ? h('div', { class: 'row' }, [
           row('最大/上限', h('input', {

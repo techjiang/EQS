@@ -69,7 +69,10 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' })
     res.end('404 Not Found')
   } catch (err) {
-    const status = err instanceof HttpError ? err.status : 500
+    // 有些模块（如 forms.js 的作答清洗）不在 http.js 里，只按约定挂一个 status；
+    // 只认 instanceof HttpError 的后果是：一个「你的作答不合法」的 422 被报成 500，
+    // 前端拿到的文案变成「服务器内部错误」，用户完全不知道是自己填错了
+    const status = err instanceof HttpError ? err.status : (Number(err?.status) || 500)
     if (status >= 500) {
       console.error('[EQS]', err)
       try { log(null, '服务异常', err.message, clientIp(req)) } catch {}
