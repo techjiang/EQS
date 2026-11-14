@@ -75,7 +75,7 @@ export function blankField(type) {
   const base = {
     id: uid(), type, label: fieldMeta(type).label, required: false,
     placeholder: '', description: '', options: [], defaultValue: '',
-    score: 0, answer: [], analysis: '', logic: [], props: {}
+    score: 0, answer: [], analysis: '', tags: '', logic: [], props: {}
   }
   if (['radio', 'checkbox', 'select', 'sort', 'carousel', 'cascader'].includes(type)) {
     base.options = [

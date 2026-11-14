@@ -140,7 +140,9 @@ table.table{width:100%;border-collapse:collapse;font-size:13.5px}
   .table th.stick-id{background:var(--panel-2)}
   .table .stick-time{position:sticky;left:120px;background:var(--panel);z-index:2;box-shadow:inset -1px 0 0 var(--line)}
   .table th.stick-time{background:var(--panel-2)}
-  .table .stick-score{position:sticky;right:298px;background:var(--panel);z-index:2;box-shadow:inset 1px 0 0 var(--line)}
+  /* 操作列的宽度不是常数：多一个「批阅」按钮、窄屏换行都会变。
+     写死 298px 时，按钮变宽后得分列被压在操作列底下，只剩半截「5」「已」——所以按实测宽度吸。 */
+  .table .stick-score{position:sticky;right:var(--ops-w,298px);background:var(--panel);z-index:2;box-shadow:inset 1px 0 0 var(--line)}
   .table .stick-ops{position:sticky;right:0;background:var(--panel);z-index:2;box-shadow:inset 1px 0 0 var(--line)}
   .table th.stick-score,.table th.stick-ops{background:var(--panel-2)}
   .table tbody tr:hover .stick-id,.table tbody tr:hover .stick-time,

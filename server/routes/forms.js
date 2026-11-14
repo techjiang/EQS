@@ -334,7 +334,7 @@ function pageNumberLike(line) {
 function classifyAsBlockStart(raw) {
   const t = raw.trim()
   if (!t) return 'none'
-  if (/^(?:答案|正确答案|分值|分数|解析|说明|题型|类型)\s*[:：]/.test(t)) return 'meta'
+  if (/^(?:答案|正确答案|分值|分数|解析|说明|题型|类型|标签)\s*[:：]/.test(t)) return 'meta'
   if (inlineTypePrefix(t)) return 'stem'
   if (/^[一二三四五六七八九十]{1,3}\s*、\s*\S/.test(t)) return 'stem'
   // 圈号是选项序号，不是题号：这里不能把「① 苹果」判成一道新题的开头
@@ -349,6 +349,7 @@ function classify(line, state) {
   if (/^(?:答案|正确答案|参考答案)\s*[:：]/.test(t)) return 'meta:answer'
   if (/^(?:分值|分数)\s*[:：]/.test(t)) return 'meta:score'
   if (/^(?:解析|说明|考点)\s*[:：]/.test(t)) return 'meta:analysis'
+  if (/^(?:标签|tag|tags)\s*[:：]/i.test(t)) return 'meta:tags'
   if (/^(?:提示|备注)\s*[:：]/.test(t)) return 'meta:note'
   const typeLine = /^(?:题型|类型|题目类型)\s*[:：]\s*(.+)$/.exec(t)
   if (typeLine) return 'meta:type'
@@ -468,6 +469,20 @@ function finishStem(block) {
   if (hadBang) block.required = true
 }
 
+/**
+ * 标签归一：`,` 还是 `，`、`;` 还是 `、`，用户不会统一；
+ * 存库统一成逗号分隔，方便 LIKE 与拆分，同时去重、去空、限制长度。
+ */
+export function normalizeTags(v) {
+  const list = Array.isArray(v) ? v : String(v ?? '').split(/[,，;；、|\/]+|\s{2,}/)
+  const out = []
+  for (const raw of list) {
+    const t = String(raw ?? '').trim().replace(/^#/, '').slice(0, 24)
+    if (t && !out.includes(t)) out.push(t)
+  }
+  return out.slice(0, 12).join(',')
+}
+
 function toList(v) {
   if (Array.isArray(v)) return v.map(x => String(x).trim()).filter(Boolean)
   return String(v ?? '').split(/[,，;；、\s]+/).map(x => x.trim()).filter(Boolean)
@@ -510,6 +525,7 @@ function makeField({ type, label }) {
     answer: [],
     score: 0,
     analysis: '',
+    tags: '',
     props: {}
   }
 }
@@ -537,6 +553,7 @@ function blockToField(block) {
   field.required = block.required
   field.score = block.score
   field.analysis = block.analysis
+  field.tags = block.tags || ''
   field.props = { ...block.props }
 
   const opts = orderOptions(block.options)
@@ -558,6 +575,19 @@ function blockToField(block) {
 /** 答案落到「当前题型的取值」上：`B` → 第 2 项的 value，`错` → 错误，`对` → 正确 */
 function resolveAnswer(raw, field) {
   if (!raw || !raw.length) return []
+  // 多选题答案常被连着写：「答案：①②」「答案：AB」「答案：ACD」。
+  // toList 按顿号/逗号拆，连写的一串会整体落到「不存在的选项」里被剔除——
+  // 用户看到的是「4 题导入成功」，其中多选题其实一道正确答案都没有。
+  const optCount = (field.options || []).length
+  const lettersOnly = str => [...str].every(ch => { const i = ch.toUpperCase().charCodeAt(0) - 65; return i >= 0 && i < optCount })
+  const tokens = []
+  for (const tok of raw) {
+    if (/^[①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳]{2,}$/.test(tok)) { tokens.push(...[...tok]); continue }
+    // 「AB」拆开只有每个字母都落在选项范围内才拆：不然选项本身叫「MySQL」的题会被拆坏
+    if (/^[A-Za-z]{2,}$/.test(tok) && lettersOnly(tok)) { tokens.push(...[...tok]); continue }
+    tokens.push(tok)
+  }
+  raw = tokens
   const opts = field.options || []
   const isJudge = field.type === 'radio' && opts.length === 2 && opts[0].value === '正确' && opts[1].value === '错误'
   const out = []
@@ -661,6 +691,9 @@ export function parseTextToFields(text, { defaultScore = 0 } = {}) {
       }
       else if (rest === 'score') cur.score = Number(/(\d+(?:\.\d+)?)/.exec(t)?.[1] || 0)
       else if (rest === 'analysis') cur.analysis = t.replace(/^(?:解析|说明|考点)\s*[:：]\s*/, '')
+      // 「标签：数据库,基础」：题库靠标签筛题组卷，文本导入却不认这行，
+      // 于是手写标签只能导完再一条条点开补
+      else if (rest === 'tags') cur.tags = normalizeTags(t.replace(/^(?:标签|tags?)\s*[:：]\s*/i, ''))
       else if (rest === 'note') addToStem(cur, t)
       continue
     }

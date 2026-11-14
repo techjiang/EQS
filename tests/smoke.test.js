@@ -1273,7 +1273,85 @@ try {
     assert(entries?.[0]?.data?.toString() === 'deflated-content', 'deflate 压缩的条目能解开', entries?.[0]?.data?.toString())
   }
 
-  console.log('\n[41] 前端静态资源')
+  console.log('\n[42] 题库标签：写入、筛选、组卷')
+  {
+    r = await req('POST', '/api/banks', { name: '标签题库' })
+    const bankId = r.json.id
+    // 标签从文本导入里来：「标签：」这一行不该变成题干或选项
+    await req('POST', `/api/banks/${bankId}/import-text`, {
+      text: '1. 下列哪个是关系型数据库？ [单选]\nA. Redis\nB. MySQL\n答案：B\n分值：5\n标签：数据库,基础\n\n' +
+            '2. HTTP 404 表示资源不存在。 [判断]\n答案：正确\n分值：5\n标签：网络\n\n' +
+            '3. 下列哪些是水果 [多选]\n① 苹果\n② 香蕉\n③ 铁\n答案：①②\n分值：10\n标签：常识\n\n' +
+            '4. 简述事件循环的作用 [简答]\n分值：0\n标签：JavaScript'
+    })
+    let qs = (await req('GET', `/api/banks/${bankId}/questions`)).json.data
+    assert(qs.length === 4, '文本导入 4 题全部落库', String(qs.length))
+    assert(qs[0].tags === '数据库,基础', '「标签：」行落成标签，且不进题干', JSON.stringify(qs[0]?.tags))
+    assert(qs[1].tags === '网络', '判断题也能带标签', JSON.stringify(qs[1]?.tags))
+    assert(qs[3].score === 0, '分值 0 不再被兜底成 5', String(qs[3]?.score))
+    assert(qs[2].answer.length === 2, '「答案：①②」这类连写答案被拆开', JSON.stringify(qs[2]?.answer))
+
+    qs = (await req('GET', `/api/banks/${bankId}/questions?tag=${encodeURIComponent('网络')}`)).json.data
+    assert(qs.length === 1 && qs[0].tags === '网络', '按标签筛题只出命中标签的题', JSON.stringify(qs.map(q => q.title)))
+
+    qs = (await req('GET', `/api/banks/${bankId}/questions?keyword=${encodeURIComponent('数据库')}`)).json.data
+    assert(qs.some(q => q.tags.includes('数据库')), '题干搜索也能命中标签')
+
+    // item 级 tags 之前被整批丢掉，只剩 body.tags 生效
+    await req('POST', `/api/banks/${bankId}/questions`, {
+      items: [{ label: '带标签的手写题', type: 'radio', options: ['x', 'y'], answer: ['x'], score: 5, tags: '手写' }]
+    })
+    qs = (await req('GET', `/api/banks/${bankId}/questions?tag=${encodeURIComponent('手写')}`)).json.data
+    assert(qs.length === 1, 'items 里每条自带的标签能落库', JSON.stringify(qs.length))
+
+    // 组卷按题型 / 标签，筛不到就明确报错，不静默退回全库
+    r = await req('POST', `/api/banks/${bankId}/paper`, { title: '只有多选', count: 5, types: ['checkbox'] })
+    assert(r.status === 201 && r.json.count === 1, '按题型组卷只抽到该题型', JSON.stringify(r.json))
+    r = await req('POST', `/api/banks/${bankId}/paper`, { title: '只要标签', count: 5, tags: ['网络'] })
+    assert(r.status === 201 && r.json.count === 1, '按标签组卷只抽到命中标签的题', JSON.stringify(r.json))
+    r = await req('POST', `/api/banks/${bankId}/paper`, { title: 'x', count: 5, types: ['signature'] })
+    assert(r.status === 400 && /没有/.test(r.json?.message || ''), '筛不到题型时明确报错，不静默退回全库', String(r.json?.message))
+
+    // 及格线百分比夹在 1..100：180 会让满分也不及格
+    r = await req('POST', `/api/banks/${bankId}/paper`, { title: '及格线', count: 2, passPercent: 180 })
+    assert(r.json.settings.passPercent === 100, '及格线越界被夹到 100', String(r.json.settings?.passPercent))
+
+    // Excel 导出带标签列，判断题如实体现在「题型」列
+    const res = await fetch(BASE + `/api/banks/${bankId}/export.xlsx`, { headers: { Cookie: cookie } })
+    const { readXlsx } = await import('../server/lib/xlsx.js')
+    const rows = readXlsx(Buffer.from(await res.arrayBuffer()))
+    assert(rows[0].includes('标签'), '题库导出带标签列', JSON.stringify(rows[0]))
+    assert(rows.some(row => row[0] === '判断'), '判断题在「题型」列标注为判断，不再是单选', JSON.stringify(rows.map(r2 => r2[0])))
+    assert(rows.some(row => row.includes('数据库,基础')), '标签值原样导出', JSON.stringify(rows.find(r2 => r2.includes('数据库,基础'))))
+
+    // 导出的表能被自己的解析器读回：标签不丢，判断题不退化
+    const { rowsToFields } = await import('../server/lib/sheet.js')
+    const back = rowsToFields(rows)
+    const judgeRow = back.fields.find(f => f.label.includes('HTTP 404'))
+    assert(judgeRow?.declType === 'judge', '导出再导入，判断题仍是判断题', JSON.stringify(judgeRow?.declType))
+    assert(back.fields.some(f => f.tags === '数据库,基础'), '导出再导入，标签不丢', JSON.stringify(back.fields.map(f => f.tags)))
+  }
+
+  console.log('\n[43] 报表：平均值只对分数类题型出现')
+  {
+    const { computeStats } = await import('../server/lib/forms.js')
+    const schema = [
+      { id: 'a', type: 'radio', label: '端口', options: [{ label: '21', value: '21' }, { label: '80', value: '80' }], answer: ['80'], score: 5 },
+      { id: 'b', type: 'nps', label: '推荐意愿', options: [], answer: [], score: 0, props: { max: 10, min: 0 } }
+    ]
+    const stats = computeStats({ schema }, [
+      { data: { a: '21', b: '9' }, score: 0, passed: 0, created_at: '2026-01-01T00:00:00Z' },
+      { data: { a: '80', b: '10' }, score: 5, passed: 1, created_at: '2026-01-01T00:00:00Z' }
+    ])
+    const radio = stats.questions.find(q => q.id === 'a')
+    assert(radio.average === undefined, '单选题不再给出「平均 148.63」这种荒唐平均值', JSON.stringify(radio.average))
+    assert(radio.series.length === 2, '单选题的选项分布仍在', JSON.stringify(radio.series))
+    const nps = stats.questions.find(q => q.id === 'b')
+    assert(nps.average === 9.5, 'NPS 仍然算平均分', String(nps.average))
+  }
+
+  console.log('\n[44] 前端静态资源')
+
   for (const p of ['/', '/js/main.js', '/css/app.css', '/assets/eqs-mark.svg', '/vendor/echarts.min.js']) {
     const res = await fetch(BASE + p)
     assert(res.ok, `静态资源可访问：${p}`)

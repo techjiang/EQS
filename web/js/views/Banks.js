@@ -18,7 +18,10 @@ export default {
     const importTab = ref('text')
     const editQ = ref(null)
     const paperOpen = ref(false)
-    const paper = ref({ title: '', count: 10, duration: 60 })
+    const paper = ref({ title: '', count: 10, duration: 60, passPercent: 60, types: [], tags: [] })
+    // 题目筛选：题干/标签关键字 + 标签点选。标签是纯文本字段，前端拆成词片展示
+    const qKeyword = ref('')
+    const qTag = ref('')
 
     const load = async () => {
       try {
@@ -30,8 +33,31 @@ export default {
 
     const select = async (b) => {
       active.value = b
-      const r = await api.get(`/api/banks/${b.id}/questions`)
+      qKeyword.value = ''
+      qTag.value = ''
+      await loadQuestions()
+      refreshTags()
+    }
+
+    const loadQuestions = async () => {
+      if (!active.value) return
+      const qs = new URLSearchParams()
+      if (qKeyword.value.trim()) qs.set('keyword', qKeyword.value.trim())
+      if (qTag.value) qs.set('tag', qTag.value)
+      const r = await api.get(`/api/banks/${active.value.id}/questions${qs.toString() ? '?' + qs : ''}`)
       questions.value = r.data
+    }
+
+    /** 全量题目里出现过的标签，按出现次数排前面，点一下就筛 */
+    const allTags = ref([])
+    const refreshTags = async () => {
+      if (!active.value) { allTags.value = []; return }
+      const r = await api.get(`/api/banks/${active.value.id}/questions`)
+      const count = new Map()
+      for (const q of r.data) {
+        for (const t of String(q.tags || '').split(',').map(x => x.trim()).filter(Boolean)) count.set(t, (count.get(t) || 0) + 1)
+      }
+      allTags.value = [...count.entries()].sort((a, b) => b[1] - a[1]).map(([name, n]) => ({ name, n }))
     }
 
     onMounted(load)
@@ -63,14 +89,15 @@ export default {
         else await api.post(`/api/banks/${active.value.id}/questions`, { ...editQ.value, title: editQ.value.label })
         ok('题目已保存')
         editQ.value = null
-        select(active.value)
+        await loadQuestions()
+        refreshTags()
         load()
       } catch (e) { err(e.message) }
     }
 
     const delQuestion = async (q) => {
       if (!await confirmBox('删除这道题？可在「回收中心 · 题目」里恢复。')) return
-      try { await api.del(`/api/questions/${q.id}`); select(active.value); load() } catch (e) { err(e.message) }
+      try { await api.del(`/api/questions/${q.id}`); await loadQuestions(); refreshTags(); load() } catch (e) { err(e.message) }
     }
 
     const doImport = async () => {
@@ -79,7 +106,8 @@ export default {
         ok(`已导入 ${r.imported} 道题` + (r.droppedAnswers?.length ? `；${r.droppedAnswers.length} 道题的答案不在选项里，已清空待修正：${r.droppedAnswers.slice(0, 2).join('、')}` : ''))
         importOpen.value = false
         importText.value = ''
-        select(active.value)
+        await loadQuestions()
+        refreshTags()
         load()
       } catch (e) { err(e.message) }
     }
@@ -93,7 +121,8 @@ export default {
         const unknown = r.unknownColumns?.length ? `；未识别的列已忽略：${r.unknownColumns.join('、')}` : ''
         ok(`已从 Excel 导入 ${r.imported} 道题${skipped}${unknown}` + (r.droppedAnswers?.length ? `；${r.droppedAnswers.length} 道题的答案不在选项里，已清空待修正` : ''))
         importOpen.value = false
-        select(active.value)
+        await loadQuestions()
+        refreshTags()
         load()
       } catch (e) { err(e.message) }
     }
@@ -101,6 +130,26 @@ export default {
     const downloadTemplate = () => api.download('/api/banks/template.xlsx', 'EQS 题库导入模板.xlsx')
       .then(() => ok('模板已下载，填好后用「Excel 导入」上传'))
       .catch(e => err(e.message))
+
+    /** 组卷筛选题型：与题库题型口径一致 */
+    const paperTypes = ['radio', 'checkbox', 'text', 'textarea']
+    const togglePaperType = (t) => {
+      const set = new Set(paper.value.types || [])
+      set.has(t) ? set.delete(t) : set.add(t)
+      paper.value.types = [...set]
+    }
+    const togglePaperTag = (t) => {
+      const set = new Set(paper.value.tags || [])
+      set.has(t) ? set.delete(t) : set.add(t)
+      paper.value.tags = [...set]
+    }
+    const tagsOf = (q) => String(q.tags || '').split(',').map(x => x.trim()).filter(Boolean)
+    /** 题库把判断题存成 radio + 正确/错误，列表里照 type 显示就是「单选题」——学生看不出这是判断 */
+    const isJudgeQ = (q) => {
+      const vals = (q.options || []).map(o => String(o.value ?? o.label))
+      return q.type === 'radio' && vals.length === 2 && vals.includes('正确') && vals.includes('错误')
+    }
+    const typeLabelOf = (q) => (isJudgeQ(q) ? '判断题' : fieldMeta(q.type).label)
 
     const makePaper = async () => {
       try {
@@ -155,7 +204,7 @@ export default {
                     .then(() => ok('已导出 Excel')).catch(e => err(e.message))
                 }, '导出 Excel'),
                 h('button', { class: 'btn sm', onClick: addQuestion }, '+ 添加题目'),
-                h('button', { class: 'btn sm', onClick: () => paperOpen.value = true }, '智能组卷'),
+                h('button', { class: 'btn sm', onClick: () => { paper.value = { ...paper.value, title: active.value?.name + ' - 试卷' }; paperOpen.value = true } }, '智能组卷'),
                 h('button', { class: 'btn sm primary', onClick: () => practice('sequence') }, '开始刷题')
               ])
             ]),
@@ -167,7 +216,29 @@ export default {
             ])
           ]),
           h('div', { class: 'card', style: 'overflow:hidden' }, [
-            h('div', { class: 'card-h' }, [h('h3', {}, `题目 (${questions.value.length})`)]),
+            h('div', { class: 'card-h' }, [
+              h('h3', {}, `题目 (${questions.value.length})`),
+              h('div', { class: 'flex', style: 'gap:6px' }, [
+                h('input', {
+                  class: 'input', style: 'max-width:200px;height:30px',
+                  placeholder: '搜题干或标签', value: qKeyword.value,
+                  onInput: e => qKeyword.value = e.target.value,
+                  onKeydown: e => { if (e.key === 'Enter') loadQuestions() }
+                }),
+                h('button', { class: 'btn sm', onClick: loadQuestions }, '搜索'),
+                (qKeyword.value || qTag.value) ? h('button', {
+                  class: 'btn sm ghost',
+                  onClick: () => { qKeyword.value = ''; qTag.value = ''; loadQuestions() }
+                }, '清空') : null
+              ])
+            ]),
+            // 标签云：点一片就筛，再点取消。标签不显示出来，用户根本不知道有这东西
+            allTags.value.length ? h('div', {
+              class: 'flex wrap', style: 'gap:6px;padding:0 16px 10px'
+            }, allTags.value.map(t => h('button', {
+              class: ['btn', 'sm', qTag.value === t.name ? 'primary' : ''],
+              onClick: () => { qTag.value = qTag.value === t.name ? '' : t.name; loadQuestions() }
+            }, `${t.name} · ${t.n}`))) : null,
             questions.value.length ? h('div', { style: 'padding:8px 16px 16px' }, questions.value.map((q, i) => h('div', {
               style: 'padding:12px 0;border-bottom:1px solid var(--line-2)'
             }, [
@@ -175,11 +246,15 @@ export default {
                 h('div', { style: 'flex:1;min-width:0' }, [
                   h('div', { style: 'font-weight:540;margin-bottom:4px' }, `${i + 1}. ${q.title}`),
                   h('div', { class: 'small muted' }, [
-                    fieldMeta(q.type).label,
+                    typeLabelOf(q),
                     q.options.length ? ` · ${q.options.length} 个选项` : '',
                     q.answer.length ? ` · 答案：${q.answer.join(',')}` : '',
                     ` · ${q.score} 分`
-                  ])
+                  ]),
+                  tagsOf(q).length ? h('div', { class: 'flex wrap', style: 'gap:4px;margin-top:6px' }, tagsOf(q).map(t => h('span', {
+                    class: 'tag', style: 'cursor:pointer',
+                    onClick: () => { qTag.value = qTag.value === t ? '' : t; loadQuestions() }
+                  }, '#' + t))) : null
                 ]),
                 h('div', { class: 'flex', style: 'gap:4px' }, [
                   h('button', { class: 'btn ghost sm', onClick: () => editQ.value = { ...q, label: q.title } }, '编辑'),
@@ -219,14 +294,14 @@ export default {
             }, 'Excel 表格')
           ]),
           importTab.value === 'text' ? [
-            h('div', { class: 'hint mb' }, '格式：每题以「1.」「一、」开头，方括号写题型，选项以「A.」「①」开头，可写「答案：A」「分值：5」「解析：…」；判断题答案写「对 / 错」即可。'),
+            h('div', { class: 'hint mb' }, '格式：每题以「1.」「一、」开头，方括号写题型，选项以「A.」「①」开头，可写「答案：A」「分值：5」「解析：…」「标签：数据库,基础」；判断题答案写「对 / 错」即可。'),
             h('textarea', {
               class: 'textarea mono', style: 'min-height:260px', value: importText.value,
-              placeholder: '1. 下列哪个是关系型数据库？ [单选]\nA. Redis\nB. MySQL\nC. MongoDB\n答案：B\n分值：5\n解析：MySQL 是关系型数据库。',
+              placeholder: '1. 下列哪个是关系型数据库？ [单选]\nA. Redis\nB. MySQL\nC. MongoDB\n答案：B\n分值：5\n解析：MySQL 是关系型数据库。\n标签：数据库,基础',
               onInput: e => importText.value = e.target.value
             })
           ] : [
-            h('div', { class: 'hint mb' }, '表格列依次是「题型 / 题干 / 选项 / 答案 / 分值 / 解析」，顺序无所谓——有表头就按列名认。选项在单元格里一行一个（A.苹果 换行 B.香蕉），答案写 A、A,C 或 正确。'),
+            h('div', { class: 'hint mb' }, '表格列依次是「题型 / 题干 / 选项 / 答案 / 分值 / 解析 / 标签」，顺序无所谓——有表头就按列名认。选项在单元格里一行一个（A.苹果 换行 B.香蕉），答案写 A、A,C 或 正确。'),
             h('div', { class: 'flex', style: 'gap:8px;align-items:center;flex-wrap:wrap' }, [
               h('label', { class: 'btn primary' }, [
                 '选择 .xlsx 文件',
@@ -252,12 +327,30 @@ export default {
             class: 'input', value: paper.value.title || active.value?.name + ' - 试卷',
             onInput: e => paper.value.title = e.target.value
           })]),
+          h('div', { class: 'field' }, [
+            h('label', {}, '限题型（不选则不限）'),
+            h('div', { class: 'flex wrap', style: 'gap:6px' }, paperTypes.map(t => h('button', {
+              class: ['btn', 'sm', (paper.value.types || []).includes(t) ? 'primary' : ''],
+              onClick: () => togglePaperType(t)
+            }, fieldMeta(t).label)))
+          ]),
+          allTags.value.length ? h('div', { class: 'field' }, [
+            h('label', {}, '限标签（不选则不限，多选为「同时满足」）'),
+            h('div', { class: 'flex wrap', style: 'gap:6px' }, allTags.value.map(t => h('button', {
+              class: ['btn', 'sm', (paper.value.tags || []).includes(t.name) ? 'primary' : ''],
+              onClick: () => togglePaperTag(t.name)
+            }, `${t.name} · ${t.n}`)))
+          ]) : null,
           h('div', { class: 'row' }, [
             h('div', { class: 'field' }, [h('label', {}, '抽题数量'), h('input', {
               class: 'input', type: 'number', value: paper.value.count, onInput: e => paper.value.count = Number(e.target.value)
             })]),
             h('div', { class: 'field' }, [h('label', {}, '考试时长（分钟）'), h('input', {
               class: 'input', type: 'number', value: paper.value.duration, onInput: e => paper.value.duration = Number(e.target.value)
+            })]),
+            h('div', { class: 'field' }, [h('label', {}, '及格线（%）'), h('input', {
+              class: 'input', type: 'number', min: 1, max: 100, value: paper.value.passPercent ?? 60,
+              onInput: e => paper.value.passPercent = Number(e.target.value)
             })])
           ])
         ],
@@ -277,7 +370,12 @@ export default {
               onChange: e => {
                 const t = e.target.value
                 const base = blankField(t)
-                editQ.value = { ...base, id: editQ.value.id, label: editQ.value.label, score: editQ.value.score, answer: [] }
+                // 换题型不该把已经写好的标签/解析一起清掉
+                editQ.value = {
+                  ...base, id: editQ.value.id, label: editQ.value.label,
+                  score: editQ.value.score, analysis: editQ.value.analysis,
+                  tags: editQ.value.tags || '', answer: []
+                }
               }
             }, ['radio', 'checkbox', 'text', 'textarea', 'select'].map(t => h('option', { value: t }, fieldMeta(t).label)))]),
             h('div', { class: 'field' }, [h('label', {}, '分值'), h('input', {
@@ -339,9 +437,15 @@ export default {
               }
             })
           ]) : null,
-          h('div', { class: 'field' }, [h('label', {}, '答案解析'), h('textarea', {
-            class: 'textarea', style: 'min-height:60px', value: editQ.value.analysis, onInput: e => editQ.value.analysis = e.target.value
-          })])
+          h('div', { class: 'row' }, [
+            h('div', { class: 'field' }, [h('label', {}, '标签（逗号分隔，用于筛题组卷）'), h('input', {
+              class: 'input', placeholder: '例如：数据库,基础', value: editQ.value.tags || '',
+              onInput: e => editQ.value.tags = e.target.value
+            })]),
+            h('div', { class: 'field' }, [h('label', {}, '答案解析'), h('textarea', {
+              class: 'textarea', style: 'min-height:60px', value: editQ.value.analysis, onInput: e => editQ.value.analysis = e.target.value
+            })])
+          ])
         ],
         footer: [h('button', { class: 'btn', onClick: () => editQ.value = null }, '取消'), h('button', { class: 'btn primary', onClick: saveQuestion }, '保存')]
       }) : null

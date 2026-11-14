@@ -1,4 +1,4 @@
-import { h, ref, onMounted, computed } from '/vendor/vue.esm.js'
+import { h, ref, onMounted, onBeforeUnmount, computed, nextTick, watch } from '/vendor/vue.esm.js'
 import { api } from '../api.js'
 import { route } from '../router.js'
 import { ok, err, confirmBox, fmtDate, Empty, Modal, Pagination } from '../ui.js'
@@ -78,7 +78,26 @@ export default {
       } catch (e) { err(e.message) } finally { loading.value = false }
     }
 
-    onMounted(async () => { await loadForms(); await load() })
+    /**
+     * 吸右侧的两列要按实测宽度对齐：操作列多一个按钮就宽一截，
+     * CSS 里写死 298px 时它会盖住「得分」列，只剩半截数字。
+     */
+    const syncOpsWidth = () => {
+      const ops = document.querySelector('.table th.stick-ops')
+      if (!ops) return
+      const w = Math.ceil(ops.getBoundingClientRect().width)
+      if (w > 0) document.documentElement.style.setProperty('--ops-w', w + 'px')
+    }
+    watch([rows, allMode], async () => { await nextTick(); syncOpsWidth() })
+
+    onMounted(async () => {
+      await loadForms()
+      await load()
+      window.addEventListener('resize', syncOpsWidth)
+      await nextTick()
+      syncOpsWidth()
+    })
+    onBeforeUnmount(() => window.removeEventListener('resize', syncOpsWidth))
 
     const switchForm = async () => {
       page.value = 1

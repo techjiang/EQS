@@ -9,7 +9,7 @@ import { buildXlsx, readXlsx } from './xlsx.js'
  * 列可以按表头名认（不要求顺序），也可以没有表头（按上面的顺序读）。
  */
 
-const HEADERS = ['题型', '题干', '选项', '答案', '分值', '解析']
+const HEADERS = ['题型', '题干', '选项', '答案', '分值', '解析', '标签']
 
 /** 中英文表头别名，兼容用户自己攒的模板 */
 const ALIAS = {
@@ -18,7 +18,9 @@ const ALIAS = {
   options: ['选项', '选项内容', 'options', 'option'],
   answer: ['答案', '正确答案', 'answer'],
   score: ['分值', '分数', '分', '得分', 'score', 'point', 'points'],
-  analysis: ['解析', '答案解析', 'analysis', 'explain']
+  analysis: ['解析', '答案解析', 'analysis', 'explain'],
+  // 标签放最后：老表格没有这一列照样能导，新表格多一列也不会顶掉前六列的位置
+  tags: ['标签', '分类', '知识点', 'tags', 'tag']
 }
 
 const TYPE_ALIAS = {
@@ -92,7 +94,7 @@ export function rowsToFields(rows) {
   let map = headerMap(rows[0])
   let start = 0
   if (map) start = 1
-  else map = { type: 0, label: 1, options: 2, answer: 3, score: 4, analysis: 5 }
+  else map = { type: 0, label: 1, options: 2, answer: 3, score: 4, analysis: 5, tags: 6 }
 
   const fields = []
   const skipped = []
@@ -131,11 +133,15 @@ export function rowsToFields(rows) {
       label,
       options: options.map(o => ({ label: o, value: o })),
       score: scoreRaw === '' ? 0 : Number(scoreRaw),
-      analysis: at('analysis')
+      analysis: at('analysis'),
+      tags: at('tags')
     })
-    if (type === 'judge') {
+    // 表里写「单选」、选项却是「正确/错误」，本质就是判断题；
+    // 不认这层，导出来再导回去题型会一路显示成「单选」，判断和单选就分不开了
+    if (type === 'judge' || isJudgeOptions(field.options)) {
       field.type = 'radio'
       field.options = [{ label: '正确', value: '正确' }, { label: '错误', value: '错误' }]
+      field.declType = 'judge'
     }
     field.answer = splitAnswer(answerRaw)
     if (field.score < 0 || !Number.isFinite(field.score)) field.score = 0
@@ -174,16 +180,26 @@ export function parseXlsx(buf) {
 export function questionsToRows(questions) {
   const rows = [HEADERS]
   for (const q of questions) {
+    const opts = (q.options || []).map(o => String(o.label ?? o.value))
     rows.push([
-      q.type === 'judge' ? '判断' : typeName(q.type),
+      // 题库把判断题存成 radio + 正确/错误，导出照 type 写就是「单选」，
+      // 人看着像自己写错了题型，导回去也再没有人认得出这是判断
+      q.type === 'judge' || isJudgeOptions(opts) ? '判断' : typeName(q.type),
       q.title,
       (q.options || []).map((o, i) => `${String.fromCharCode(65 + i)}.${o.label ?? o.value}`).join('\n'),
       (q.answer || []).join(','),
       Number(q.score) || 0,
-      q.analysis || ''
+      q.analysis || '',
+      q.tags || ''
     ])
   }
   return rows
+}
+
+/** 选项恰好是「正确/错误」两个：这就是判断题 */
+export function isJudgeOptions(options) {
+  const list = (options || []).map(o => String(o?.value ?? o?.label ?? o))
+  return list.length === 2 && list.includes('正确') && list.includes('错误')
 }
 
 const TYPE_NAME = {
@@ -197,10 +213,10 @@ function typeName(t) { return TYPE_NAME[t] || t }
 export function templateXlsx() {
   return buildXlsx('题目', [
     HEADERS,
-    ['单选', 'EQS 内置的数据库是？', 'A.MySQL\nB.SQLite 内嵌\nC.Oracle', 'B', 5, '内置 SQLite，开箱即用'],
-    ['多选', '以下哪些是 EQS 的题型？', 'A.单选\nB.矩阵量表\nC.子表单', 'A,B,C', 10, ''],
-    ['判断', 'EQS 支持私有化部署。', '', '正确', 5, ''],
-    ['简答', '简述你对条件显隐的理解。', '', '', 10, '主观题，交卷后人工批阅']
+    ['单选', 'EQS 内置的数据库是？', 'A.MySQL\nB.SQLite 内嵌\nC.Oracle', 'B', 5, '内置 SQLite，开箱即用', '数据库,基础'],
+    ['多选', '以下哪些是 EQS 的题型？', 'A.单选\nB.矩阵量表\nC.子表单', 'A,B,C', 10, '', '题型'],
+    ['判断', 'EQS 支持私有化部署。', '', '正确', 5, '', '部署'],
+    ['简答', '简述你对条件显隐的理解。', '', '', 10, '主观题，交卷后人工批阅', '表单逻辑']
   ])
 }
 

@@ -28,6 +28,8 @@ export function normalizeField(f, i = 0) {
     score: Number(f.score) || 0,
     answer: Array.isArray(f.answer) ? f.answer : (f.answer ? [f.answer] : []),
     analysis: f.analysis || '',
+    // 标签只对题库/组卷有意义，但 schema 是前后端共用的结构，顺手带上，避免题型之外再开一条通道
+    tags: typeof f.tags === 'string' ? f.tags : Array.isArray(f.tags) ? f.tags.join(',') : '',
     logic: Array.isArray(f.logic) ? f.logic : [],
     props: typeof f.props === 'object' && f.props ? f.props : {}
   }
@@ -277,7 +279,12 @@ export function computeStats(form, submissions) {
         optionPairs = Array.from({ length: Math.max(0, max - from + 1) }, (_, i) => ({ name: String(from + i), value: counts[String(from + i)] || 0 }))
       }
       item.series = optionPairs
-      item.average = values.length ? Math.round((values.reduce((a, b) => a + (Number(flat(b)) || 0), 0) / values.length) * 100) / 100 : 0
+      // 平均值只对「值本身就是分数」的题型有意义：评分 / NPS / 开关。
+      // 单选题拿它求平均是荒唐的——选项写 21/80/443 的端口题会算出「平均 148.63」，
+      // 多选题把数组拼成字符串后算出来更没意义。
+      if (['rate', 'nps', 'slider', 'number', 'switch'].includes(f.type)) {
+        item.average = values.length ? Math.round((values.reduce((a, b) => a + (Number(flat(b)) || 0), 0) / values.length) * 100) / 100 : 0
+      }
     } else if (f.type === 'matrix') {
       item.series = (f.props?.rows || []).map(row => {
         const rowVals = values.map(v => v?.[row]).filter(Boolean)

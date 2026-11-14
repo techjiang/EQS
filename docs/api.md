@@ -109,8 +109,8 @@ PUT /api/submissions/:id/review
 | --- | --- | --- |
 | GET | `/api/banks` | 题库列表 |
 | POST | `/api/banks` | 新建题库 `{name, description?}` |
-| GET | `/api/banks/:id/questions` | 题目列表 |
-| POST | `/api/banks/:id/questions` | 新增题目 |
+| GET | `/api/banks/:id/questions?keyword=&type=&tag=` | 题目列表；`keyword` 同时匹配题干与标签，`tag` 按标签整词匹配 |
+| POST | `/api/banks/:id/questions` | 新增题目（支持 `items: []` 批量，每条可带自己的 `tags`） |
 | POST | `/api/banks/:id/import` | `{text}` 文本批量导入 |
 | POST | `/api/banks/paper` | 多题库混合组卷，见下 |
 
@@ -118,7 +118,8 @@ PUT /api/submissions/:id/review
 
 ```
 POST /api/banks/paper
-{ "bankIds": [1, 2, 3], "count": 10, "types": ["single", "essay"],
+{ "bankIds": [1, 2, 3], "count": 10,
+  "types": ["radio", "textarea"], "tags": ["网络", "协议"],
   "title": "2025 前端与安全能力考核", "passPercent": 60, "duration": 60 }
 ```
 
@@ -126,8 +127,17 @@ POST /api/banks/paper
   不会静默退化成「从全部题库抽题」。
 - 抽题时先把候选题全局打乱，再按题库轮转取题（round-robin），
   避免题量大的题库把卷面刷满，保证混合卷各题库比例均衡。
-- `types` 可限定题型；`passPercent` / `duration` 写入新考试的 settings。
-- 返回新建的考试表单详情，`schema.fields` 即组好的卷面。
+- `types` 限定题型，取值同 schema 的字段类型（`radio` / `checkbox` / `text` / `textarea` …）；
+  `tags` 限定标签，多个标签是「同时满足」。两者筛不到任何题目时返回
+  `400 该题库中没有同时满足 … 的题目`，**不会静默退回全库抽题**。
+- `passPercent` 是卷面百分比，越界会被夹到 `1..100`；`duration` 写入新考试的 settings。
+- 返回新建的考试表单详情，`schema` 即组好的卷面。
+
+### 题库标签
+
+题目带一个纯文本 `tags` 字段，逗号分隔（`"数据库,基础"`）。来源有三处：文本导入的
+`标签：数据库,基础` 一行、Excel 的「标签」列、题目接口的 `tags` 字段。组卷与筛题都
+按**整词**匹配——`tag=基础` 不会命中 `计算机基础`。
 
 ## 附件上传
 
@@ -164,11 +174,11 @@ POST /api/banks/paper
 | PUT/DELETE | `/api/banks/:id` | 更新 / 删除 |
 | GET/POST | `/api/banks/:id/questions` | 题目列表 / 新增 |
 | PUT/DELETE | `/api/questions/:id` | 更新 / 删除题目 |
-| POST | `/api/banks/:id/import-text` | 文本批量导入，返回 `{imported, droppedAnswers}`（答案指向不存在的选项会被剔除并列在这里） |
+| POST | `/api/banks/:id/import-text` | 文本批量导入（`答案：` `分值：` `解析：` `标签：`），返回 `{imported, droppedAnswers}` |
 | GET | `/api/banks/template.xlsx` | 下载题库导入模板（1 行表头 + 4 行示例） |
 | GET | `/api/banks/:id/export.xlsx` | 题库导出为 Excel，改完可直接再导回来 |
 | POST | `/api/banks/:id/import-xlsx` | multipart 上传 `file`（.xlsx）批量导入，返回 `{imported, skipped, droppedAnswers, unknownColumns}` |
-| POST | `/api/banks/:id/paper` | 智能组卷 `{title, count, duration}` |
+| POST | `/api/banks/:id/paper` | 单题库组卷 `{title, count, duration, passPercent, types?, tags?}` |
 | GET | `/api/banks/:id/practice?mode=sequence\|random\|wrong\|favorite` | 拉取练习题目（不含答案） |
 | POST | `/api/banks/:id/practice/answer` | 提交作答 `{questionId, value, progress?, note?, favorite?}` |
 | GET | `/api/banks/:id/progress` | 练习进度 |

@@ -153,7 +153,7 @@ export default {
               h('div', { class: 'card-h' }, [
                 h('div', { style: 'min-width:0' }, [
                   h('h3', { class: 'truncate' }, q.label),
-                  h('div', { class: 'small muted' }, `${q.count} 人作答${q.average ? ` · 平均 ${q.average}` : ''}`)
+                  h('div', { class: 'small muted' }, `${q.count} 人作答${q.average != null && q.average !== 0 ? ` · 平均 ${q.average}` : ''}`)
                 ]),
                 h('button', { class: 'btn sm ghost', onClick: () => exportPng('chart_' + q.id) }, 'PNG')
               ]),

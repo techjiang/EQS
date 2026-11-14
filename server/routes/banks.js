@@ -2,7 +2,7 @@ import { get, all, run, now, log } from '../lib/db.js'
 import { readJson, fail, sendJson } from '../lib/http.js'
 import { requireUser, requirePerm, can } from '../lib/auth.js'
 import { normalizeField, paginate, safeJson, gradeSubmission, coerceAnswerToField } from '../lib/forms.js'
-import { parseTextToFields } from './forms.js'
+import { parseTextToFields, normalizeTags } from './forms.js'
 import { readXlsxUpload } from './files.js'
 import { parseXlsx, rowsToFields, questionsXlsx, templateXlsx } from '../lib/sheet.js'
 
@@ -13,6 +13,46 @@ const parseQ = q => ({ ...q, options: safeJson(q.options, []), answer: safeJson(
  * 但读题、刷题、看进度三处漏了同一道校验——任何登录用户换一个 id 就能读到别人题库的
  * 全部题目和标准答案（连做题都不需要），私有题库等于公开。
  */
+/** 及格线是卷面百分比：<=0 落 60，>100 就是「永远不及格」，必须夹住 */
+function clampPercent(v) {
+  const n = Number(v)
+  if (!Number.isFinite(n) || n <= 0) return 60
+  return Math.min(100, Math.max(1, Math.round(n * 10) / 10))
+}
+
+const TYPE_LABEL = {
+  radio: '单选', checkbox: '多选', select: '下拉', text: '填空', textarea: '简答',
+  judge: '判断', rate: '评分', nps: '量表', date: '日期', number: '数字',
+  upload: '上传', phone: '手机', email: '邮箱', sort: '排序', matrix: '矩阵',
+  slider: '滑动', signature: '签名'
+}
+function typeLabelOf(t) { return TYPE_LABEL[t] || t }
+
+/**
+ * 单题库抽题：题型 / 标签筛选 + 随机。
+ * 筛了却一道都没有时明确报错——静默退回全库会让「只要单选」的卷子里冒出简答题。
+ */
+function pickQuestions(bankId, body, count) {
+  const where = ['bank_id = ?', 'deleted_at IS NULL']
+  const args = [bankId]
+  const types = (Array.isArray(body.types) ? body.types : body.typeFilter ? [body.typeFilter] : []).filter(Boolean)
+  if (types.length) { where.push(`type IN (${types.map(() => '?').join(',')})`); args.push(...types) }
+  const tags = (Array.isArray(body.tags) ? body.tags : body.tag ? [body.tag] : []).map(t => String(t).trim()).filter(Boolean)
+  for (const t of tags) {
+    // 整词匹配：`LIKE %基础%` 会把「计算机基础」也算进来
+    where.push("(',' || tags || ',') LIKE ?")
+    args.push(`%,${t},%`)
+  }
+  const rows = all(`SELECT * FROM questions WHERE ${where.join(' AND ')} ORDER BY RANDOM() LIMIT ?`, ...args, count)
+  if (!rows.length && (types.length || tags.length)) {
+    const parts = []
+    if (types.length) parts.push(`题型「${types.map(typeLabelOf).join(' / ')}」`)
+    if (tags.length) parts.push(`标签「${tags.join(' / ')}」`)
+    fail(400, `该题库中没有同时满足 ${parts.join(' + ')} 的题目`)
+  }
+  return rows
+}
+
 function readableBank(user, id) {
   const bank = get('SELECT * FROM banks WHERE id = ? AND deleted_at IS NULL', Number(id))
   if (!bank) return null
@@ -130,8 +170,12 @@ export default function register(r) {
     const type = url.searchParams.get('type')
     const where = ['bank_id = ?', 'deleted_at IS NULL']
     const args = [bank.id]
-    if (keyword) { where.push('title LIKE ?'); args.push(`%${keyword}%`) }
+    // 搜「网络」时，题干里没有这两个字、但标签写了的题也该出来
+    if (keyword) { where.push('(title LIKE ? OR tags LIKE ?)'); args.push(`%${keyword}%`, `%${keyword}%`) }
     if (type) { where.push('type = ?'); args.push(type) }
+    // 标签筛选按整词匹配：`LIKE %基础%` 会让「基础」命中「计算机基础」
+    const tag = url.searchParams.get('tag')
+    if (tag) { where.push("(',' || tags || ',') LIKE ?"); args.push(`%,${String(tag).trim()},%`) }
     const rows = all(`SELECT * FROM questions WHERE ${where.join(' AND ')} ORDER BY id ASC`, ...args).map(parseQ)
     sendJson(res, 200, { ok: true, data: rows, total: rows.length })
   })
@@ -147,8 +191,14 @@ export default function register(r) {
       const f = normalizeField(item)
       if (!f.label) continue
       coerceAnswerToField(f)
+      // 标签：item 自己的优先，请求体上的当默认值。
+      // 之前只读 body.tags，批量传 items 时每条自带的标签被整批丢掉。
+      const tags = normalizeTags(item.tags ?? item.tag ?? body.tags ?? '')
+      // 分值：`f.score || 5` 会把用户明说的「不计分」写成 5 分，
+      // 组卷时它就变成计分题，答错直接扣分
+      const score = item.score === undefined || item.score === '' ? 5 : Math.max(0, Number(f.score) || 0)
       const result = run('INSERT INTO questions(bank_id, type, title, options, answer, analysis, score, tags, created_at) VALUES(?,?,?,?,?,?,?,?,?)',
-        bank.id, f.type, f.label, JSON.stringify(f.options), JSON.stringify(f.answer), f.analysis, f.score || 5, body.tags || '', now())
+        bank.id, f.type, f.label, JSON.stringify(f.options), JSON.stringify(f.answer), f.analysis, score, tags, now())
       ids.push(Number(result.lastInsertRowid))
     }
     sendJson(res, 201, { ok: true, ids })
@@ -161,8 +211,9 @@ export default function register(r) {
     const body = await readJson(req)
     const f = normalizeField({ ...parseQ(q), ...body })
     coerceAnswerToField(f)
+    const tags = body.tags === undefined ? q.tags : normalizeTags(body.tags)
     run('UPDATE questions SET type = ?, title = ?, options = ?, answer = ?, analysis = ?, score = ?, tags = ? WHERE id = ?',
-      f.type, f.label, JSON.stringify(f.options), JSON.stringify(f.answer), f.analysis, f.score, body.tags ?? q.tags, q.id)
+      f.type, f.label, JSON.stringify(f.options), JSON.stringify(f.answer), f.analysis, f.score, tags, q.id)
     sendJson(res, 200, { ok: true })
   })
 
@@ -197,8 +248,10 @@ export default function register(r) {
         f.answer = kept
       }
       coerceAnswerToField(f)
-      run('INSERT INTO questions(bank_id, type, title, options, answer, analysis, score, created_at) VALUES(?,?,?,?,?,?,?,?)',
-        bank.id, f.type, f.label, JSON.stringify(f.options), JSON.stringify(f.answer), f.analysis, f.score ?? 5, now())
+      // 「分值：0」是用户明说的「这题不计分」，nullish 兜底不能写成 `|| 5`
+      const score = f.score ?? 5
+      run('INSERT INTO questions(bank_id, type, title, options, answer, analysis, score, tags, created_at) VALUES(?,?,?,?,?,?,?,?,?)',
+        bank.id, f.type, f.label, JSON.stringify(f.options), JSON.stringify(f.answer), f.analysis, score, normalizeTags(f.tags || ''), now())
     }
     sendJson(res, 200, { ok: true, imported: fields.length, droppedAnswers: dropped })
   })
@@ -247,8 +300,8 @@ export default function register(r) {
     for (const f of fields) {
       if (f.dropped?.length) droppedAnswers.push(`${f.label}（${f.dropped.join('、')}）`)
       delete f.dropped
-      run('INSERT INTO questions(bank_id, type, title, options, answer, analysis, score, created_at) VALUES(?,?,?,?,?,?,?,?)',
-        bank.id, f.type, f.label, JSON.stringify(f.options), JSON.stringify(f.answer), f.analysis, f.score ?? 0, now())
+      run('INSERT INTO questions(bank_id, type, title, options, answer, analysis, score, tags, created_at) VALUES(?,?,?,?,?,?,?,?,?)',
+        bank.id, f.type, f.label, JSON.stringify(f.options), JSON.stringify(f.answer), f.analysis, f.score ?? 0, normalizeTags(f.tags || ''), now())
       imported++
     }
     log(user, 'Excel 导入题目', `${bank.name} #${bank.id} → ${imported} 道`)
@@ -261,8 +314,8 @@ export default function register(r) {
     const bank = get('SELECT * FROM banks WHERE id = ? AND deleted_at IS NULL', Number(params.id))
     if (!bank) fail(404, '题库不存在')
     const body = await readJson(req)
-    const count = Math.max(1, Number(body.count) || 10)
-    const rows = all('SELECT * FROM questions WHERE bank_id = ? AND deleted_at IS NULL ORDER BY RANDOM() LIMIT ?', bank.id, count).map(parseQ)
+    const count = Math.max(1, Math.min(200, Number(body.count) || 10))
+    const rows = pickQuestions(bank.id, body, count).map(parseQ)
     if (!rows.length) fail(400, '题库中没有题目')
     const schema = rows.map(q => {
       // 题库认「正确答案：A」「正确」，卷面上的多选认 ['选项值']、判断认「正确/错误」。
@@ -277,11 +330,12 @@ export default function register(r) {
     })
     const ts = now()
     const settings = {
-      passPercent: Number(body.passPercent) > 0 ? Number(body.passPercent) : 60,
-      duration: Number(body.duration) || 60
+      // 与多题库组卷同口径：及格线是百分比，超过 100 就永远不及格
+      passPercent: clampPercent(body.passPercent),
+      duration: Math.max(0, Number(body.duration) || 0)
     }
     const result = run('INSERT INTO forms(title, description, kind, schema, settings, status, created_by, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?)',
-      body.title || `${bank.name} - 试卷`, body.description || '由题库智能组卷生成', 'exam', JSON.stringify(schema),
+      String(body.title || `${bank.name} - 试卷`).slice(0, 200), body.description || '由题库智能组卷生成', 'exam', JSON.stringify(schema),
       JSON.stringify(settings), 'draft', user.id, ts, ts)
     sendJson(res, 201, { ok: true, id: Number(result.lastInsertRowid), count: schema.length, settings })
   })
@@ -305,9 +359,12 @@ export default function register(r) {
     const pool = all(`SELECT * FROM questions WHERE deleted_at IS NULL AND bank_id IN (${marks})`, ...ids)
     if (!pool.length) fail(400, '所选题库中没有题目')
     let picked = pool
-    if (body.typeFilter) {
-      const tf = pool.filter(q => q.type === body.typeFilter)
-      if (tf.length) picked = tf
+    const wantedTypes = (Array.isArray(body.types) ? body.types : body.typeFilter ? [body.typeFilter] : []).filter(Boolean)
+    if (wantedTypes.length) {
+      const tf = pool.filter(q => wantedTypes.includes(q.type))
+      // 选了题型却一道都没有：静默退回全库抽题，用户拿到的是「明明筛了单选，卷子里却有简答」
+      if (!tf.length) fail(400, `所选题库中没有「${wantedTypes.map(t => typeLabelOf(t)).join(' / ')}」类型的题目`)
+      picked = tf
     }
     // 按比例均衡抽题：先打乱再轮转各题库取，避免题目多的题库把卷子占满
     picked = picked.sort(() => Math.random() - 0.5)
@@ -335,7 +392,7 @@ export default function register(r) {
       return f
     })
     const settings = {
-      passPercent: Number(body.passPercent) > 0 ? Math.min(100, Number(body.passPercent)) : 60,
+      passPercent: clampPercent(body.passPercent),
       duration: Math.max(0, Number(body.duration) || 0)
     }
     const ts = now()
