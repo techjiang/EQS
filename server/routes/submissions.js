@@ -39,7 +39,7 @@ import { submissionsXlsx, submissionsHead, submissionRow } from '../lib/sheet.js
 import { writeXlsxStream } from '../lib/xlsx.js'
 import { signFileUrl, signFileUrls, signHtmlFiles, QUERY_FILE_TTL } from '../lib/fileAccess.js'
 // 份数/分数的留痕口径只有一份：前端也是这套（web/js/review.js），两边说的必须是同一件事
-import { scoreChanges, changeText, calibrate, gapLevel, reviewDrift, driftText } from '../../web/js/review.js'
+import { scoreChanges, changeText, calibrate, gapLevel, reviewDrift, driftText, regradeRuler, regradeText } from '../../web/js/review.js'
 
 function fingerprint(req, extra = {}) {
   return {
@@ -906,6 +906,31 @@ export default function register(r) {
      */
     const drift = reviewDrift(entries)
     for (const t of drift.teachers) t.text = driftText(t)
+    /*
+     * 换一把尺子重批全场：按某位的尺子，谁会被推出及格线。
+     *
+     * 区间回答「这一份会怎么变」，尺度回答「谁偏松几分」，走向回答「他后来收没收」——
+     * 这三件拼起来还差一句：按李老师那把松尺子重批，及格的人会多出几个。
+     *
+     * 只读有主观分的答卷：没人批过的卷子换谁的尺子都一样，读它们只是白扫一遍。
+     * 及格线与题目总分都走 gradeSubmission，和成绩单同一口径——这里不能自己再算一遍
+     * 「总分 = 各题分值相加」，那会漏掉条件跳转跳过的题，算出来的线跟榜单上差几分。
+     */
+    const graded = []
+    for (const row of each(`SELECT id, data, score, passed, manual_scores FROM submissions
+        WHERE form_id = ? AND deleted_at IS NULL AND manual_scores NOT IN ('', '{}', 'null')`, form.id)) {
+      const data = safeJson(row.data, {})
+      const manual = manualScoresOf(row)
+      const g = gradeSubmission(form.schema, data, form.settings, manual)
+      // pending 一起带下去：还有主观题没给分的卷子，总分本身还会涨，
+      // 拿它算「会不会翻过及格线」算的是一个还没定下来的分数
+      graded.push({
+        id: row.id, score: row.score, passed: row.passed === 1, manual,
+        passLine: g.passLine, total: g.total, pending: reviewTally(form, row).pending
+      })
+    }
+    const regrade = regradeRuler(entries, graded, { maxOf })
+    for (const t of regrade.teachers) t.text = regradeText(t)
     sendJson(res, 200, {
       ok: true,
       data: {
@@ -917,6 +942,7 @@ export default function register(r) {
          * 「两人给分一致」在库里其实是看不见的——能说的只有「没找到改过分的地方」。
          */
         drift,
+        regrade,
         note: result.conflicts ? '' : '还没有同一道题被两位老师给出不同的分（同分不留痕，所以一致的那些看不见）'
       }
     })

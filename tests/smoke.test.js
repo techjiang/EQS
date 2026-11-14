@@ -4630,6 +4630,13 @@ try {
       ], { maxOf: () => 20 })
       assert(cal.bands.submissions === 1, '只有 1 份卷子（#1）的分数会因为尺子不齐而浮动', JSON.stringify(cal.bands))
       assert(cal.bands.maxSpread === 18, '浮动额是各题差距相加（12 + 6 = 18）', JSON.stringify(cal.bands))
+      // 人工分支持两位小数，差值必然带浮点尾巴：界面上不能出现「差 5.299999999999999 分」
+      const floaty = calibrate([
+        mk(1, 1, '张老师', [{ id: 'q1', label: 'A', from: null, to: 19.4 }]),
+        mk(1, 2, '李老师', [{ id: 'q1', label: 'A', from: 19.4, to: 14.1 }])
+      ], { maxOf: () => 20 })
+      assert(floaty.questions[0].worst.gap === 5.3, '两位小数的分差要收拾干净（5.3 而不是 5.299999999999999）',
+        String(floaty.questions[0].worst.gap))
     }
 
     // ---- 接口：列表、详情、导出、榜单、批量阅卷都带上区间
@@ -4964,6 +4971,161 @@ try {
     assert(afterSave({ offset: 20, left: 0 }).action === 'done', '队列空了就收尾，不再拉一张空页')
     let cont = afterSave({ offset: 20, left: 3 })
     assert(cont.action === 'continue' && cont.offset === 20, '队列还有人就接着批同一个 offset（不是 +limit，翻页会漏卷）', JSON.stringify(cont))
+  }
+
+  console.log('\n[71] 换一把尺子重批：谁会被推出及格线')
+  {
+    // ---- 纯函数：事实替换与外推分开算，及格线不动
+    {
+      const { regradeRuler, regradeText } = await import('../web/js/review.js')
+      const mk = (sub, uid, name, changes) => ({ submissionId: sub, userId: uid, username: name, createdAt: 't', changes })
+      const rows = (list) => list.map(([id, score, passLine, manual]) => ({ id, score, passLine, total: 100, passed: score >= passLine, manual }))
+
+      /*
+       * 三份卷子，同一题 q1（满分 20）：张老师偏松 8 分，李老师偏紧 8 分。
+       * #1 #2 两格被两人都批过（偏移从这两格算出来），#3 只有第三个人批过——
+       * 张老师没碰过它，那一格只能外推。
+       */
+      const entries = [
+        mk(1, 1, '张老师', [{ id: 'q1', label: '简答', from: null, to: 18 }]),
+        mk(1, 2, '李老师', [{ id: 'q1', label: '简答', from: 18, to: 10 }]),
+        mk(2, 1, '张老师', [{ id: 'q1', label: '简答', from: null, to: 16 }]),
+        mk(2, 2, '李老师', [{ id: 'q1', label: '简答', from: 16, to: 8 }])
+      ]
+      const list = rows([
+        [1, 70, 60, { q1: 10 }],
+        [2, 64, 60, { q1: 8 }],
+        [3, 55, 60, { q1: 10 }]
+      ])
+      let r = regradeRuler(entries, list, { maxOf: () => 20 })
+      const zhang = r.teachers.find(t => t.name === '张老师')
+      assert(zhang && Math.abs(zhang.bias - 8) < 1e-9, '口径偏移就是同格对比出来的分差（+8 分）', JSON.stringify(zhang?.bias))
+      assert(zhang.facts === 2 && zhang.projected === 1, '两格是把他给过的分换回去，一格是外推', JSON.stringify({ f: zhang.facts, p: zhang.projected }))
+      assert(zhang.flipUp === 1 && zhang.flipDown === 0, '#3 从 55 推到 63，越 60 的线', JSON.stringify({ u: zhang.flipUp, d: zhang.flipDown }))
+      assert(zhang.passAfter === 3 && zhang.passBefore === 2, '过线人数 = 原来的 + 上岸 − 落榜', JSON.stringify({ b: zhang.passBefore, a: zhang.passAfter }))
+      assert(zhang.items[0].id === 1 || zhang.items[0].id === 3, '位移大的几份排前面', JSON.stringify(zhang.items.map(x => x.id)))
+      assert(regradeText(zhang) === '1 人越线上岸', '结论一句话：几个人上岸', regradeText(zhang))
+
+      // 及格线本身不动：换尺子不改变题目分值，动的是人
+      const lineCheck = regradeRuler(entries, rows([[1, 59, 60, { q1: 10 }]]), { maxOf: () => 20 })
+        .teachers.find(t => t.name === '张老师')
+      assert(lineCheck && lineCheck.flipUp === 1, '及格线在原地，59 分那份被推进线内', JSON.stringify(lineCheck?.items))
+
+      // 外推要剪回满分：整体偏松 8 分平移到一道已经给了 20 分的题上不该变成 28
+      r = regradeRuler([
+        mk(1, 1, '张老师', [{ id: 'q1', from: null, to: 20 }]),
+        mk(1, 2, '李老师', [{ id: 'q1', from: 20, to: 12 }])
+      ], rows([[9, 100, 60, { q1: 20 }]]), { maxOf: () => 20 })
+      // 张老师偏松 8 分，但这道题已经满分——他重批下去一分都加不动，所以他不进这张表：
+      // 一个「谁都不会被改到」的尺子摆上去，只会让人以为它能改变什么
+      assert(!r.teachers.find(t => t.name === '张老师'), '满分题上没人能再加分（超纲的分不是成绩）',
+        JSON.stringify(r.teachers.map(t => [t.name, t.changed])))
+      const clip = r.teachers.find(t => t.name === '李老师')
+      assert(clip && clip.items[0].to === 92, '偏紧那把尺子会把满分卷压下来', JSON.stringify(clip?.items))
+
+      // 撤分的人不参与偏移：与区间、走向同一条判据
+      r = regradeRuler([
+        mk(1, 1, '张老师', [{ id: 'q1', from: null, to: 10 }]),
+        mk(1, 2, '李老师', [{ id: 'q1', from: 10, to: null }]),
+        mk(1, 2, '李老师', [{ id: 'q2', from: null, to: 5 }])
+      ], rows([[1, 50, 60, { q1: 10, q2: 5 }]]), { maxOf: () => 20 })
+      const revoked = r.teachers.find(t => t.name === '李老师')
+      assert(!revoked || revoked.bias === 0, '撤分（to: null）不算 0 分，不产生偏移', JSON.stringify(revoked?.bias))
+
+      /*
+       * 现在的分是谁落下的，换他的尺子就等于现状：一分不动，于是他不进这张表。
+       * 但要留名——否则读者会以为漏了人，或者以为他的尺子没有偏移。
+       */
+      r = regradeRuler([
+        mk(1, 1, '张老师', [{ id: 'q1', from: null, to: 18 }]),
+        mk(1, 2, '李老师', [{ id: 'q1', from: 18, to: 10 }])
+      ], rows([[1, 60, 60, { q1: 10 }]]), { maxOf: () => 20 })
+      assert(r.settled.some(x => x.name === '李老师' && x.current), '当前成绩单那把尺子不进表，但要留名', JSON.stringify(r.settled))
+
+      // 说了「12 人上岸」就得能列出 12 份：截断到固定条数，读者数一遍会以为结论有假
+      {
+        const e = []
+        const rs = []
+        for (let i = 1; i <= 12; i++) {
+          e.push(mk(i, 1, '张老师', [{ id: 'q1', from: null, to: 20 }]))
+          e.push(mk(i, 2, '李老师', [{ id: 'q1', from: 20, to: 0 }]))
+          rs.push({ id: i, score: 50, passed: false, manual: { q1: 0 }, passLine: 55, total: 100, pending: 0 })
+        }
+        const g = regradeRuler(e, rs, { maxOf: () => 20 })
+        const z = g.teachers.find(t => t.name === '张老师')
+        assert(z.flipUp === 12, '12 份换边', JSON.stringify({ up: z.flipUp }))
+        assert(z.items.filter(it => it.flip).length === 12, '换边的一份都不截', JSON.stringify({ n: z.items.filter(it => it.flip).length }))
+      }
+
+      // 没批完的卷子不参与：总分还会涨，它的「会不会过线」是个还没定下来的数
+      r = regradeRuler([
+        mk(1, 1, '张老师', [{ id: 'q1', from: null, to: 18 }]),
+        mk(1, 2, '李老师', [{ id: 'q1', from: 18, to: 10 }])
+      ], [
+        { id: 1, score: 40, passed: false, manual: { q1: 10 }, passLine: 60, total: 100, pending: 0 },
+        { id: 2, score: 50, passed: false, manual: { q1: 10 }, passLine: 60, total: 100, pending: 1 }
+      ], { maxOf: () => 20 })
+      assert(r.reviewed === 1 && r.unfinished === 1, '没批完的卷子不进分母，单独报数', JSON.stringify({ r: r.reviewed, u: r.unfinished }))
+      assert(r.teachers.every(t => t.passBefore <= 1), '没批完的卷子不参与过线统计', JSON.stringify(r.teachers.map(t => [t.name, t.passBefore])))
+
+      // 没人对比过的时候说清「怎么才会有」，不是甩一张空表
+      r = regradeRuler([], list, { maxOf: () => 20 })
+      assert(r.teachers.length === 0 && /两位老师/.test(r.note), '没有可比数据时说明怎么才会有', r.note)
+      assert(regradeText(null) === '', '没有人就没有那句话')
+    }
+
+    // ---- 接口：同一份留痕，换尺子的账要和成绩单上的分对得上
+    let r = await req('POST', '/api/forms', {
+      title: '换尺子卷', kind: 'exam',
+      schema: [
+        { id: 'r1', type: 'textarea', label: '主观题一', answer: [], score: 20 },
+        { id: 'r2', type: 'radio', label: '客观题', options: ['A', 'B'], answer: ['A'], score: 10 }
+      ],
+      settings: { passPercent: 60 }
+    })
+    const rid = r.json.id
+    await req('PUT', `/api/forms/${rid}`, { status: 'published' })
+    const rs = []
+    for (let i = 0; i < 3; i++) {
+      r = await req('POST', `/api/public/forms/${rid}/submit`, { data: { r1: `答 ${i}`, r2: 'A' } })
+      rs.push(r.json.id)
+    }
+    const rAdmin = cookie
+    r = await req('GET', `/api/forms/${rid}/review-calibration`)
+    assert(r.status === 200 && r.json.data.regrade, '尺度接口带上「换尺子重批」', JSON.stringify(Object.keys(r.json.data || {})))
+    assert(r.json.data.regrade.teachers.length === 0 && /两位老师/.test(r.json.data.regrade.note),
+      '还没人对比过 → 没有人会被推过线，且说明原因', JSON.stringify(r.json.data.regrade))
+
+    await req('POST', '/api/auth/register', { username: 'regrade_b', password: 'rg-pass-123', nickname: '王老师' })
+    const addR = await call(rAdmin, 'POST', `/api/forms/${rid}/members`, { username: 'regrade_b', role: 'editor' })
+    assert(addR.status === 201, '把第二位老师拉进这张卷子', JSON.stringify(addR.json))
+    const wang = await asUser('regrade_b', 'rg-pass-123')
+
+    // 同一格两人都给过分：偏移从这两格算；第三份只被管理员批过，王老师那一格只能外推
+    cookie = rAdmin
+    await req('PUT', `/api/submissions/${rs[0]}/review`, { scores: { r1: 6 } })
+    await call(wang, 'PUT', `/api/submissions/${rs[0]}/review`, { scores: { r1: 14 } })
+    await req('PUT', `/api/submissions/${rs[1]}/review`, { scores: { r1: 8 } })
+    await call(wang, 'PUT', `/api/submissions/${rs[1]}/review`, { scores: { r1: 16 } })
+    await req('PUT', `/api/submissions/${rs[2]}/review`, { scores: { r1: 6 } })
+    cookie = rAdmin
+    r = await req('GET', `/api/forms/${rid}/review-calibration`)
+    const rg = r.json.data.regrade
+    const w = rg.teachers.find(t => t.name === '王老师')
+    assert(w, '王老师的尺子会改变结果', JSON.stringify(rg.teachers.map(t => t.name)))
+    assert(Math.abs(w.bias - 8) < 1e-9, '口径偏移 = 同格对比出来的 +8 分', String(w.bias))
+    assert(w.facts === 2 && w.projected >= 1, '两格事实、一格外推', JSON.stringify({ f: w.facts, p: w.projected }))
+    assert(typeof w.text === 'string' && w.text, '每把尺子带一句人话结论', w.text)
+    // 与成绩单同一口径：位移后的分不能超过总分
+    assert(w.items.every(it => it.to <= 30), '重批后的分不超过卷面总分', JSON.stringify(w.items))
+
+    // 只给能批阅的人看：它会暴露「谁对哪份卷子放宽了」，和尺度对账同一条权限
+    const holderR = cookie
+    await req('POST', '/api/auth/register', { username: 'regrade_out', password: 'ro-pass-123' })
+    const outR = await asUser('regrade_out', 'ro-pass-123')
+    r = await call(outR, 'GET', `/api/forms/${rid}/review-calibration`)
+    assert(r.status === 403, '无关账号看不到换尺子的账', `${r.status} ${r.json?.message || ''}`)
+    cookie = holderR
   }
 
   console.log('\n[45] 前端静态资源')

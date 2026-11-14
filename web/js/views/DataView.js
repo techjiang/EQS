@@ -5,7 +5,7 @@ import { ok, err, confirmBox, fmtDate, Empty, Modal, Pagination, escapeHtml } fr
 import { Icon } from '../icons.js'
 import { renderControl, answerDisplay } from '../renderer.js'
 import { buildFlow } from '../flow.js'
-import { batchPayload, nextIndex, reviewProgress, afterSave, elapsedSeconds, changeText, changeLine, humanSeconds, gapLevel, bandText, biasText } from '../review.js'
+import { batchPayload, nextIndex, reviewProgress, afterSave, elapsedSeconds, changeText, changeLine, humanSeconds, gapLevel, bandText, biasText, regradeText } from '../review.js'
 
 export default {
   setup() {
@@ -403,6 +403,21 @@ export default {
           ])
         })
       ])
+    }
+
+    /*
+     * 「不列在上面」的那句说明。一个人和两个人写同一句话，中文里就露馅了：
+     * 「他们落下的分」在只有李老师一个人时读起来像还漏了谁。
+     */
+    const regradeSettledNote = (settled) => {
+      const one = settled.length === 1
+      if (settled.every(x => x.current)) {
+        return one
+          ? '现在的成绩单就是他落下的分，换他的尺子重批等于现状，一分都不会动。'
+          : '现在的成绩单就是他们落下的分，换他们的尺子重批等于现状，一分都不会动。'
+      }
+      return (one ? '换他的尺子' : '换他们的尺子')
+        + '算下来一分也不会变——要么批过的地方跟现在的分本来就一致，要么偏移被题目的上下界剪掉了。'
     }
 
     const calibration = ref(null)
@@ -993,6 +1008,82 @@ export default {
                   h('div', { class: 'small muted' }, calibration.value.drift.note)
                 ])
               : null),
+            /*
+             * 换一把尺子重批全场。
+             *
+             * 上面几块都是「回头看」：谁偏松几分、谁的尺子收紧了、哪一份的分数浮动多大。
+             * 教研组长真正要拍的那个问题还悬着：按李老师那把松尺子重批，及格线附近谁会翻过去。
+             *
+             * 这块必须说清哪部分是事实、哪部分是外推：他真批过的那几格是把出现过的分换回去，
+             * 他没批过的格子是按他的口径平移过去的投影。混成一句「按他的尺子 6 人上岸」，
+             * 读者就只能信或不信，没办法判断这个数字有多少是猜的。
+             */
+            calibration.value.regrade?.teachers?.length
+              ? h('div', { style: 'margin-top:18px' }, [
+                  h('div', { class: 'small', style: 'font-weight:600;margin-bottom:4px' }, '换一把尺子重批：谁会被推出及格线'),
+                  h('div', { class: 'small muted', style: 'margin-bottom:10px' },
+                    '及格线不动——换尺子不改变题目分值，动的是人。这 ' + calibration.value.regrade.reviewed
+                    + ' 份批完的卷子里：他真批过的那几格是把他给的分换回去（事实），'
+                    + '他没批过的格子按他在这道题上的口径平移（投影）。'
+                    // 没批完的卷子总分还会涨，拿它算「会不会过线」算的是个还没定下来的数
+                    + (calibration.value.regrade.unfinished
+                      ? `另有 ${calibration.value.regrade.unfinished} 份还有主观题没批完，不参与这笔账。`
+                      : '')),
+                  ...calibration.value.regrade.teachers.slice(0, 4).map(t => h('div', { class: 'drift-row' }, [
+                    h('div', { class: 'flex between wrap', style: 'gap:8px;align-items:baseline' }, [
+                      h('div', { class: 'flex wrap', style: 'gap:8px;align-items:baseline;min-width:0' }, [
+                        h('b', { class: 'small' }, t.name),
+                        h('span', { class: 'small muted' }, `口径 ${biasText(t.bias)} 分 · 批过 ${t.graded} 格`),
+                        h('span', { class: 'small muted' }, `${t.changed} 份分数会变，最大 ${t.maxMove} 分`),
+                        // 过线人数是这块唯一能被校长读走的数字：及格线上的人从 26 变成 34
+                        h('span', { class: 'small muted' }, `过线 ${t.passBefore} → ${t.passAfter} 人`)
+                      ]),
+                      // 结论只用一句话：几个上岸、几个掉下去。这两件事要分开数，
+                      // 合成一个「净增 2 人」就把「3 人上岸、1 人落榜」这件完全不同的事盖掉了
+                      t.flipUp || t.flipDown
+                        ? h('span', { class: ['tag', t.flipUp > t.flipDown ? 'ok' : 'warn'] }, regradeText(t))
+                        : h('span', { class: 'tag' }, regradeText(t))
+                    ]),
+                    // 逐份列出位移最大的几份：抽象的「5 人上岸」读者没法追，得能看见是哪几份
+                    ...t.items.map(it => h('div', {
+                      class: 'small', style: 'margin-top:6px;color:var(--text-2)'
+                    }, [
+                      h('span', { class: 'mono muted', style: 'margin-right:6px' }, `#${it.id}`),
+                      h('span', {}, `${it.from} → ${it.to} 分`),
+                      h('span', { class: 'muted', style: 'margin-left:8px' },
+                        `${it.delta > 0 ? '+' : ''}${it.delta}`),
+                      it.flip === 'up'
+                        ? h('span', { class: 'tag ok', style: 'margin-left:8px' }, '越线上岸')
+                        : it.flip === 'down' ? h('span', { class: 'tag warn', style: 'margin-left:8px' }, '掉到线下') : null
+                    ])),
+                    // 说了「6 人上岸」却少列一条，读者数一遍会以为结论有假：换边的一份都不能省
+                    t.changed > t.items.length
+                      ? h('div', { class: 'small muted', style: 'margin-top:4px' },
+                          `另有 ${t.changed - t.items.length} 份也动了，但没换边，未列`)
+                      : null,
+                    h('div', { class: 'small muted', style: 'margin-top:4px' },
+                      `事实替换 ${t.facts} 格 · 外推 ${t.projected} 格`)
+                  ])),
+                  calibration.value.regrade.teachers.length > 4
+                    ? h('div', { class: 'small muted', style: 'margin-top:4px' },
+                        `另有 ${calibration.value.regrade.teachers.length - 4} 位老师的尺子会改变结果，未展开`)
+                    : null,
+                  /*
+                   * 现在的分是谁落下的，换他的尺子就等于现状——一分都不会变，所以他不会出现在上表里。
+                   * 不写这一句，读者会以为漏了一个人，或者以为他的尺子没有偏移。
+                   */
+                  calibration.value.regrade.settled?.length
+                    ? h('div', { class: 'small muted', style: 'margin-top:6px' },
+                        '不列在上面的是 ' + calibration.value.regrade.settled.map(x => x.name).join('、') + '：'
+                        + regradeSettledNote(calibration.value.regrade.settled))
+                    : null
+                ])
+              : (calibration.value.regrade?.note
+                ? h('div', { style: 'margin-top:18px' }, [
+                    h('div', { class: 'small', style: 'font-weight:600;margin-bottom:4px' }, '换一把尺子重批：谁会被推出及格线'),
+                    h('div', { class: 'small muted' }, calibration.value.regrade.note)
+                  ])
+                : null),
             calibration.value.teachers?.length > 1
               ? h('div', { class: 'small muted', style: 'margin-top:12px' },
                   '参与批阅的账号：' + calibration.value.teachers.map(t => `${t.name || '未知账号'}（${t.gradings} 次）`).join(' · '))

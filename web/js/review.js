@@ -180,7 +180,7 @@ function replayCells(entries = []) {
        * 同一位老师改第二遍时 Map 里那一项还在原位，顺序是第一次出现的顺序——
        * 拿它当时间序，会把「先批的人的分」当成现在的分。
        */
-      if (i >= cell.seq) { cell.seq = i; cell.current = { name: teachers.get(key).name, value }; cell.lastAt = e.createdAt || '' }
+      if (i >= cell.seq) { cell.seq = i; cell.current = { name: teachers.get(key).name, value }; cell.currentKey = key; cell.lastAt = e.createdAt || '' }
     }
     if ((e.changes || []).length) teachers.get(key).gradings++
   })
@@ -254,6 +254,9 @@ function bucketLabel(unit, key) {
 }
 
 const round1 = v => Math.round(Number(v) * 10) / 10
+// 人工分本身支持两位小数（applyReview 会四舍五入到两位），所以两者相减必然带浮点尾巴：
+// 5.299999999999999 分不是「差 5.3 分」，它只是一个还没被收拾干净的 double
+const round100 = v => Math.round(Number(v) * 100) / 100
 
 /** 偏移量的写法：正数是「比别人给得高」，带符号才看得出方向 */
 export function biasText(v) {
@@ -431,8 +434,10 @@ export function calibrate(entries, { maxOf = () => 0 } = {}) {
     const given = [...cell.by.entries()].filter(([, v]) => v.value !== null && v.value !== undefined)
     if (given.length < 2) continue
     const values = given.map(([, v]) => Number(v.value))
-    const gap = Math.max(...values) - Math.min(...values)
-    if (gap === 0) continue
+    const raw = Math.max(...values) - Math.min(...values)
+    if (raw === 0) continue
+    // 两位小数就够：差 5.3 分是个能读的数字，差 5.299999999999999 分是一行噪声
+    const gap = round100(raw)
     conflicts++
     const max = Number(maxOf(cell.id)) || 0
     const q = questions.get(cell.id) || { id: cell.id, label: cell.label, max, cells: [] }
@@ -591,4 +596,197 @@ export function bandText(band) {
   const n = v => String(Math.round(Number(v) * 100) / 100)
   if (!(band.spread > 0)) return `${n(band.score)} 分`
   return `${n(band.score)} 分（${n(band.low)} ~ ${n(band.high)}）`
+}
+
+/**
+ * 换一把尺子重批全场：如果这份卷子交给某位老师批，谁会被推出及格线。
+ *
+ * 区间只回答「这一份的分数会怎么变」，尺度对账只回答「谁偏松几分」，
+ * 时间走向只回答「他后来收没收」。这三件拼起来还差一句：
+ * **按李老师那把松尺子重批全场，及格的人会多出几个，是多在哪几个人身上。**
+ *
+ * 这件事只能分两段说，混在一起就变成了编数字：
+ *
+ *  1. **事实替换**：他真批过的那几格，把他给的分换回去。这不是预测，是把已经发生过的另一种结果
+ *     按回原位——同一个人对同一份答案给的分，本来就该只有一个。
+ *  2. **外推**：他没批过的格子，拿他在这道题上的口径偏移（同格对比算出来的分差）平移过去。
+ *     这一段是投影，界面上单独标出格数。没被任何人批过的主观题不做外推：
+ *     那题现在没有分，替他凭空给一个分，等于用编出来的数字把人推过及格线。
+ *
+ * 还有一条前提：**只算已经批完的卷子。** 还有主观题没给分的卷子，总分本身还会涨，
+ * 拿它算「会不会翻过及格线」算的是一个还没定下来的分数。这类卷子跳过并单独报数，
+ * 不假装它们也参与了。
+ *
+ * 两条边界：
+ *  - **及格线本身不动。** 它是「可判分总分 × passPercent」，换尺子不改变题目的分值，
+ *    所以线在原地——动的是人。这句话要摆在界面上：读者以为要问的是线，其实要问的是人。
+ *  - **只算主观题。** 客观题是机器判的，跟谁的尺子都没关系。
+ *  - **负数与超满分一律剪回 [0, 满分]**：一位老师整体偏松 6 分，平移到一道已经给了满分的题上
+ *    会得到 26/20，而超纲的分数不是成绩。
+ */
+// 换边的全留，其余按位移补到 n 条：截断不能把「上岸的人」截掉
+function flipsFirst(items, n) {
+  const flip = []
+  const rest = []
+  for (const it of items) (it.flip ? flip : rest).push(it)
+  const byMove = (a, b) => Math.abs(b.delta) - Math.abs(a.delta)
+  flip.sort(byMove)
+  rest.sort(byMove)
+  return flip.concat(rest).slice(0, Math.max(n, flip.length))
+}
+
+export function regradeRuler(entries = [], rows = [], { maxOf = () => 0 } = {}) {
+  // rows: [{ id, score, passed, manual, passLine, total, pending }]，pending 是还没给分的主观题数
+  const { cells, teachers } = replayCells(entries)
+  // 每位老师每道题的偏移（只从「同格 ≥2 人」的格子里取）：考生水平在减法里抵消掉
+  const biasOf = new Map()   // key → Map(qid → { sum, n })
+  const quota = new Map()    // key → 他真批过几格
+  for (const cell of cells.values()) {
+    const given = [...cell.by.entries()].filter(([, v]) => v.value !== null && v.value !== undefined)
+    for (const [k, v] of given) quota.set(k, (quota.get(k) || 0) + 1)
+    if (given.length < 2) continue
+    for (const [k, v] of given) {
+      const others = given.filter(([k2]) => k2 !== k).map(([, x]) => Number(x.value))
+      const base = others.reduce((a, b) => a + b, 0) / others.length
+      if (!biasOf.has(k)) biasOf.set(k, new Map())
+      const per = biasOf.get(k)
+      const hit = per.get(cell.id) || { sum: 0, n: 0 }
+      hit.sum += Number(v.value) - base
+      hit.n++
+      per.set(cell.id, hit)
+    }
+  }
+
+  /*
+   * 谁是「当前成绩单上的那把尺子」：每一格最后写入的人。
+   * 换他的尺子重批等于现状——一分都不会变，于是他会从结果里消失。
+   * 这件事得说出来，否则读者会以为漏了一个人，或者以为他的尺子没有偏移。
+   */
+  const lastWriter = new Map()
+  for (const cell of cells.values()) {
+    if (cell.currentKey) lastWriter.set(cell.currentKey, (lastWriter.get(cell.currentKey) || 0) + 1)
+  }
+  const settled = []
+  // 未批完的卷子与「谁给的分」无关，所以在这里一次数完，别让每位老师各数一遍
+  const unfinished = rows.filter(r => Number(r.pending) > 0 && Number.isFinite(Number(r.score)) && Number.isFinite(Number(r.passLine))).length
+  const out = []
+  for (const [key, t] of teachers) {
+    const per = biasOf.get(key) || new Map()
+    const perQ = new Map([...per.entries()].map(([qid, x]) => [qid, x.sum / x.n]))
+    let facts = 0
+    let projected = 0
+    let changed = 0
+    let up = 0
+    let down = 0
+    let flipUp = 0
+    let flipDown = 0
+    let passBefore = 0
+    let maxMove = 0
+    const items = []
+    for (const row of rows) {
+      const cur = Number(row.score)
+      const line = Number(row.passLine)
+      if (!Number.isFinite(cur) || !Number.isFinite(line)) continue
+      // 还有主观题没给分的卷子，总分还会往上涨：它的「会不会过线」是个还没定下来的数
+      if (Number(row.pending) > 0) continue
+      // 换尺子不改变题目分值，所以及格线在原地不动——动的是人
+      const was = cur >= line
+      if (was) passBefore++
+      let delta = 0
+      for (const [qid, raw] of Object.entries(row.manual || {})) {
+        if (raw === undefined || raw === null || raw === '') continue
+        const max = Number(maxOf(qid)) || 0
+        const now = Number(raw)
+        if (!Number.isFinite(now)) continue
+        const cell = cells.get(`${row.id}::${qid}`)
+        const mine = cell?.by.get(key)?.value
+        if (mine !== undefined && mine !== null) {
+          // 事实替换：他给过这个分，那就是他的答案，不是一次预测
+          delta += Math.min(Math.max(Number(mine), 0), max || Number(mine)) - now
+          facts++
+          continue
+        }
+        const b = perQ.get(qid)
+        if (b === undefined) continue
+        // 外推：平移之后仍要落在 [0, 满分] 里，超纲的分不是成绩
+        const next = Math.min(Math.max(now + b, 0), max || now + b)
+        delta += next - now
+        projected++
+      }
+      if (!delta) continue
+      const after = Math.max(Math.min(cur + delta, Number(row.total) || Infinity), 0)
+      const move = round100(after - cur)
+      changed++
+      if (move > 0) up++
+      else down++
+      maxMove = Math.max(maxMove, Math.abs(move))
+      // 上岸与落榜分两栏数：「3 人上岸、1 人落榜」和「净增 2 人」不是同一件事
+      const is = after >= line
+      if (is && !was) flipUp++
+      if (was && !is) flipDown++
+      items.push({ id: row.id, from: round100(cur), to: round100(after), delta: move, flip: is === was ? '' : (is ? 'up' : 'down') })
+    }
+    out.push({
+      key,
+      name: t.name || '未知账号',
+      bias: round100([...perQ.values()].reduce((a, b) => a + b, 0) / (perQ.size || 1)),
+      graded: quota.get(key) || 0,
+      facts,
+      projected,
+      changed,
+      up,
+      down,
+      flipUp,
+      flipDown,
+      passBefore,
+      // 没变的那几份成绩不动，所以过线人数就是「原来的 + 上岸 − 落榜」，不必再数一遍
+      passAfter: passBefore + flipUp - flipDown,
+      maxMove: round100(maxMove),
+      /*
+       * 换边的那几份排最前面，然后才按位移大小。
+       * 「有人被推过线」是这张表唯一的结论，把它埋在一堆「分数变了但没换边」的中间，
+       * 读者就得自己一行行找哪几个人的名字变了颜色。
+       *
+       * 也不能截断到固定条数：说「6 人越线上岸」却只列出 5 条，第 6 个人就这么没了，
+       * 读者数一遍会以为结论有假。换边的一律留全，剩下的名额才按位移补。
+       */
+      items: flipsFirst(items, 8)
+    })
+  }
+  for (const t of out) {
+    if (t.changed > 0) continue
+    /*
+     * 重批一分不动有两种原因，话得分开说：
+     *  - `current`：每一格最后都是他写的。现在的成绩单就是他的口径，换他的尺子等于现状。
+     *  - 否则：他的偏移恰好被题目的上下界剪掉了，或者他批过的地方跟记着的分本来就一样。
+     * 混成一句「换他的尺子不会变」，读者没法判断这是「他已经赢了」还是「他的分没起作用」。
+     */
+    settled.push({
+      name: t.name || '未知账号',
+      graded: quota.get(t.key) || 0,
+      current: (lastWriter.get(t.key) || 0) >= cells.size && cells.size > 0
+    })
+  }
+  const kept = out.filter(t => t.changed > 0).sort((a, b) => (b.flipUp + b.flipDown) - (a.flipUp + a.flipDown) || b.changed - a.changed)
+  return {
+    teachers: kept,
+    // 重批等于现状的人：现在的分就是他落下的，不列出来会让读者以为漏了一个
+    settled,
+    // 分母要说清：没批完的卷子不参与，「36 份里 8 人上岸」和「36 份里 8 人上岸，另有 5 份还没批完」不是同一句话
+    reviewed: rows.length - unfinished,
+    unfinished,
+    note: kept.length
+      ? ''
+      : '等同一道题被两位老师都改过分，这里会出现「换成某位的尺子，谁会被推出及格线」——只有被比过的地方才能算出偏移，人少的时候这条账算不出来'
+  }
+}
+
+/** 换尺子的那句结论：按他的尺子重批，3 人越线上岸，1 人掉到线下 */
+export function regradeText(t) {
+  if (!t) return ''
+  const parts = []
+  if (t.flipUp) parts.push(`${t.flipUp} 人越线上岸`)
+  if (t.flipDown) parts.push(`${t.flipDown} 人掉到线下`)
+  if (!parts.length) return t.changed ? `${t.changed} 份分数会变，但没人换边` : '这份卷子的分一个都不会变'
+  return parts.join('，')
 }
