@@ -4398,6 +4398,165 @@ try {
     }
   }
 
+  console.log('\n[68] 评分尺度：同一道题两个人给了差多远的分')
+  {
+    // ---- 纯函数：回放口径（浏览器与服务端共用同一份）
+    {
+      const { calibrate, gapLevel } = await import('../web/js/review.js')
+      const mk = (sub, uid, name, at, changes) => ({ submissionId: sub, userId: uid, username: name, createdAt: at, changes })
+
+      // 同一份卷子的同一道题，两个人给了差 14 分
+      let r = calibrate([
+        mk(1, 1, '张老师', '2026-11-14T09:00:00Z', [{ id: 'q1', label: '下一季度计划', from: null, to: 4 }]),
+        mk(1, 2, '李老师', '2026-11-14T09:05:00Z', [{ id: 'q1', label: '下一季度计划', from: 4, to: 18 }])
+      ], { maxOf: () => 20 })
+      assert(r.conflicts === 1, '同一格被两个人给过、且不一致 → 一处分歧', JSON.stringify({ c: r.conflicts }))
+      assert(r.questions.length === 1 && r.questions[0].worst.gap === 14, '差多少分是算出来的，不是估的', JSON.stringify(r.questions[0]?.worst))
+      assert(r.questions[0].worst.by.map(x => x.value).sort((a, b) => a - b).join(',') === '4,18',
+        '保留两个人的原始分，不去平均（平均成 7 分就看不出是 4 和 18）', JSON.stringify(r.questions[0]?.worst.by))
+      assert(r.questions[0].cells[0].ratio === 0.7, '差多少分也要按满分折算成比例', String(r.questions[0]?.cells[0].ratio))
+
+      // 两个人都给 8 分：不是分歧。把「两个人批过」和「两个人不一致」混成一个数，等于没有指标
+      r = calibrate([
+        mk(1, 1, '张老师', 'a', [{ id: 'q1', from: null, to: 8 }]),
+        mk(1, 2, '李老师', 'b', [{ id: 'q1', from: null, to: 8 }])
+      ], { maxOf: () => 20 })
+      assert(r.conflicts === 0 && r.questions.length === 0, '两人都给 8 分不算分歧', JSON.stringify({ c: r.conflicts }))
+
+      // 不同份卷子上的同一道题，不是同一格：张老师批张三、李老师批李四，差得再远也不是分歧
+      r = calibrate([
+        mk(1, 1, '张老师', 'a', [{ id: 'q1', from: null, to: 4 }]),
+        mk(2, 2, '李老师', 'b', [{ id: 'q1', from: null, to: 18 }])
+      ], { maxOf: () => 20 })
+      assert(r.conflicts === 0, '不同答卷上的同一道题不算同一格（考生水平本来就有差）', JSON.stringify({ c: r.conflicts }))
+
+      // 撤分是「没有分」，不是 0 分：一次误操作不该让整张尺子歪掉
+      r = calibrate([
+        mk(1, 1, '张老师', 'a', [{ id: 'q1', from: null, to: 4 }]),
+        mk(1, 2, '李老师', 'b', [{ id: 'q1', from: null, to: 18 }]),
+        mk(1, 3, '王老师', 'c', [{ id: 'q1', from: null, to: null }])
+      ], { maxOf: () => 20 })
+      assert(r.conflicts === 1, '撤分的人不参与对账（to 为 null 不算 0 分）',
+        JSON.stringify({ c: r.conflicts, by: r.questions[0]?.worst?.by }))
+      assert(r.questions[0].worst.by.length === 2, '撤分不进「给了几分」的并列名单', String(r.questions[0]?.worst?.by.length))
+
+      // 同一个人改了两轮：只认最后一次，否则「改过分」会被当成第二个人
+      r = calibrate([
+        mk(1, 1, '张老师', 'a', [{ id: 'q1', from: null, to: 4 }]),
+        mk(1, 1, '张老师', 'b', [{ id: 'q1', from: 4, to: 15 }]),
+        mk(1, 2, '李老师', 'c', [{ id: 'q1', from: 15, to: 15 }])
+      ], { maxOf: () => 20 })
+      assert(r.conflicts === 0, '同一个人改两轮只认最后一次（改过分不等于第二个人）', JSON.stringify(r.questions))
+
+      // 两两对账：方向要说得清谁更松
+      r = calibrate([
+        mk(1, 1, '张老师', 'a', [{ id: 'q1', from: null, to: 4 }]),
+        mk(1, 2, '李老师', 'b', [{ id: 'q1', from: 4, to: 18 }]),
+        mk(2, 1, '张老师', 'c', [{ id: 'q2', from: null, to: 10 }]),
+        mk(2, 2, '李老师', 'd', [{ id: 'q2', from: 10, to: 16 }])
+      ], { maxOf: () => 20 })
+      assert(r.pairs.length === 1 && r.pairs[0].count === 2, '两个人对过两格', JSON.stringify(r.pairs))
+      // q1 差 14、q2 差 6，都是李老师高 → 平均高 10 分（不是「平均差 10 分」那么含糊）
+      assert(r.pairs[0].bias === -10 && r.pairs[0].avgGap === 10 && /李老师/.test(r.pairs[0].b),
+        '偏向算的是「谁平均更高」，与「绝对差多少」分开记', JSON.stringify(r.pairs[0]))
+      assert(r.pairs[0].maxGap === 14, '顺便记下最扎眼的那一处', String(r.pairs[0].maxGap))
+
+      // 门槛按比例算：满分 5 差 2 分与满分 50 差 2 分不是同一件事
+      assert(gapLevel(6, 20) === '明显' && gapLevel(4, 20) === '值得看一眼' && gapLevel(2, 20) === '轻微',
+        '分歧程度按满分折算，不按绝对分')
+      assert(gapLevel(2, 5) === '明显' && gapLevel(2, 50) === '轻微', '差同样 2 分，在 5 分题和 50 分题里轻重不同')
+      assert(gapLevel(0, 20) === '' && gapLevel(5, 0) === '', '没差、或没有满分就不评')
+    }
+
+    // ---- 接口：从留痕回放，不另建汇总表
+    let r = await req('POST', '/api/forms', {
+      title: '尺度对账卷', kind: 'exam',
+      schema: [
+        { id: 'c1', type: 'textarea', label: '简述下一季度计划', answer: [], score: 20 },
+        { id: 'c2', type: 'textarea', label: '这次复盘的教训', answer: [], score: 10 }
+      ],
+      settings: { passPercent: 60 }
+    })
+    const cid = r.json.id
+    await req('PUT', `/api/forms/${cid}`, { status: 'published' })
+    const subs = []
+    for (let i = 0; i < 3; i++) {
+      r = await req('POST', `/api/public/forms/${cid}/submit`, { data: { c1: `计划 ${i}`, c2: `教训 ${i}` } })
+      subs.push(r.json.id)
+    }
+    // 还没有任何留痕：说清楚「还没有同一道题被两位老师批过」，而不是给一张空表
+    r = await req('GET', `/api/forms/${cid}/review-calibration`)
+    assert(r.status === 200 && r.json.data.conflicts === 0 && /还不能|没有/.test(r.json.data.note),
+      '没留痕时给出说明而不是一张空表', JSON.stringify(r.json.data?.note))
+
+    const adminCk = cookie
+    await req('POST', '/api/auth/register', { username: 'calib_b', password: 'cb-pass-123', nickname: '李老师' })
+    const add = await call(adminCk, 'POST', `/api/forms/${cid}/members`, { username: 'calib_b', role: 'editor' })
+    assert(add.status === 201, '把第二位老师拉进这张卷子', JSON.stringify(add.json))
+    const li = await asUser('calib_b', 'cb-pass-123')
+    // 张老师（管理员）批第 1 份的 c1 给 6 分
+    cookie = adminCk
+    r = await req('PUT', `/api/submissions/${subs[0]}/review`, { scores: { c1: 6 } })
+    assert(r.status === 200, '张老师给出 6 分', JSON.stringify(r.json))
+    // 李老师对同一份同一题给 18 分
+    r = await call(li, 'PUT', `/api/submissions/${subs[0]}/review`, { scores: { c1: 18 } })
+    assert(r.status === 200, '李老师对同一份同一题给出 18 分', JSON.stringify(r.json))
+
+    cookie = adminCk
+    r = await req('GET', `/api/forms/${cid}/review-calibration`)
+    const cal = r.json.data
+    assert(r.status === 200, '尺度接口可用', JSON.stringify(r.json))
+    assert(cal.conflicts === 1 && cal.questions.length === 1, '同一题两人给出不同的分 → 一处分歧', JSON.stringify({ c: cal.conflicts }))
+    assert(cal.questions[0].id === 'c1' && cal.questions[0].worst.gap === 12, '差 12 分（6 vs 18）', JSON.stringify(cal.questions[0]?.worst))
+    assert(cal.questions[0].level === '明显', '差 12 分在满分 20 的题上算「明显」', cal.questions[0]?.level)
+    assert(cal.questions[0].worst.by.some(x => /李老师/.test(x.name)) && cal.questions[0].worst.by.some(x => /李老师/.test(x.name) === false),
+      '并列写着两个人各自的分数', JSON.stringify(cal.questions[0]?.worst.by))
+    assert(cal.pairs.length === 1 && cal.pairs[0].count === 1, '两两对账也记一笔', JSON.stringify(cal.pairs))
+    assert(cal.teachers.length >= 2, '参与批阅的账号列出来', JSON.stringify(cal.teachers))
+
+    // 第二个人给了同样的分：不留痕，所以也不会被误算成一处分歧。
+    // 这条是在守「分数没动就不留痕」与「分歧只数真被改过的地方」两件事的一致性
+    r = await call(li, 'PUT', `/api/submissions/${subs[1]}/review`, { scores: { c1: 9 } })
+    cookie = adminCk
+    r = await req('PUT', `/api/submissions/${subs[1]}/review`, { scores: { c1: 9 } })
+    assert(r.status === 200, '同一道题给同样的分也照常保存', JSON.stringify(r.json))
+    r = await req('GET', `/api/forms/${cid}/review-calibration`)
+    assert(r.json.data.conflicts === 1, '给分一致的题不会被算成一处分歧（同分不留痕）',
+      JSON.stringify({ conflicts: r.json.data.conflicts }))
+    // 李老师先批、管理员再输一遍同样的分：分数没动 → 不留痕 → 不会多算一处不一致。
+    // 「同分不留痕」与「分歧只数真被改过的地方」在这里必须对得上
+    assert(r.json.data.questions.length === 1 && r.json.data.questions[0].cells.length === 1,
+      '同分那次不留痕，分歧清单不会虚增', JSON.stringify(r.json.data.questions?.map(q => q.cells.length)))
+
+    // 不同份卷子上的同一道题不算同一格
+    r = await req('PUT', `/api/submissions/${subs[2]}/review`, { scores: { c2: 2 } })
+    r = await call(li, 'PUT', `/api/submissions/${subs[2]}/review`, { scores: { c2: 2 } })
+    cookie = adminCk
+    // 撤分也不参与对账：把撤分当 0 分算，一次误操作就会让整张尺子歪掉
+    r = await req('PUT', `/api/submissions/${subs[2]}/review`, { scores: { c2: null } })
+    r = await req('GET', `/api/forms/${cid}/review-calibration`)
+    assert(r.json.data.conflicts === 1, '撤分之后分歧数不会凭空变多', JSON.stringify({ conflicts: r.json.data.conflicts }))
+
+    // 问卷没有阅卷，也就没有尺度可对
+    r = await req('POST', '/api/forms', { title: '尺度问卷', kind: 'survey', schema: [] })
+    const survey = r.json.id
+    r = await req('GET', `/api/forms/${survey}/review-calibration`)
+    assert(r.status === 400 && /批阅/.test(r.json.message), '问卷没有评分尺度', `${r.status} ${r.json.message}`)
+
+    // 尺度会暴露「这份卷子谁给了几分」：无关账号与只读协作者都不该看
+    const holder = cookie
+    await req('POST', '/api/auth/register', { username: 'calib_r', password: 'cr-pass-123', nickname: '旁听老师' })
+    const ro = await asUser('calib_r', 'cr-pass-123')
+    r = await call(ro, 'GET', `/api/forms/${cid}/review-calibration`)
+    assert(r.status === 403, '无关账号看不了评分尺度', `${r.status} ${r.json?.message || ''}`)
+    cookie = holder
+    const addRo = await req('POST', `/api/forms/${cid}/members`, { username: 'calib_r', role: 'viewer' })
+    assert(addRo.status === 201, '把旁听老师加为只读协作者', JSON.stringify(addRo.json))
+    r = await call(ro, 'GET', `/api/forms/${cid}/review-calibration`)
+    assert(r.status === 403, '只读协作者看不了评分尺度（它会暴露谁给了几分）', `${r.status} ${r.json?.message || ''}`)
+    cookie = holder
+  }
+
   console.log('\n[44] 阅卷键盘：能提交什么、Enter 往哪走')
 
   {

@@ -5,7 +5,7 @@ import { ok, err, confirmBox, fmtDate, Empty, Modal, Pagination, escapeHtml } fr
 import { Icon } from '../icons.js'
 import { renderControl, answerDisplay } from '../renderer.js'
 import { buildFlow } from '../flow.js'
-import { batchPayload, nextIndex, reviewProgress, afterSave, elapsedSeconds, changeText, changeLine, humanSeconds } from '../review.js'
+import { batchPayload, nextIndex, reviewProgress, afterSave, elapsedSeconds, changeText, changeLine, humanSeconds, gapLevel } from '../review.js'
 
 export default {
   setup() {
@@ -347,6 +347,26 @@ export default {
       }
     }
 
+    /* ---------------- 评分尺度 ----------------
+     *
+     * 留痕能追到「谁批的、改了什么」，但两个人对同一题给出 4 分和 18 分时，
+     * 系统只是把两条并排摆着，成绩单照旧只有一个总分。教研组真做的事是
+     * 「同一道题先各自批 10 份，对一遍尺子再开工」——这件事现在能看了。
+     */
+    const calibration = ref(null)
+    const openCalibration = async () => {
+      if (!form.value) return err('请先在左上角选择一个具体表单')
+      if (form.value.kind !== 'exam') return err('只有考试需要批阅')
+      try {
+        calibration.value = { title: form.value.title, loading: true }
+        const r = await api.get(`/api/forms/${formId.value}/review-calibration`)
+        calibration.value = { title: form.value.title, loading: false, ...r.data }
+      } catch (e) {
+        calibration.value = null
+        err(e.message)
+      }
+    }
+
     const openBatch = async () => {
       if (!form.value) return err('请先在左上角选择一个具体表单')
       if (form.value.kind !== 'exam') return err('只有考试需要批阅')
@@ -564,6 +584,10 @@ export default {
         form.value?.kind === 'exam'
           ? h('button', { class: 'btn sm primary', onClick: openBatch, title: '一页十份一起批，不用一份一份点开' }, '批量阅卷')
           : null,
+        // 尺度对账跟批量阅卷是同一件事的两端：一个往前批，一个回头对尺子
+        form.value?.kind === 'exam'
+          ? h('button', { class: 'btn sm', onClick: openCalibration, title: '同一道题两个人给了差多远的分' }, '评分尺度')
+          : null,
         h('button', { class: 'btn sm danger', onClick: batchDelete }, '批量删除'),
         h('button', { class: 'btn sm primary', onClick: () => openEdit({ id: 0, data: {}, marked: 0 }) }, '+ 新增答卷')
       ]),
@@ -751,6 +775,88 @@ export default {
           h('button', { class: 'btn', onClick: () => review.value = null }, '取消'),
           h('button', { class: 'btn primary', onClick: saveReview }, '保存并重算成绩')
         ]
+      }) : null,
+
+      calibration.value ? Modal({
+        title: `评分尺度 · ${calibration.value.title}`, modelValue: true,
+        onClose: () => calibration.value = null, wide: true,
+        children: h('div', {}, calibration.value.loading
+          ? h('div', { style: 'padding:20px' }, '正在回放批阅留痕…')
+          : [
+            /*
+             * 头一句只说两件事：对过多少格、其中有几格不一致。
+             * 「同一道题被两个人给过不同的分」才是证据，「两个人平均分不同」不是——
+             * 他们批的可能是不同考生的答案，考生水平本来就有差。
+             */
+            h('div', { class: 'flex between wrap', style: 'gap:8px;align-items:baseline' }, [
+              h('span', { class: 'small', style: 'font-weight:600' },
+                calibration.value.conflicts
+                  ? `两位老师对同一道题给出不同分数的地方：${calibration.value.conflicts} 处`
+                  : (calibration.value.note || '还没有同一道题被两位老师给出不同的分')),
+              h('span', { class: 'small muted' }, `回放 ${calibration.value.logs || 0} 条批阅留痕`)
+            ]),
+            /*
+             * 分母看不见这件事得说出来：同分不留痕，所以「对过几处」只能算个下限。
+             * 摆一个假分母上去（比如「共对过 20 处，其中 18 处不一致」）比不摆更糟。
+             */
+            h('div', { class: 'small muted', style: 'margin-top:6px' },
+              '同一个人给的分没被人改过就不会留痕，所以这里只统计「被后一位老师改过」的地方——它是下限，不是全部。'),
+            calibration.value.questions?.length ? h('div', { style: 'margin-top:12px' }, [
+              ...calibration.value.questions.map(q => h('div', {
+                class: 'calib-row', style: 'padding:12px 14px;border:1px solid var(--line);border-radius:10px;margin-bottom:10px'
+              }, [
+                h('div', { class: 'flex between wrap', style: 'gap:8px;align-items:flex-start' }, [
+                  h('div', { style: 'font-size:13.5px;line-height:1.5;font-weight:520' }, q.label),
+                  h('div', { class: 'flex', style: 'gap:6px;align-items:center;flex:none' }, [
+                    h('span', { class: 'tag' }, `满分 ${q.max}`),
+                    // 差 1 分不值得开会，差 10 分才值得：门槛按比例算，不按绝对分算
+                    gapLevel(q.worst?.gap, q.max)
+                      ? h('span', { class: ['tag', gapLevel(q.worst?.gap, q.max) === '明显' ? 'danger' : 'warn'] },
+                          gapLevel(q.worst?.gap, q.max))
+                      : null
+                  ])
+                ]),
+                // 每一处并排写清楚是谁给了几分：平均成一句「平均差 7 分」就看不出是 4 和 18
+                ...q.cells.slice(0, 4).map(c => h('div', {
+                  class: 'small', style: 'margin-top:6px;color:var(--text-2)'
+                }, [
+                  h('span', { class: 'mono muted', style: 'margin-right:6px' }, `#${c.submissionId}`),
+                  ...c.by.map((p2, i) => h('span', {}, [
+                    i ? h('span', { class: 'muted', style: 'margin:0 5px' }, 'vs') : null,
+                    h('b', {}, p2.name || '未知账号'),
+                    h('span', {}, ` ${p2.value} 分`)
+                  ])),
+                  h('span', { class: 'muted', style: 'margin-left:8px' }, `差 ${c.gap} 分`)
+                ])),
+                q.cells.length > 4
+                  ? h('div', { class: 'small muted', style: 'margin-top:4px' }, `另有 ${q.cells.length - 4} 处不一致未展开`)
+                  : null
+              ]))
+            ]) : null,
+            /*
+             * 两两对账。人数 >2 的教研组真正要问的是「谁的标准偏松」，
+             * 而这只有两两之间对过同一批格子才说得清。
+             */
+            calibration.value.pairs?.length ? h('div', { style: 'margin-top:14px' }, [
+              h('div', { class: 'small', style: 'font-weight:600;margin-bottom:6px' }, '两两对账'),
+              ...calibration.value.pairs.map(p2 => h('div', {
+                class: 'small', style: 'padding:8px 0;border-top:1px dashed var(--line);color:var(--text-2)'
+              }, [
+                h('b', {}, p2.a || '未知账号'), h('span', { class: 'muted', style: 'margin:0 6px' }, 'vs'),
+                h('b', {}, p2.b || '未知账号'),
+                // 说的只能是「被改过 N 处」：同分不留痕，两人意见一致的地方在库里不存在
+                h('span', { style: 'margin-left:8px' }, `被改过 ${p2.count} 处 · 平均差 ${p2.avgGap} 分`),
+                // 偏松/偏紧写在后半句，结论要能一句话读完
+                p2.bias ? h('span', { style: 'margin-left:8px' },
+                  `（${p2.bias > 0 ? p2.a : p2.b} 平均高 ${Math.abs(p2.bias)} 分）`) : h('span', { style: 'margin-left:8px' }, '（没有系统性偏向）')
+              ]))
+            ]) : null,
+            calibration.value.teachers?.length > 1
+              ? h('div', { class: 'small muted', style: 'margin-top:12px' },
+                  '参与批阅的账号：' + calibration.value.teachers.map(t => `${t.name || '未知账号'}（${t.gradings} 次）`).join(' · '))
+              : null
+          ]),
+        footer: [h('button', { class: 'btn', onClick: () => calibration.value = null }, '关闭')]
       }) : null,
 
       batch.value ? Modal({

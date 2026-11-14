@@ -152,3 +152,113 @@ export function elapsedSeconds(from, to, max = 6 * 3600) {
   if (s <= 0 || s > max) return 0
   return s
 }
+
+/**
+ * 评分尺度：同一份卷子的同一道题，被两位老师分别给过分，差了多少。
+ *
+ * 留痕能追到「谁批的、改了什么」，但两个人对同一题给出 4 分和 18 分时，
+ * 系统只是把两条并排摆着，不会提醒任何人。真实的教研组做法是「同一道题先各自批 10 份，
+ * 对一遍尺子再开工」，而这件事此前只能靠人喊。
+ *
+ * 口径上有一条必须守住：**只有「同一份卷子的同一道题被两个人给过不同的分」才算证据**。
+ * 「这道题张老师平均给 12、李老师平均给 15」不算——他们批的可能是不同学生的答案，
+ * 考生水平本来就有差。把这两件事混成一个「分歧指数」，换来的只是一个没人敢信的排行榜。
+ *
+ * 还有一条只能承认、不能糊过去：**给分一致的两个人是不留痕的**。
+ * 「分数没动就不留痕」是上一轮刻意定下的（打开看一眼就关掉不该长出空记录），
+ * 于是第二个老师如果给了同样的分，库里什么都没有。所以这里的分母是看不见的，
+ * 能报的只有「真被后一位老师改过的地方」——不编一个「共对过 N 处」糊在上面。
+ *
+ * 回放按时间顺序走留痕：每位老师在每一格上的**最后一次**给分为准。
+ * 撤分（to === null）表示「这个人对这格没有分数」，不是 0 分——
+ * 把撤分当 0 算，一次误操作就会让整张尺子歪掉。
+ */
+export function calibrate(entries, { maxOf = () => 0 } = {}) {
+  const who = (e) => (Number(e.userId) > 0 ? `u${e.userId}` : `n${e.username || '?'}`)
+  // (答卷, 题目) → { id, label, by: Map(老师 → { name, value, at }) }
+  const cells = new Map()
+  const teachers = new Map()
+  for (const e of entries || []) {
+    const key = who(e)
+    if (!teachers.has(key)) teachers.set(key, { name: e.username || '未知账号', gradings: 0 })
+    for (const c of e.changes || []) {
+      const ck = `${e.submissionId}::${c.id}`
+      if (!cells.has(ck)) cells.set(ck, { submissionId: Number(e.submissionId), id: c.id, label: c.label || c.id, by: new Map() })
+      const cell = cells.get(ck)
+      // 后写的覆盖先写的：留痕是按时间排的，「最后给了几分」才是这名老师现在的口径
+      cell.by.set(key, { name: teachers.get(key).name, value: c.to === undefined ? null : c.to, at: e.createdAt || '' })
+    }
+    if ((e.changes || []).length) teachers.get(key).gradings++
+  }
+
+  const questions = new Map()
+  const pairs = new Map()
+  /*
+   * 只报 conflicts，不报「共对过几处」。
+   * 「对过」的分母在库里根本不存在：分数没动就不留痕（打开看一眼就关掉不该长出空记录），
+   * 所以第二个老师给了同样的分时什么都没记下。一个必然偏小的分母摆上去，
+   * 只会让人得出「我们分歧率 90%」这种结论。能数的只有「真被后一位老师改过的地方」。
+   */
+  let conflicts = 0
+  for (const cell of cells.values()) {
+    const given = [...cell.by.entries()].filter(([, v]) => v.value !== null && v.value !== undefined)
+    if (given.length < 2) continue
+    const values = given.map(([, v]) => Number(v.value))
+    const gap = Math.max(...values) - Math.min(...values)
+    if (gap === 0) continue
+    conflicts++
+    const max = Number(maxOf(cell.id)) || 0
+    const q = questions.get(cell.id) || { id: cell.id, label: cell.label, max, cells: [] }
+    q.max = q.max || max
+    q.cells.push({ submissionId: cell.submissionId, gap, ratio: max > 0 ? gap / max : 0, by: given.map(([, v]) => ({ name: v.name, value: Number(v.value) })) })
+    questions.set(cell.id, q)
+    // 两两对账：谁比谁松、松多少。两人只对过一道题也算数，只是次数少而己
+    for (let i = 0; i < given.length; i++) {
+      for (let j = i + 1; j < given.length; j++) {
+        const [ka, a] = given[i]
+        const [kb, b] = given[j]
+        const [k1, k2] = ka < kb ? [ka, kb] : [kb, ka]
+        const [v1, v2] = ka < kb ? [Number(a.value), Number(b.value)] : [Number(b.value), Number(a.value)]
+        const pk = `${k1}::${k2}`
+        const p = pairs.get(pk) || { a: teachers.get(k1).name, b: teachers.get(k2).name, count: 0, sum: 0, maxGap: 0 }
+        p.count++
+        p.sum += v1 - v2        // 正数 = 前者给得更高
+        p.maxGap = Math.max(p.maxGap, Math.abs(v1 - v2))
+        pairs.set(pk, p)
+      }
+    }
+  }
+
+  const list = [...questions.values()]
+    .map(q => ({
+      ...q,
+      // 同题里最扎眼的那一处排前面：一眼要看到「4 分 vs 18 分」，不是平均后才 7 分
+      worst: q.cells.reduce((a, b) => (b.gap > (a?.gap ?? -1) ? b : a), null),
+      cells: q.cells.sort((a, b) => b.gap - a.gap)
+    }))
+    .sort((a, b) => (b.worst?.gap || 0) - (a.worst?.gap || 0))
+
+  return {
+    conflicts,
+    questions: list,
+    pairs: [...pairs.values()]
+      .map(p => ({ ...p, avgGap: p.count ? Math.round((Math.abs(p.sum) / p.count) * 100) / 100 : 0, bias: p.count ? Math.round((p.sum / p.count) * 100) / 100 : 0 }))
+      .sort((a, b) => b.count - a.count || b.maxGap - a.maxGap),
+    teachers: [...teachers.values()].sort((a, b) => b.gradings - a.gradings)
+  }
+}
+
+/**
+ * 一处分歧有多值得管。
+ *
+ * 满分 20 的题差 1 分不值得开会，差 10 分才值得。所以门槛按比例算，不按绝对分算——
+ * 否则满分 5 分的题差 2 分和满分 50 分的题差 2 分会被判成同一件事。
+ */
+export function gapLevel(gap, max) {
+  const m = Number(max) || 0
+  if (!m || !(Number(gap) > 0)) return ''
+  const r = Number(gap) / m
+  if (r >= 0.3) return '明显'
+  if (r >= 0.15) return '值得看一眼'
+  return '轻微'
+}

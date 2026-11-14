@@ -38,7 +38,7 @@ import { submissionsXlsx, submissionsHead, submissionRow } from '../lib/sheet.js
 import { writeXlsxStream } from '../lib/xlsx.js'
 import { signFileUrl, signFileUrls, signHtmlFiles, QUERY_FILE_TTL } from '../lib/fileAccess.js'
 // 份数/分数的留痕口径只有一份：前端也是这套（web/js/review.js），两边说的必须是同一件事
-import { scoreChanges, changeText } from '../../web/js/review.js'
+import { scoreChanges, changeText, calibrate, gapLevel } from '../../web/js/review.js'
 
 function fingerprint(req, extra = {}) {
   return {
@@ -829,6 +829,59 @@ export default function register(r) {
     // done 只报「已批完」的份数，不报「扫过多少」：后者包含没有主观题的卷子，
     // 拿它做进度分子的话，刚打开阅卷界面就显示「已批 40 份」，一份都还没批。
     sendJson(res, 200, { ok: true, data, total: queue.length, need, done: Math.max(need - queue.length, 0), scanned, offset, limit })
+  })
+
+  /**
+   * 评分尺度：这道题，两个人给出过差多远的分。
+   *
+   * 留痕已经能回答「谁批的、改了什么」，但两条痕迹只是并排摆着——
+   * 张老师给 4 分、李老师给 18 分，系统不会提醒任何人，成绩单照旧只有一个总分。
+   * 教研组真正常做的事是「同一道题先各自批 10 份，对一遍尺子再开工」，
+   * 而这件事此前只能靠人喊。
+   *
+   * 不新建表：留痕里逐题记着 from/to，按时间回放就能还原「每一格最后是谁给了几分」。
+   * 多一张汇总表只会多一个会跟留痕对不上的地方。
+   */
+  r.get('/api/forms/:id/review-calibration', async (req, res, { params }) => {
+    const user = requirePerm(req, 'data:read')
+    const form = pickForm(params.id)
+    if (!form) fail(404, '表单不存在')
+    // 尺度对账会暴露「这份卷子谁给了几分」，只读协作者看报表就够了
+    requireFormRole(user, form, 'edit')
+    if (form.kind !== 'exam') fail(400, '只有考试答卷需要批阅')
+    const url = new URL(req.url, 'http://x')
+    const days = Math.min(Math.max(Number(url.searchParams.get('days')) || 0, 0), 365)
+    const since = days ? new Date(Date.now() - days * 86400_000).toISOString() : ''
+    /*
+     * 只取「有改动」的留痕。回放要的是每一格最后一次的值，
+     * 而 review_logs.changes 是 JSON，SQL 里拆不开——一次考试几千条而已，读回来再算。
+     * 按 id 正序：后写的覆盖先写的，跟写入端的时间顺序一致。
+     */
+    const rows = all(`SELECT id, submission_id, user_id, username, changes, created_at FROM review_logs
+      WHERE form_id = ?${since ? ' AND created_at >= ?' : ''} ORDER BY id ASC`,
+      ...(since ? [form.id, since] : [form.id]))
+    const entries = rows.map(r => ({
+      submissionId: r.submission_id, userId: r.user_id, username: r.username || '',
+      createdAt: r.created_at, changes: safeJson(r.changes, [])
+    }))
+    // 满分从当前 schema 取：尺度说的「差了几分」必须跟题目现在的分值对得上
+    const maxOf = id => Number(form.schema.find(f => f.id === id)?.score) || 0
+    const result = calibrate(entries, { maxOf })
+    // 每道题再标一句人话，别让前端各算一遍口径
+    for (const q of result.questions) q.level = gapLevel(q.worst?.gap, q.max)
+    sendJson(res, 200, {
+      ok: true,
+      data: {
+        ...result,
+        logs: entries.length,
+        /*
+         * 没有分歧时要说清是哪种「没有」：一张空表会让人以为功能坏了。
+         * 而且这句话不能吹：「同分不留痕」（分数没动就不落记录），所以
+         * 「两人给分一致」在库里其实是看不见的——能说的只有「没找到改过分的地方」。
+         */
+        note: result.conflicts ? '' : '还没有同一道题被两位老师给出不同的分（同分不留痕，所以一致的那些看不见）'
+      }
+    })
   })
 
   /** 从回收站恢复一份答卷 */
