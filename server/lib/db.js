@@ -16,6 +16,36 @@ PRAGMA foreign_keys = ON;
 PRAGMA busy_timeout = 5000;
 `)
 
+/*
+ * 批阅留痕。
+ *
+ * submissions 上的 reviewed_at / reviewed_by 只记得「最后一次」，而且改一次就覆盖一次：
+ * 「这份卷子两道题的分差得离谱，是谁批的、什么时候批的」在真学校里是会被追问的，
+ * 而库里的答复永远是同一个人的同一个时间点。这里按「次」记：谁、什么时候、动了哪几题、
+ * 从几分改到几分、这份卷子花了多久，以及是最新一次还是历史。
+ *
+ * 单独抽成一段 SQL 是有原因的：导入老备份时 switchDb 直接顶替库文件，
+ * 老库里没有这张表——不补的话，第一次批阅就会撞一句 no such table。
+ */
+const REVIEW_LOG_DDL = `
+CREATE TABLE IF NOT EXISTS review_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  submission_id INTEGER NOT NULL,
+  form_id INTEGER NOT NULL,
+  user_id INTEGER NOT NULL DEFAULT 0,
+  username TEXT DEFAULT '',
+  source TEXT NOT NULL DEFAULT 'single',
+  seconds INTEGER NOT NULL DEFAULT 0,
+  score_before REAL,
+  score_after REAL,
+  changes TEXT NOT NULL DEFAULT '[]',
+  note TEXT DEFAULT '',
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_review_logs_sub ON review_logs(submission_id, id);
+CREATE INDEX IF NOT EXISTS idx_review_logs_form ON review_logs(form_id, id);
+`
+
 const now = () => new Date().toISOString()
 
 db.exec(`
@@ -249,6 +279,7 @@ CREATE INDEX IF NOT EXISTS idx_forms_kind ON forms(kind, deleted_at);
 CREATE INDEX IF NOT EXISTS idx_sub_created ON submissions(created_at);
 /* 按表单 + 时间取数（时间范围筛选）走这条，省掉回表 */
 CREATE INDEX IF NOT EXISTS idx_sub_form_created ON submissions(form_id, created_at);
+${REVIEW_LOG_DDL}
 /*
  * 成绩排名按 (表单, 分数倒序) 取前 N 名。
  * 没有这条索引时，SQLite 要把这个表单的全部答卷读出来排一遍才能给出前 20 名——
@@ -330,6 +361,8 @@ PRAGMA synchronous = NORMAL;
 PRAGMA foreign_keys = ON;
 PRAGMA busy_timeout = 5000;
 `)
+  // 导入老备份时库文件是直接顶替的，新表要在这里补齐，否则第一条批阅就 no such table
+  db.exec(REVIEW_LOG_DDL)
   resetStatementCache()
   return db
 }

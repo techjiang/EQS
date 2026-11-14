@@ -37,6 +37,8 @@ import { rankingTop, rankOf, publicRanking, distributionOf } from '../lib/rankin
 import { submissionsXlsx, submissionsHead, submissionRow } from '../lib/sheet.js'
 import { writeXlsxStream } from '../lib/xlsx.js'
 import { signFileUrl, signFileUrls, signHtmlFiles, QUERY_FILE_TTL } from '../lib/fileAccess.js'
+// 份数/分数的留痕口径只有一份：前端也是这套（web/js/review.js），两边说的必须是同一件事
+import { scoreChanges, changeText } from '../../web/js/review.js'
 
 function fingerprint(req, extra = {}) {
   return {
@@ -153,6 +155,40 @@ function cachedReport(form) {
 /** 列表/详情统一带上人工分，前端不用再 parse 一次 */
 function withManual(row) {
   return { ...submissionData(row), manual_scores: manualScoresOf(row) }
+}
+
+/**
+ * 批阅留痕的读法。
+ *
+ * 与写入端（applyReview）成对：那边记「谁、什么时候、动了哪几题」，这边只负责按次取回来。
+ * changes 里存的是 JSON 数组，解析失败不给 500——一条坏记录不该让整页批阅历史打不开。
+ */
+function reviewLogs(submissionId, limit = 50) {
+  return all(`SELECT id, user_id, username, source, seconds, score_before, score_after, changes, note, created_at
+    FROM review_logs WHERE submission_id = ? ORDER BY id DESC LIMIT ?`, Number(submissionId), Math.min(Math.max(Number(limit) || 50, 1), 200))
+    .map(r => ({
+      id: r.id, userId: r.user_id, username: r.username || '', source: r.source,
+      seconds: r.seconds || 0, scoreBefore: r.score_before, scoreAfter: r.score_after,
+      changes: safeJson(r.changes, []), note: r.note || '', createdAt: r.created_at
+    }))
+}
+
+/**
+ * 一页答卷的批阅人姓名。
+ *
+ * 列表里每个人一行、每行都要显示「谁批的」，逐行 pickUser 一遍就是 N+1 次查询；
+ * 而一页 20 行的批阅人常常只有两三个。这里按 id 去重取一次，查不到就给空串——
+ * 账号被删掉之后，姓名列退化成空比显示「#7」更像人话。
+ */
+function reviewerNames(rows) {
+  const ids = [...new Set(rows.map(r => Number(r.reviewed_by) || 0).filter(Boolean))]
+  const map = new Map()
+  if (ids.length) {
+    for (const u of all(`SELECT id, nickname, username FROM users WHERE id IN (${ids.map(() => '?').join(',')})`, ...ids)) {
+      map.set(u.id, u.nickname || u.username || '')
+    }
+  }
+  return id => map.get(Number(id) || 0) || ''
 }
 
 export default function register(r) {
@@ -540,10 +576,13 @@ export default function register(r) {
     const formCache = new Map()
     const withPending = (row) => {
       const base2 = withManual(row)
-      if (row.form_kind !== 'exam') return { ...base2, pending: 0 }
+      // 「谁批的」摆在行上：一封卷子两道题分差得离谱时，第一眼要看到的是人，不是一个时间戳
+      const reviewer = nameOf(row.reviewed_by)
+      if (row.form_kind !== 'exam') return { ...base2, pending: 0, reviewer }
       if (!formCache.has(row.form_id)) formCache.set(row.form_id, pickForm(row.form_id))
-      return { ...base2, pending: pendingLeft(formCache.get(row.form_id), row) }
+      return { ...base2, pending: pendingLeft(formCache.get(row.form_id), row), reviewer }
     }
+    const nameOf = reviewerNames(rows)
     sendJson(res, 200, { ok: true, data: rows.map(withPending), total, page: p.page, pageSize: p.pageSize, totalPages: p.totalPages })
   })
 
@@ -554,7 +593,22 @@ export default function register(r) {
     const form = pickForm(row.form_id, { withDeleted: true })
     // 单份答卷是明细，不是汇总：只读协作者看报表就够了
     if (form) requireFormRole(user, form, 'edit')
-    sendJson(res, 200, { ok: true, data: { ...withManual(row), form } })
+    const reviewer = reviewerNames([row])(row.reviewed_by)
+    // 批阅历史跟着详情一起给：批阅弹窗打开就要显示「上次谁批的、改了什么」，
+    // 再单独发一次请求会让弹窗先空一下再补上，等于把两次渲染拼在人眼前
+    sendJson(res, 200, { ok: true, data: { ...withManual(row), reviewer, review_logs: reviewLogs(row.id, 20), form } })
+  })
+
+  /** 一份答卷的批阅历史（按次倒序）：谁、什么时候、动了哪几题、从几分改到几分 */
+  r.get('/api/submissions/:id/review-logs', async (req, res, { params }) => {
+    const user = requirePerm(req, 'data:read')
+    const row = get('SELECT * FROM submissions WHERE id = ?', Number(params.id))
+    if (!row) fail(404, '答卷不存在')
+    const form = pickForm(row.form_id, { withDeleted: true })
+    if (form) requireFormRole(user, form, 'edit')
+    const url = new URL(req.url, 'http://x')
+    const logs = reviewLogs(row.id, url.searchParams.get('limit') || 50)
+    sendJson(res, 200, { ok: true, data: logs, total: logs.length })
   })
 
   r.post('/api/submissions', async (req, res) => {
@@ -601,8 +655,8 @@ export default function register(r) {
       const role = formRole(user, form)
       if (!role || role === 'viewer') { rejected.push({ id, reason: '无权批阅该答卷' }); continue }
       try {
-        const data = applyReview(user, row, form, it.scores, it.note, { merge: true })
-        saved.push({ id, score: data.score, review: data.review })
+        const data = applyReview(user, row, form, it.scores, it.note, { merge: true, source: 'batch', seconds: it.seconds })
+        saved.push({ id, score: data.score, review: data.review, changes: data.changes?.length || 0 })
       } catch (e) {
         rejected.push({ id, reason: e.message || '保存失败' })
       }
@@ -644,8 +698,11 @@ export default function register(r) {
    * 两条路各写一遍的话，「哪些题可以给分」很快会分叉——而分叉的后果是
    * 老师在工作台里给的分，换个入口保存就变成非法值。
    */
-  function applyReview(user, row, form, rawScores, note, { merge = false } = {}) {
+  function applyReview(user, row, form, rawScores, note, { merge = false, source = 'single', seconds = 0 } = {}) {
     const data = JSON.parse(row.data)
+    // 改之前的那份人工分：留痕要记「从几分改到几分」，而不是只记最后落在哪
+    const before = manualScoresOf(row)
+    const scoreBefore = row.score
     // 只认这份卷子里真有、且确实没有标准答案的题，防止给选择题凭空加分
     const subjective = new Map(form.schema.filter(f => isSubjective(f) && fieldVisible(f, data)).map(f => [f.id, f]))
     /*
@@ -667,10 +724,29 @@ export default function register(r) {
       scores[fid] = Math.round(n * 100) / 100
     }
     const g = gradeSubmission(form.schema, data, form.settings, scores)
+    const ts = now()
+    const finalNote = String(note ?? row.review_note ?? '').slice(0, 500)
     run('UPDATE submissions SET manual_scores = ?, score = ?, passed = ?, reviewed_at = ?, reviewed_by = ?, review_note = ?, updated_at = ? WHERE id = ?',
-      JSON.stringify(scores), g.score, g.passed ? 1 : 0, now(), user.id, String(note ?? row.review_note ?? '').slice(0, 500), now(), row.id)
+      JSON.stringify(scores), g.score, g.passed ? 1 : 0, ts, user.id, finalNote, ts, row.id)
+    /*
+     * 逐题留痕。
+     * submissions 上的 reviewed_at / reviewed_by 只记得「最后一次」，而且改一次覆盖一次：
+     * 「这份卷子是谁批的、这两道题的分差得离谱是不是同一个人给的」在真学校里是要被追问的，
+     * 而那一列永远只给出最后一个人、最后一个时间点。这里按「次」记：
+     * 谁、什么时候、动了哪几题、从几分改到几分、这份卷子花了多久。
+     *
+     * 只在真有改动时落一条：「打开看一眼就关掉」不该在留痕里长出一行空记录。
+     */
+    const changes = scoreChanges(before, scores, id => subjective.get(id)?.label || id)
+    if (changes.length) {
+      run(`INSERT INTO review_logs(submission_id, form_id, user_id, username, source, seconds, score_before, score_after, changes, note, created_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
+        row.id, row.form_id, user.id, user.nickname || user.username || '', source,
+        Math.min(Math.max(Math.round(Number(seconds) || 0), 0), 6 * 3600),
+        scoreBefore ?? null, g.score, JSON.stringify(changes), finalNote, ts)
+    }
     const updated = get('SELECT * FROM submissions WHERE id = ?', row.id)
-    return { ...withManual(updated), review: buildReview(form.schema, data, form.settings, scores) }
+    return { ...withManual(updated), review: buildReview(form.schema, data, form.settings, scores), changes }
   }
 
   r.put('/api/submissions/:id/review', async (req, res, { params }) => {
@@ -684,7 +760,7 @@ export default function register(r) {
     const body = await readJson(req)
     // 合并而不是覆盖：文档里一直写着「未出现在 scores 里的主观题保留原有分数」，
     // 而代码此前是整体替换——前端每次都把全部题目回传，所以没人发现这句话是假的。
-    const data = applyReview(user, row, form, body.scores, body.note, { merge: true })
+    const data = applyReview(user, row, form, body.scores, body.note, { merge: true, source: 'single', seconds: body.seconds })
     log(user, '批阅答卷', `#${row.id} → ${data.score}/${data.review?.total ?? '-'}`)
     dispatchWebhooks('update', { formId: form.id, formTitle: form.title, submission: withManual(get('SELECT * FROM submissions WHERE id = ?', row.id)) }).catch(() => {})
     sendJson(res, 200, { ok: true, data })
@@ -716,7 +792,7 @@ export default function register(r) {
     const queue = []
     let scanned = 0
     let need = 0
-    for (const row of each('SELECT id, public_id, data, manual_scores, score, passed, created_at, review_note, reviewed_at FROM submissions WHERE form_id = ? AND deleted_at IS NULL ORDER BY id ASC', form.id)) {
+    for (const row of each('SELECT id, public_id, data, manual_scores, score, passed, created_at, review_note, reviewed_at, reviewed_by FROM submissions WHERE form_id = ? AND deleted_at IS NULL ORDER BY id ASC', form.id)) {
       scanned++
       const tally = reviewTally(form, row)
       if (!tally.subjective) continue
@@ -725,6 +801,7 @@ export default function register(r) {
       queue.push(row)
     }
     const page = queue.slice(offset, offset + limit)
+    const nameOfReviewer = reviewerNames(page)
     const data = page.map(row => {
       const answers = JSON.parse(row.data)
       const manual = manualScoresOf(row)
@@ -742,6 +819,9 @@ export default function register(r) {
       return {
         id: row.id, publicId: row.public_id, createdAt: row.created_at,
         score: row.score, passed: row.passed, note: row.review_note || '',
+        // 这一份之前有没有人动过：批量阅卷里最怕「两个人各批了一半，谁也不知道对方给了多少」
+        reviewedAt: row.reviewed_at || '', reviewedBy: row.reviewed_by || 0,
+        reviewer: nameOfReviewer(row.reviewed_by),
         answeredCount: items.filter(i => i.given).length,
         items
       }
@@ -874,7 +954,14 @@ export default function register(r) {
      * 代价是拿不到 Content-Length（流式长度未知），所以不设它——让浏览器按 chunked 收。
      */
     const { schema, head } = submissionsHead(form)
-    const cursor = each(`SELECT id, public_id, data, score, passed, created_at, reviewed_at, switch_count, flagged FROM submissions WHERE ${where.join(' AND ')} ORDER BY id DESC`, ...args)
+    /*
+     * 批阅人用子查询带出来，而不是 JOIN users：
+     * 导出沿用同一个 where（列名裸露、没有表别名），JOIN 之后 id / created_at 立刻变成歧义列，
+     * 而要改的就是「按时间范围导出」这种最常用的语句。外层仍叫 submissions，where 一个字不用动。
+     */
+    const cursor = each(`SELECT id, public_id, data, score, passed, created_at, reviewed_at, switch_count, flagged,
+      (SELECT COALESCE(NULLIF(u.nickname, ''), u.username, '') FROM users u WHERE u.id = submissions.reviewed_by) AS reviewer_name
+      FROM submissions WHERE ${where.join(' AND ')} ORDER BY id DESC`, ...args)
     const rows = {
       [Symbol.asyncIterator]() {
         let first = true

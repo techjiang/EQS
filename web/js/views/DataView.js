@@ -5,7 +5,7 @@ import { ok, err, confirmBox, fmtDate, Empty, Modal, Pagination, escapeHtml } fr
 import { Icon } from '../icons.js'
 import { renderControl, answerDisplay } from '../renderer.js'
 import { buildFlow } from '../flow.js'
-import { batchPayload, nextIndex, reviewProgress, afterSave } from '../review.js'
+import { batchPayload, nextIndex, reviewProgress, afterSave, elapsedSeconds, changeText, changeLine, humanSeconds } from '../review.js'
 
 export default {
   setup() {
@@ -254,6 +254,12 @@ export default {
           title: f.title,
           note: sub.review_note || '',
           reviewedAt: sub.reviewed_at || '',
+          // 上次是谁批的、这之前改过几次：一份卷子两个人先后批过，
+          // 分差得离谱时要能一眼看出不是同一个人给的
+          reviewer: sub.reviewer || '',
+          logs: sub.review_logs || [],
+          // 这一次从什么时候开始下手：留痕里的「耗时」不该从弹窗打开算起
+          startedAt: 0,
           scores: { ...(sub.manual_scores || {}) },
           items: subjective.map(q => ({
             id: q.id, label: q.label, score: Number(q.score) || 0,
@@ -265,6 +271,7 @@ export default {
 
     /** 默认把「还没给过分」的题按 0 分填上：卷面分先落地，避免整张卷子永远停在待批阅 */
     const fillZero = () => {
+      touchReview()
       for (const it of review.value.items) {
         if (review.value.scores[it.id] === undefined || review.value.scores[it.id] === '') review.value.scores[it.id] = 0
       }
@@ -273,7 +280,9 @@ export default {
     const saveReview = async () => {
       try {
         const r = await api.put(`/api/submissions/${review.value.id}/review`, {
-          scores: review.value.scores, note: review.value.note
+          scores: review.value.scores, note: review.value.note,
+          // 只记「真的动手」的那一段：打开看一眼就关掉，不该在留痕里多出一次耗时
+          seconds: elapsedSeconds(review.value.startedAt, Date.now())
         })
         const total = r.data.review ? `${r.data.review.total} 分` : ''
         ok(`批阅完成${total ? `，重新计算成绩 ${total}` : ''}`)
@@ -281,6 +290,9 @@ export default {
         load()
       } catch (e) { err(e.message) }
     }
+
+    /** 单份批阅里第一次动分数的那一刻，用来算这一份批了多久 */
+    const touchReview = () => { if (review.value && !review.value.startedAt) review.value.startedAt = Date.now() }
     /* ---------------- 批量阅卷 ----------------
      *
      * 以前批一份卷子要五步：点开 → 给分 → 保存 → 等列表刷新 → 点开下一份。
@@ -358,6 +370,8 @@ export default {
         // 「撤掉已给的分，退回待批」要单记一笔：空串表示「本来就没批」，
         // 两者混成一个状态的话，撤分这份永远赖在队列里
         revoke: new Set(),
+        // 这一份第一次动手的时间：耗时按份算，不按整页算
+        startedAt: 0,
         noteDraft: x.note || ''
       }))
       batch.value = {
@@ -422,8 +436,12 @@ export default {
     }
 
     const fillBatch = (x, value) => {
+      if (!x.startedAt) x.startedAt = Date.now()
       for (const it of x.items) x.draft[it.id] = String(value === 'full' ? it.score : 0)
     }
+
+    /** 这一份第一次动手的时间：耗时按份算，不按整页算 */
+    const touchRow = (x) => { if (!x.startedAt) x.startedAt = Date.now() }
 
     const openEdit = async (row) => {
       // 编辑弹窗用的是这条答卷自己的卷子。之前直接改 form.value，
@@ -590,7 +608,14 @@ export default {
                 h('td', { class: 'nowrap stick-score' }, r.score != null
                   ? h('span', {}, [
                       h('span', { class: ['tag', r.passed ? 'ok' : 'warn'] }, String(r.score)),
-                      r.reviewed_at ? h('span', { class: 'tag', style: 'margin-left:4px' }, '已批阅') : null
+                      // 「谁批的」比「批过了」更重要：一封卷子两道题分差得离谱时，
+                      // 先要知道这是不是一个人给的
+                      r.reviewed_at
+                        ? h('span', {
+                            class: 'tag', style: 'margin-left:4px',
+                            title: `批阅人：${r.reviewer || '未知账号'}`
+                          }, r.reviewer ? `批：${r.reviewer}` : '已批阅')
+                        : null
                     ])
                   : '-'),
                 h('td', { class: 'nowrap stick-ops' }, h('div', { class: 'flex', style: 'gap:4px' }, [
@@ -647,8 +672,29 @@ export default {
           onKeydown: e => { if (e.key === 'Escape') review.value = null }
         }, [
           h('div', { class: 'small muted mb' }, review.value.reviewedAt
-            ? `上次批阅：${fmtDate(review.value.reviewedAt)}，可再次调整`
+            ? `上次批阅：${fmtDate(review.value.reviewedAt)}${review.value.reviewer ? ` · ${review.value.reviewer}` : ''}，可再次调整`
             : '主观题没有标准答案，需要人工给分；给完分系统会重算总分与及格判定'),
+          // 批阅历史摊在打开就能看到的位置：一份卷子两个人先后批过，
+          // 两道题的分差得离谱时，第一眼要看的是「是不是同一个人给的」
+          review.value.logs?.length ? h('details', { class: 'review-logs mb' }, [
+            h('summary', {}, `批阅记录 ${review.value.logs.length} 次`,
+              h('span', { class: 'small muted', style: 'margin-left:8px' },
+                changeText(review.value.logs[0].changes || []))),
+            ...review.value.logs.map(lg => h('div', { class: 'review-log-item' }, [
+              h('div', { class: 'flex between wrap', style: 'gap:8px' }, [
+                h('span', { class: 'small', style: 'font-weight:600' },
+                  `${lg.username || '未知账号'} · ${fmtDate(lg.createdAt)}`),
+                h('span', { class: 'small muted' },
+                  [lg.source === 'batch' ? '批量阅卷' : '单份批阅',
+                    humanSeconds(lg.seconds) ? `用时 ${humanSeconds(lg.seconds)}` : '',
+                    lg.scoreBefore !== null && lg.scoreBefore !== undefined && lg.scoreAfter !== null
+                      ? `${lg.scoreBefore} → ${lg.scoreAfter} 分` : ''].filter(Boolean).join(' · '))
+              ]),
+              h('div', { class: 'small', style: 'margin-top:2px;color:var(--text-2)' },
+                (lg.changes || []).map(c => `${c.label}：${changeLine(c)}`).join('；') || '没有改动'),
+              lg.note ? h('div', { class: 'small muted', style: 'margin-top:2px' }, '备注：' + lg.note) : null
+            ]))
+          ]) : null,
           h('div', { class: 'kbd-bar' }, [
             h('span', {}, [h('kbd', {}, '数字'), ' 直接填分']),
             h('span', {}, [h('kbd', {}, 'Enter'), ' 下一题，最后一题再按一次 = 保存']),
@@ -680,15 +726,16 @@ export default {
                 onKeydown: scoreKeys(reviewInputs, saveReview),
                 onInput: e => {
                   const v = e.target.value
+                  touchReview()
                   if (v === '') delete review.value.scores[it.id]
                   else review.value.scores[it.id] = Number(v)
                 }
               }),
               h('button', {
-                class: 'btn sm', onClick: () => review.value.scores[it.id] = it.score
+                class: 'btn sm', onClick: () => { touchReview(); review.value.scores[it.id] = it.score }
               }, '满分'),
               h('button', {
-                class: 'btn sm', onClick: () => review.value.scores[it.id] = 0
+                class: 'btn sm', onClick: () => { touchReview(); review.value.scores[it.id] = 0 }
               }, '0 分')
             ])
           ])),
@@ -736,7 +783,15 @@ export default {
                 h('b', {}, `#${x.id}`),
                 x.publicId ? h('span', { class: 'mono small muted' }, x.publicId) : null,
                 h('span', { class: 'small muted' }, fmtDate(x.createdAt)),
-                h('span', { class: 'tag' }, `客观题 ${x.score ?? '-'} 分`)
+                h('span', { class: 'tag' }, `客观题 ${x.score ?? '-'} 分`),
+                // 这一份别人已经批过一部分：两口子/两位老师同时批同一场时，
+                // 谁给了多少分必须一眼看得见，否则两份分差得离谱也没人知道是两个人干的
+                x.reviewedAt
+                  ? h('span', {
+                      class: 'tag warn',
+                      title: `${x.reviewer || '未知账号'} 于 ${fmtDate(x.reviewedAt)} 批阅过，这次是接着改`
+                    }, `上次由 ${x.reviewer || '未知账号'} 批`)
+                  : null
               ]),
               h('div', { class: 'flex', style: 'gap:4px' }, [
                 h('button', { class: 'btn ghost sm', onClick: () => fillBatch(x, 'zero') }, '全 0 分'),
@@ -760,18 +815,19 @@ export default {
                   onFocus: e => e.target.select?.(),
                   onKeydown: scoreKeys(scoreInputs, saveBatch),
                   onInput: e => {
+                    touchRow(x)
                     x.revoke.delete(it.id)
                     x.draft[it.id] = e.target.value
                   }
                 }),
-                h('button', { class: 'btn sm', onClick: () => { x.revoke.delete(it.id); x.draft[it.id] = String(it.score) } }, '满分'),
-                h('button', { class: 'btn sm', onClick: () => { x.revoke.delete(it.id); x.draft[it.id] = '0' } }, '0 分'),
+                h('button', { class: 'btn sm', onClick: () => { touchRow(x); x.revoke.delete(it.id); x.draft[it.id] = String(it.score) } }, '满分'),
+                h('button', { class: 'btn sm', onClick: () => { touchRow(x); x.revoke.delete(it.id); x.draft[it.id] = '0' } }, '0 分'),
                 // 服务端早就支持 null = 撤分回队列，界面上一直没有入口；
                 // 给过分之后又把「还没批」写回来的通道，只能靠这一颗
                 it.current !== null && it.current !== undefined
                   ? h('button', {
                       class: 'btn ghost sm', title: '撤掉这道题的分，让它回到待批队列',
-                      onClick: () => { x.revoke.add(it.id); x.draft[it.id] = '' }
+                      onClick: () => { touchRow(x); x.revoke.add(it.id); x.draft[it.id] = '' }
                     }, x.revoke.has(it.id) ? '已撤分' : '撤分')
                   : null,
                 it.analysis ? h('span', { class: 'small muted', style: 'margin-left:4px' }, '解析：' + it.analysis.slice(0, 40)) : null

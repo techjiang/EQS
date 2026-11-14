@@ -178,7 +178,8 @@
 | PUT | `/api/submissions/:id` | 编辑答卷内容（保留已有主观题人工分） |
 | PUT | `/api/submissions/:id/review` | 主观题批阅，见下 |
 | GET | `/api/forms/:id/review-queue?limit=&offset=` | 阅卷队列：这一页还没批完的答卷，含逐题作答原文与已给的分 |
-| PUT | `/api/submissions/review-batch` | 批量保存人工分，body `{ items: [{ id, scores, note }] }` |
+| PUT | `/api/submissions/review-batch` | 批量保存人工分，body `{ items: [{ id, scores, note, seconds }] }` |
+| GET | `/api/submissions/:id/review-logs?limit=` | 这份答卷的批阅留痕（谁、什么时候、动了哪几题、从几分改到几分） |
 | DELETE | `/api/submissions/:id` | 删除 |
 | POST | `/api/submissions/batch-delete` | `{ids}` 批量删除 |
 
@@ -275,6 +276,41 @@ PUT /api/submissions/review-batch
   「已保存 7 份，1 份被拒」，还得自己回头找是哪一份哪一题；本地拦截会直接把焦点挪到那道题。
 - **撤分有单独入口**。已给过分、想让它回到「待批」的题，提交时送 `null`；
   这个语义接口一直是有的，只是界面上此前没有入口。
+
+### 批阅留痕：谁批的、改了什么、批了多久
+
+`submissions` 上的 `reviewed_at` / `reviewed_by` 只记得**最后一次**，而且改一次覆盖一次。
+于是「这份卷子两道题的分差得离谱，是谁批的」在库里永远只有一个答案：最后那个人、最后一个时间点。
+真学校里这个问题是会被追问的，所以按「次」另记一张表：
+
+```
+GET /api/submissions/33/review-logs
+{ "ok": true, "data": [
+  { "id": 9, "username": "张老师", "source": "batch", "seconds": 41,
+    "scoreBefore": 32, "scoreAfter": 41, "createdAt": "2026-11-14T09:12:03Z",
+    "note": "",
+    "changes": [
+      { "id": "q_plan", "label": "简述下一季度计划", "from": 12, "to": 16 },
+      { "id": "q_lesson", "label": "这次复盘的教训", "from": null, "to": 5 },
+      { "id": "q_extra", "label": "补充说明", "from": 8, "to": null }
+    ] },
+  { "id": 7, "username": "李老师", "source": "single", "seconds": 96, ... }
+] }
+```
+
+三条口径值得单独说：
+
+- **`from` / `to` 里的 `null` 是「没有分」**，不是 0 分。撤分记成 `to: null`，
+  改成 0 分记成 `to: 0`——两者混成一条，事后就看不出老师到底是判了 0 还是没批。
+- **只在真有改动时落一条**。打开看一眼就关掉不在留痕里长出一行空记录。
+- **耗时按份算，不按整页算**。批量阅卷一页十份里只批了 3 份，按整页时间平摊会把另外 7 份的耗时写大；
+  所以每一份从「第一次动这一份的分」开始计时，负数与超过 6 小时的一律归零
+  （系统时间被调过、标签页在后台睡一夜，那种数字只污染「批阅效率」，它本来也不是审计字段）。
+
+单份 `review` 与批量 `review-batch` 都接受可选 `seconds`；写库的那一处是同一个 `applyReview()`，
+所以两条入口的口径不会分叉。答卷详情 `GET /api/submissions/:id` 顺带返回 `reviewer` 与最近 20 条
+`review_logs`（弹窗打开就要显示「上次谁批的」，再发一次请求等于把两次渲染拼在人眼前）。
+阅卷队列的每一份也带 `reviewedAt` / `reviewer`：两个人各批了一半时，谁给了多少分要一眼看得见。
 
 ### 成绩排名
 

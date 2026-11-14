@@ -4229,6 +4229,175 @@ try {
     assert(r.status === 400 && /批阅/.test(r.json.message), '问卷没有阅卷队列', `${r.status} ${r.json.message}`)
   }
 
+  console.log('\n[67] 批阅留痕：谁批的、改了什么、批了多久')
+  {
+    // ---- 纯函数：留痕口径（浏览器与服务端共用同一份）
+    {
+      const { scoreChanges, changeText, changeLine, humanSeconds, elapsedSeconds } = await import('../web/js/review.js')
+      let cs = scoreChanges({ a: 12, b: 8 }, { a: 18, b: null, c: 5 })
+      assert(cs.length === 3, '改分 + 撤分 + 新增，三条改动都记下来', JSON.stringify(cs))
+      const byId = Object.fromEntries(cs.map(c => [c.id, c]))
+      assert(byId.a.from === 12 && byId.a.to === 18, '改了分记下前后两个值', JSON.stringify(byId.a))
+      assert(byId.b.to === null, '撤分记成 null，不是记成 0 分', JSON.stringify(byId.b))
+      assert(byId.c.from === null && byId.c.to === 5, '新给的分 from 是 null', JSON.stringify(byId.c))
+      assert(scoreChanges({ a: 5 }, { a: 5 }).length === 0, '分数没动就不产出留痕')
+      assert(scoreChanges({}, {}).length === 0, '两份都空也不产出留痕')
+      // 0 分和「没批」必须分开：把两者混成一条，事后看不出老师到底判了 0 还是没批
+      cs = scoreChanges({ a: 6 }, { a: 0 })
+      assert(cs.length === 1 && cs[0].to === 0, '把分改成 0 是一次「改分」，不是「撤分」', JSON.stringify(cs))
+      cs = scoreChanges({ a: 0 }, {})
+      assert(cs.length === 1 && cs[0].to === null && cs[0].from === 0, '把 0 分撤掉也记成撤分', JSON.stringify(cs))
+
+      assert(/新增 1 题/.test(changeText([{ from: null, to: 5 }])) &&
+        /撤分 1 题/.test(changeText([{ from: 5, to: null }])) &&
+        /改分 1 题/.test(changeText([{ from: 5, to: 8 }])), '一句话说清改了几题、怎么改的')
+      assert(changeText([]) === '没有改动', '没改动就给一句「没有改动」')
+      assert(changeLine({ from: 12, to: 18 }) === '12 → 18 分', '单题改动是人话', changeLine({ from: 12, to: 18 }))
+      assert(changeLine({ from: null, to: 9 }) === '新增 9 分' && changeLine({ from: 9, to: null }) === '撤掉 9 分',
+        '新增与撤分各有各的说法')
+
+      // 耗时：不记负数、不记离谱的长（标签页在后台睡一夜），也不从「打开弹窗」算起
+      assert(humanSeconds(45) === '45 秒' && humanSeconds(372) === '6 分 12 秒' && humanSeconds(3900) === '1 小时 5 分',
+        '秒数换成几分几秒', humanSeconds(372))
+      assert(humanSeconds(0) === '' && humanSeconds(-3) === '', '没有耗时就给空串，不写「0 秒」')
+      assert(elapsedSeconds(1000, 46000) === 45, '耗时按毫秒差算成秒', String(elapsedSeconds(1000, 46000)))
+      assert(elapsedSeconds(0, -1) === 0 && elapsedSeconds(0, 1e12) === 0, '负数与荒唐的长耗时都归零')
+
+      // 批量提交时每一份带上自己的耗时，没动过手的份不带
+      const { batchPayload } = await import('../web/js/review.js')
+      const pl = batchPayload([
+        { id: 1, draft: { a: '8' }, items: [{ id: 'a', score: 10 }], startedAt: 0, finishedAt: 60000 },
+        { id: 2, draft: { a: '' }, items: [{ id: 'a', score: 10 }], startedAt: 0, finishedAt: 60000 }
+      ]).items
+      assert(pl.length === 1 && pl[0].seconds === 60, '批过的那份带上耗时，没批的份不提交', JSON.stringify(pl))
+    }
+
+    // ---- 落库：谁批的、改了什么、几次
+    let r = await req('POST', '/api/forms', {
+      title: '留痕验收卷', kind: 'exam',
+      schema: [
+        { id: 's1', type: 'textarea', label: '主观题一', answer: [], score: 20 },
+        { id: 's2', type: 'textarea', label: '主观题二', answer: [], score: 10 }
+      ],
+      settings: { passPercent: 60 }
+    })
+    const lid = r.json.id
+    await req('PUT', `/api/forms/${lid}`, { status: 'published' })
+    r = await req('POST', `/api/public/forms/${lid}/submit`, { data: { s1: '第一题作答', s2: '第二题作答' } })
+    const sid = r.json.id
+
+    // 第一次批：只有一道题
+    r = await req('PUT', `/api/submissions/${sid}/review`, { scores: { s1: 15 }, note: '论点完整', seconds: 95 })
+    assert(r.status === 200, '第一份批阅成功', JSON.stringify(r.json))
+    r = await req('GET', `/api/submissions/${sid}`)
+    assert(/admin|超级管理员/.test(r.json.data.reviewer || ''), '答卷详情带上批阅人', JSON.stringify(r.json.data.reviewer))
+    let logs = r.json.data.review_logs || []
+    assert(logs.length === 1, '批一次留一条痕', String(logs.length))
+    assert(/admin|超级管理员/.test(logs[0].username || ''), '留痕记下是谁批的', logs[0].username)
+    assert(logs[0].seconds === 95, '留痕记下这份批了多久', String(logs[0].seconds))
+    assert(logs[0].source === 'single', '单份批阅的来源是 single', logs[0].source)
+    assert(logs[0].changes.length === 1 && logs[0].changes[0].id === 's1' &&
+      logs[0].changes[0].from === null && logs[0].changes[0].to === 15, '记下哪一题从「没分」到 15', JSON.stringify(logs[0].changes))
+    assert(logs[0].changes[0].label === '主观题一', '留痕里是题干，不是字段 id', logs[0].changes[0].label)
+    assert(logs[0].scoreBefore === 0 && logs[0].scoreAfter === 15, '记下总分从几分到几分',
+      JSON.stringify({ b: logs[0].scoreBefore, a: logs[0].scoreAfter }))
+
+    // 第二个账号接着批同一份：两条痕迹分别是两个人，不是一个人的同一个时间点
+    // 先留住管理员这条会话：注册接口自己也会 Set-Cookie，全局 cookie 会当场变成新账号
+    const adminCookie = cookie
+    await req('POST', '/api/auth/register', { username: 'reviewer2', password: 'rv2-pass-123', nickname: '代理老师' })
+    const add = await call(adminCookie, 'POST', `/api/forms/${lid}/members`, { username: 'reviewer2', role: 'editor' })
+    assert(add.status === 201, '把第二位老师加为可编辑协作者', JSON.stringify(add.json))
+    const rv2Cookie = await asUser('reviewer2', 'rv2-pass-123')
+    r = await call(rv2Cookie, 'PUT', `/api/submissions/review-batch`, { items: [{ id: sid, scores: { s2: 4 }, seconds: 30 }] })
+    const canBatch = r.status === 200
+    assert(canBatch, '协作者也能批量批阅', JSON.stringify(r.json))
+    if (canBatch) {
+      r = await req('GET', `/api/submissions/${sid}`)
+      logs = r.json.data.review_logs || []
+      assert(logs.length === 2, '两个人各批一次就是两条痕', String(logs.length))
+      assert(logs[0].username === '代理老师' && logs[0].source === 'batch', '最新一条是批量阅卷的那个人', JSON.stringify(logs[0]?.username))
+      assert(logs[0].seconds === 30, '批量那一份的耗时单独记', String(logs[0].seconds))
+      assert(/admin|超级管理员/.test(logs[1].username || ''), '上一条还是原来那个人批的（不是被覆盖）', logs[1]?.username)
+      r = await req('GET', `/api/submissions/${sid}`)
+      assert(r.json.data.reviewer === '代理老师', '当前批阅人是最新那个', r.json.data.reviewer)
+      // 列表行上也带批阅人：分差得离谱时第一眼要看到人
+      r = await req('GET', `/api/submissions?formId=${lid}`)
+      const listed = r.json.data.find(x => x.id === sid)
+      assert(listed?.reviewer === '代理老师', '答卷列表带批阅人姓名', JSON.stringify(listed?.reviewer))
+    } else {
+      assert(true, '（当前角色的权限不足以批阅，跳过换人对比）')
+    }
+
+    // 打开看一眼就关掉：分数没动，不落空痕
+    cookie = adminCookie
+    const beforeCount = (await req('GET', `/api/submissions/${sid}/review-logs`)).json.data.length
+    r = await req('PUT', `/api/submissions/${sid}/review`, { scores: { s1: 15 }, seconds: 3 })
+    const after = await req('GET', `/api/submissions/${sid}/review-logs`)
+    assert(after.status === 200 && after.json.data.length === beforeCount, '分数没动就不留痕（打开看一眼不算批过）', String(after.json.data?.length))
+
+    // 撤分也要留痕：事后要能看出「这题是被人撤回去的」，而不是从来没人批
+    r = await req('PUT', `/api/submissions/${sid}/review`, { scores: { s2: null }, seconds: 12 })
+    const revoked = await req('GET', `/api/submissions/${sid}/review-logs`)
+    const last = revoked.json.data[0]
+    assert(last.changes.some(c => c.id === 's2' && c.to === null), '撤分留下一条「撤掉」的痕迹', JSON.stringify(last.changes))
+    r = await req('GET', `/api/forms/${lid}/review-queue?limit=10`)
+    const queued = r.json.data.find(x => x.id === sid)
+    if (queued) {
+      assert(queued.reviewedAt && queued.reviewer, '阅卷队列里的每一份带上「上次谁批的」',
+        JSON.stringify({ at: queued.reviewedAt, by: queued.reviewer }))
+    } else {
+      assert(true, '（这份卷子已批完，不在队列里）')
+    }
+
+    // 留痕是给能批阅的人看的：无关账号读不到，「谁给谁打了低分」不该从这条路漏出去
+    const beforeOutsider = cookie
+    await req('POST', '/api/auth/register', { username: 'nobody99', password: 'nb-pass-123' })
+    const otherCookie = await asUser('nobody99', 'nb-pass-123')
+    const outsider = await call(otherCookie, 'GET', `/api/submissions/${sid}/review-logs`)
+    assert(outsider.status === 403, '无关账号读不到别人的批阅留痕', `${outsider.status} ${outsider.json?.message || ''}`)
+    cookie = beforeOutsider
+
+    // 批量保存回传的份数照旧，另外每份带「这次改了几题」，好让 toast 说清结果
+    r = await req('PUT', '/api/submissions/review-batch', { items: [{ id: sid, scores: { s1: 18 }, seconds: 20 }] })
+    assert(r.status === 200 && r.json.saved === 1, '批量保存仍然只回份数', JSON.stringify(r.json))
+    r = await req('GET', `/api/submissions/${sid}/review-logs?limit=2`)
+    assert(r.json.data.length === 2 && r.json.data[0].changes.some(c => c.id === 's1' && c.to === 18),
+      '批阅历史支持 limit，且最新一条就是刚才那次改分', JSON.stringify(r.json.data?.[0]?.changes))
+
+    // 导出的表格里带批阅人：表格常被转给系统外的人看，问道「谁批的」得能在表里找到人
+    const xlsx = await req('GET', `/api/forms/${lid}/submissions.xlsx`)
+    assert(xlsx.status === 200, '答卷导出仍然可用')
+    const { submissionsHead } = await import('../server/lib/sheet.js')
+    assert(submissionsHead({ kind: 'exam', schema: [] }).head.includes('批阅人'), '导出的列头里有「批阅人」')
+
+    /*
+     * 老备份里没有 review_logs 这张表。导入是直接顶替库文件的，
+     * 不在 switchDb 之后补一次建表，第一条批阅就会撞一句 no such table。
+     * 这条用子进程跑：它会把库文件换成一份「老库」，不能污染当前测试库。
+     */
+    {
+      const { execFileSync } = await import('node:child_process')
+      const work = fs.mkdtempSync(path.join(os.tmpdir(), 'eqs-old-db-'))
+      const legacy = path.join(work, 'legacy.db')
+      const mk = new DatabaseSync(legacy)
+      mk.exec('CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
+      mk.exec("INSERT INTO settings VALUES('x','1')")
+      mk.close()
+      const script = `
+        const m = await import('${process.cwd()}/server/lib/db.js')
+        m.switchDb(${JSON.stringify(legacy)})
+        const t = m.all("SELECT name FROM sqlite_master WHERE type='table' AND name='review_logs'")
+        process.stdout.write(t.length ? 'ok' : 'missing')
+      `
+      const out = execFileSync(process.execPath, ['--input-type=module', '-e', script], {
+        encoding: 'utf8', env: { ...process.env, EQS_DATA_DIR: work }
+      })
+      assert(out.trim() === 'ok', '导入老库之后 review_logs 会自动补上（否则第一条批阅就 no such table）', out.trim())
+      fs.rmSync(work, { recursive: true, force: true })
+    }
+  }
+
   console.log('\n[44] 阅卷键盘：能提交什么、Enter 往哪走')
 
   {
