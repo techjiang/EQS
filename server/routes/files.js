@@ -7,6 +7,7 @@ import { upload, localPath, storageConfig, DRIVERS } from '../lib/storage.js'
 import { safeJson, formWindow } from '../lib/forms.js'
 import { buildZip, extractZip, writeZipStream } from '../lib/zip.js'
 import { formRole, formVisibleScope, requireFormRole } from '../lib/formMembers.js'
+import { checkUpload, dispositionFor, RAW_HEADERS, rateLimit, publicLimit } from '../lib/guard.js'
 
 /** multipart/form-data 解析（够用即可） */
 /**
@@ -118,6 +119,25 @@ export default function register(r) {
     }
     const maxMb = 100
     if (data.length > maxMb * 1024 * 1024) fail(413, `文件超过 ${maxMb}MB`)
+    /*
+     * 上传频率：匿名上传是「不需要任何身份就能写磁盘」的唯一入口，
+     * 不设闸的话，一个循环就能把 data/files 灌满，把整个站点的磁盘一起带走。
+     * 按 IP 计，登录用户给得宽一些（批量导入附件是正常用法）。
+     */
+    const rl = rateLimit({ key: `upload:${clientIp(req)}`, limit: user ? publicLimit('upload') * 5 : publicLimit('upload'), windowMs: 60_000 })
+    if (!rl.ok) {
+      res.setHeader('Retry-After', String(rl.retryAfter))
+      fail(429, `上传过于频繁，请 ${rl.retryAfter} 秒后再试`)
+    }
+    /*
+     * 按真实内容判断类型。
+     * 以前 name/mime 都是客户端说了算，`/api/upload` 收下一个 .html 就落在同源目录下，
+     * 拿到 /api/files/raw/<key> 发给管理员——点开就在你的域里执行脚本。
+     */
+    const judged = checkUpload({ name, buf: data, mime })
+    if (!judged.ok) fail(415, judged.reason)
+    name = judged.name
+    mime = judged.mime
     const stored = await upload({ name, buf: data, mime, formId, submissionId })
     const result = run('INSERT INTO files(name, stored, size, mime, form_id, submission_id, owner_id, driver, url, created_at) VALUES(?,?,?,?,?,?,?,?,?,?)',
       stored.name, stored.stored, stored.size, stored.mime, stored.formId, stored.submissionId, user?.id || 0, stored.driver, stored.url, now())
@@ -137,11 +157,21 @@ export default function register(r) {
     const file = localPath(key)
     if (!file) fail(404, '文件不存在')
     const stat = fs.statSync(file)
+    const row = get('SELECT name, mime FROM files WHERE stored = ?', key)
+    /*
+     * 出去这一层也要挡一次。
+     * 库里的 mime 是上传那一刻记下来的，而存量文件可能早于这套校验（升级前传的 .html）。
+     * 所以：非白名单类型一律转成下载，且所有响应都带 sandbox CSP——
+     * 万一有人把这个同源地址当页面打开，它也没有脚本执行权、拿不到同源身份。
+     */
+    const mime = row?.mime || 'application/octet-stream'
+    const name = row?.name || path.basename(file)
     res.writeHead(200, {
-      'Content-Type': get('SELECT mime FROM files WHERE stored = ?', key)?.mime || 'application/octet-stream',
+      'Content-Type': mime,
       'Content-Length': stat.size,
-      'Content-Disposition': `inline; filename*=UTF-8''${encodeURIComponent(path.basename(file))}`,
-      'Cache-Control': 'public, max-age=31536000'
+      'Content-Disposition': dispositionFor({ name, mime }),
+      'Cache-Control': 'public, max-age=31536000',
+      ...RAW_HEADERS
     })
     fs.createReadStream(file).pipe(res)
   })

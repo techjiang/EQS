@@ -183,6 +183,22 @@ export default {
     ]))
     const ensure = (k) => { if (!cfg.value[k]) cfg.value[k] = {}; return cfg.value[k] }
 
+    /**
+     * 公开接口的三个额度框。
+     * 拆成一个函数是为了不让 site 那一大段 JSX 式的 h(...) 嵌套到看不出层级——
+     * 这里已经出现过一次括号对不上导致整页白屏。
+     */
+    const rateRow = (rl) => h('div', { class: 'flex', style: 'gap:14px;flex-wrap:wrap' },
+      [['submit', '交卷'], ['upload', '上传'], ['query', '查询']].map(([k, label]) =>
+        h('label', { class: 'flex', style: 'gap:6px;align-items:center' }, [
+          h('span', { style: 'font-size:13px;color:var(--text-2)' }, label),
+          h('input', {
+            class: 'input', type: 'number', min: 1, max: 100000, style: 'width:96px',
+            value: rl[k] ?? ({ submit: 120, upload: 60, query: 120 })[k],
+            onInput: e => rl[k] = Number(e.target.value) || 1
+          })
+        ])))
+
     const body = () => {
       const c = cfg.value
       switch (tab.value) {
@@ -218,7 +234,23 @@ export default {
               'X-Forwarded-For 是客户端自己发的头，无条件相信它会让「每个 IP 限填一次」「登录失败锁号」两条防线失效——' +
               '换个头就换了个计数器和一条新身份。默认不信任。' +
               '如果你用 Nginx 反代（deploy/nginx.conf 那套），必须改成「信任代理头、1 层」，否则所有人的 IP 都是 127.0.0.1，' +
-              '「每个 IP 限填一次」会变成「全站只能填一次」。')
+              '「每个 IP 限填一次」会变成「全站只能填一次」。'),
+            h('div', { style: 'height:14px' }),
+            field('跨域白名单', h('textarea', {
+              class: 'textarea', rows: 3, placeholder: 'https://admin.example.com',
+              value: Array.isArray(s.corsOrigins) ? s.corsOrigins.join('\n') : (s.corsOrigins || ''),
+              onInput: e => s.corsOrigins = e.target.value.split(/[\s,]+/).map(x => x.trim()).filter(Boolean)
+            }), '一行一个来源。只有这里填了的网站才能带着访客身份读取本系统接口；同源访问永远放行。'),
+            h('div', { class: 'hint' },
+              '默认留空。留空时任何第三方网页都读不到接口返回——这正是应该的样子。' +
+              '只有当你把前端单独部署在另一个域名、或者自有系统要直连这套接口时，才把那个来源加进来。' +
+              '注意：这不影响 WebHook 与 X-API-Key 的服务端调用，那些本来就不受浏览器同源策略约束。'),
+            h('div', { style: 'height:14px' }),
+            field('公开接口频率上限（每分钟 / 每 IP）', rateRow(ensure('rateLimit'))),
+            h('div', { class: 'hint' },
+              '公开填写 / 上传 / 答卷查询都不需要登录，也就没有任何成本——一个循环就能把库和磁盘灌满。' +
+              '交卷默认 120（一个班 40 人挤同一台 NAT 出口是正常场面，脚本是每秒上百次），上传 60，查询 120。' +
+              '超出后返回 429 并带 Retry-After，不会静默丢弃。')
           ])
         }
         case 'storage': {

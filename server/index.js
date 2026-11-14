@@ -7,6 +7,7 @@ import { ensureAdmin, seedRoles } from './lib/auth.js'
 import { seedTemplates, seedSettings, seedDicts } from './lib/seed.js'
 import { log } from './lib/db.js'
 import { runWithRequest } from './lib/ctx.js'
+import { applyCors, corsWhitelist } from './lib/guard.js'
 
 import authRoutes from './routes/auth.js'
 import formRoutes from './routes/forms.js'
@@ -37,21 +38,28 @@ const server = http.createServer(async (req, res) => {
   res.setHeader('X-Content-Type-Options', 'nosniff')
   res.setHeader('Referrer-Policy', 'same-origin')
 
+  /*
+   * 预检只对白名单来源放行。
+   * 以前这里无条件回 `Access-Control-Allow-Origin: <谁问就答谁>` + 允许凭证，
+   * 等于把同源策略关掉了：任何网页都能在访客登录状态下读走全部接口。
+   * 现在不认识的来源连预检都不过，真正的请求即便到达服务端也读不到响应。
+   */
   if (req.method === 'OPTIONS') {
-    res.writeHead(204, {
-      'Access-Control-Allow-Origin': req.headers.origin || '*',
-      'Access-Control-Allow-Methods': 'GET,POST,PUT,PATCH,DELETE,OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type,Authorization,X-API-Key',
-      'Access-Control-Allow-Credentials': 'true'
-    })
+    if (applyCors(req, res)) {
+      res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS')
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization,X-API-Key')
+      res.setHeader('Access-Control-Max-Age', '600')
+      res.writeHead(204)
+    } else {
+      res.writeHead(204, { Vary: 'Origin' })
+    }
     return res.end()
   }
 
-  // API 跨域（供 webhook / 外部系统调用）
+  // API 跨域（供 webhook / 外部系统调用），只对同源与白名单回显
   if (pathname.startsWith('/api/')) {
-    res.setHeader('Access-Control-Allow-Origin', req.headers.origin || '*')
-    res.setHeader('Access-Control-Allow-Credentials', 'true')
-    res.setHeader('Vary', 'Origin')
+    applyCors(req, res)
+    if (!res.getHeader('Vary')) res.setHeader('Vary', 'Origin')
   }
 
   try {
@@ -84,7 +92,10 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, () => {
   console.log(`\n  EQS 已启动  →  http://localhost:${PORT}`)
   console.log(`  数据目录：${process.env.EQS_DATA_DIR || path.join(process.cwd(), 'data')}`)
-  console.log(`  默认账号：admin / ${process.env.EQS_ADMIN_PASSWORD || 'admin123'}\n`)
+  console.log(`  默认账号：admin / ${process.env.EQS_ADMIN_PASSWORD || 'admin123'}`)
+  const cors = corsWhitelist()
+  if (cors.length) console.log(`  跨域白名单：${cors.join(', ')}`)
+  console.log('')
 })
 
 const shutdown = () => { server.close(() => process.exit(0)); setTimeout(() => process.exit(0), 3000) }

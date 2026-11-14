@@ -3770,6 +3770,119 @@ try {
     await req('DELETE', `/api/forms/${subId}`); await req('DELETE', `/api/forms/${subId}/purge`)
   }
 
+  /*
+   * [52] 外围三件事：跨站、上传类型、公开接口频率。
+   *
+   * 这三条的共同点是「功能全对，出事的只是没被想到的用法」——
+   * 接口对着同源浏览器一一正常，但放进别人的网页里、塞进上传的文件里、
+   * 被脚本按毫秒打的时候，行为完全是另一套。
+   */
+  console.log('\n[52] 外围防线：跨站来源、上传类型、公开接口频率')
+  {
+    cookie = await asUser('admin', 'test-pass-123')
+
+    // —— 跨站：不再反射任意 Origin ——
+    const evil = 'https://evil.example.com'
+    let res = await fetch(BASE + '/api/health', { headers: { Origin: evil } })
+    assert(res.headers.get('access-control-allow-origin') === null,
+      '陌生来源不拿到 Access-Control-Allow-Origin（否则任何网页都能带 Cookie 读全站数据）',
+      String(res.headers.get('access-control-allow-origin')))
+
+    res = await fetch(BASE + '/api/forms', { method: 'OPTIONS', headers: { Origin: evil, 'Access-Control-Request-Method': 'GET' } })
+    assert(res.status === 204 && res.headers.get('access-control-allow-origin') === null,
+      '陌生来源的预检也不放行', `${res.status} ${res.headers.get('access-control-allow-origin')}`)
+    assert(/\bOrigin\b/.test(res.headers.get('vary') || ''), '不认识的来源也回 Vary: Origin（避免缓存串味）')
+
+    // 同源：浏览器发的 Origin 与 Host 一致时必须放行，否则前端自己都调不动
+    res = await fetch(BASE + '/api/health', { headers: { Origin: BASE } })
+    assert(res.headers.get('access-control-allow-origin') === BASE, '同源来源照常放行', String(res.headers.get('access-control-allow-origin')))
+
+    // 白名单：设置里填了才放行，且回显具体来源而不是 *
+    await req('PUT', '/api/settings/site', { corsOrigins: ['https://admin.example.com'] })
+    res = await fetch(BASE + '/api/health', { headers: { Origin: 'https://admin.example.com' } })
+    assert(res.headers.get('access-control-allow-origin') === 'https://admin.example.com',
+      '白名单来源被回显（可用单独部署的前端）', String(res.headers.get('access-control-allow-origin')))
+    assert(res.headers.get('access-control-allow-origin') !== '*', '永远不会回 *')
+    res = await fetch(BASE + '/api/health', { headers: { Origin: 'https://admin.example.com.evil.com' } })
+    assert(res.headers.get('access-control-allow-origin') === null, '相似域名不能混进白名单')
+    await req('PUT', '/api/settings/site', { corsOrigins: [] })
+
+    // —— 上传：按真实内容判断类型 ——
+    const tryUpload = async (name, type, body) => {
+      const fd = new FormData()
+      fd.append('file', new Blob([body], { type }), name)
+      const r2 = await fetch(BASE + '/api/upload', { method: 'POST', body: fd, headers: { Cookie: cookie } })
+      return { status: r2.status, json: await r2.json().catch(() => ({})) }
+    }
+    let up = await tryUpload('evil.html', 'text/html', '<script>alert(document.domain)</script>')
+    assert(up.status === 415, '上传 .html 被拒（同源地址能变成任意人的脚本执行现场）', String(up.status))
+    up = await tryUpload('evil.svg', 'image/svg+xml', '<svg onload="alert(1)"></svg>')
+    assert(up.status === 415, '上传 .svg 被拒（SVG 里的 onload 同样会执行）', String(up.status))
+    up = await tryUpload('fake.png', 'image/png', '<!doctype html><script>alert(1)</script>')
+    assert(up.status === 415, '声明成图片实为网页的文件被识破', String(up.status))
+    up = await tryUpload('noext', 'text/plain', '<html><body>x</body></html>')
+    assert(up.status === 415, '连扩展名都没有、内容却是网页的也拦住', String(up.status))
+
+    up = await tryUpload('a.txt', 'text/plain', 'hello')
+    assert(up.status === 201, '普通文本仍可上传', String(up.status))
+    const txtId = up.json.id
+    // 真的 PNG（1x1），验证图片不会被误伤
+    const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==', 'base64')
+    up = await tryUpload('dot.png', 'image/png', png)
+    assert(up.status === 201, 'PNG 图片正常上传', String(up.status))
+    up = await tryUpload('notes.html', 'text/plain', 'hello') // 扩展名坏，内容正常
+    assert(up.status === 415, '扩展名危险就拒，不看内容' , String(up.status))
+
+    /*
+     * 下载侧：库里 mime 决定内联还是下载，但不管哪种都带 sandbox CSP。
+     * 这层不能省——存量文件可能早于上传校验（升级前传上去的 .html）。
+     */
+    const txtRow = (await req('GET', '/api/files')).json.data.find(f => f.id === txtId)
+    const rawTxt = await fetch(BASE + '/api/files/raw/' + txtRow.stored)
+    assert(rawTxt.ok && /filename\*=UTF-8''/.test(rawTxt.headers.get('content-disposition') || ''),
+      '下载头里带 RFC 5987 文件名', String(rawTxt.headers.get('content-disposition')))
+    assert(/sandbox/.test(rawTxt.headers.get('content-security-policy') || ''),
+      '文件响应带 sandbox CSP（即使被当页面打开也没有脚本权限）', String(rawTxt.headers.get('content-security-policy')))
+    assert(rawTxt.headers.get('x-content-type-options') === 'nosniff', '文件响应带 nosniff')
+
+    // —— 公开接口频率 ——
+    const fRate = (await req('POST', '/api/forms', {
+      title: '限流探针', schema: [{ id: 'r1', type: 'radio', label: '选', options: ['A', 'B'] }],
+      settings: {}
+    })).json.id
+    await req('PUT', `/api/forms/${fRate}`, { status: 'published' })
+    await req('PUT', '/api/settings/site', { rateLimit: { submit: 5, upload: 60, query: 120 } })
+    const codes = []
+    for (let i = 0; i < 8; i++) {
+      codes.push((await req('POST', `/api/public/forms/${fRate}/submit`, { data: { r1: 'A' } })).status)
+    }
+    assert(codes.includes(429), '交卷接口超过配置额度后返回 429', codes.join(','))
+    assert(codes.filter(c => c === 201).length === 5, '额度内的请求一份没少', codes.join(','))
+    const blocked = await fetch(BASE + `/api/public/forms/${fRate}/submit`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ data: { r1: 'A' } })
+    })
+    assert(Number(blocked.headers.get('retry-after')) > 0, '429 带 Retry-After（不是让调用方瞎猜）')
+    const bMsg = await blocked.json()
+    assert(/频繁/.test(bMsg.message || ''), '限流文案说清楚是频率问题', bMsg.message)
+
+    // 换一张表单是另一个桶：一题被限不该把全站公开填写一起冻住
+    const fRate2 = (await req('POST', '/api/forms', {
+      title: '限流探针二', schema: [{ id: 'r2', type: 'radio', label: '选', options: ['A'] }], settings: {}
+    })).json.id
+    await req('PUT', `/api/forms/${fRate2}`, { status: 'published' })
+    const other = await req('POST', `/api/public/forms/${fRate2}/submit`, { data: { r2: 'A' } })
+    assert(other.status === 201, '限流按表单分桶，不牵连其它问卷', String(other.status))
+
+    // 改配置立即生效（不做缓存）
+    await req('PUT', '/api/settings/site', { rateLimit: { submit: 200, upload: 200, query: 200 } })
+    const afterRaise = await req('POST', `/api/public/forms/${fRate}/submit`, { data: { r1: 'B' } })
+    assert(afterRaise.status === 201, '调高额度后立即恢复（配置不缓存）', String(afterRaise.status))
+
+    await req('PUT', '/api/settings/site', { rateLimit: { submit: 120, upload: 60, query: 120 } })
+    await req('DELETE', `/api/forms/${fRate}`); await req('DELETE', `/api/forms/${fRate}/purge`)
+    await req('DELETE', `/api/forms/${fRate2}`); await req('DELETE', `/api/forms/${fRate2}/purge`)
+  }
+
   console.log('\n[45] 前端静态资源')
 
   for (const p of ['/', '/js/main.js', '/css/app.css', '/js/views/Logs.js', '/js/views/Dicts.js', '/assets/eqs-mark.svg', '/vendor/echarts.min.js']) {

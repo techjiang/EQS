@@ -32,6 +32,7 @@ function findSubmission(formId, raw) {
 
 import { notifySubmission, dispatchWebhooks } from '../lib/notify.js'
 import { formRole, submissionVisibleScope, requireFormRole } from '../lib/formMembers.js'
+import { rateLimit, publicLimit } from '../lib/guard.js'
 import { rankingTop, rankOf, publicRanking, distributionOf } from '../lib/ranking.js'
 import { submissionsXlsx, submissionsHead, submissionRow } from '../lib/sheet.js'
 import { writeXlsxStream } from '../lib/xlsx.js'
@@ -154,8 +155,19 @@ function withManual(row) {
 }
 
 export default function register(r) {
+  /** 公开接口的频率闸。按「用途 + 来源 IP（+ 表单）」分桶，互不牵连。 */
+  const gate = (req, res, kind, formId = '') => {
+    const key = `${kind}:${clientIp(req)}:${formId}`
+    const hit = rateLimit({ key, limit: publicLimit(kind), windowMs: 60_000 })
+    if (!hit.ok) {
+      res.setHeader('Retry-After', String(hit.retryAfter))
+      fail(429, `操作过于频繁，请 ${hit.retryAfter} 秒后再试`)
+    }
+  }
+
   /** 公开：读取表单（不含答案） */
   r.get('/api/public/forms/:id', async (req, res, { params }) => {
+    gate(req, res, 'query', params.id)
     const form = pickForm(params.id)
     if (!form) fail(404, '表单不存在或已删除')
     if (form.status !== 'published') fail(403, '表单未发布')
@@ -214,6 +226,11 @@ export default function register(r) {
 
   /** 公开：提交答卷 */
   r.post('/api/public/forms/:id/submit', async (req, res, { params }) => {
+    /*
+     * 公开提交是全站唯一「不登录就能写库、还能触发 WebHook 与通知」的入口。
+     * 之前一个 while 循环就能把库灌满，顺手把下游 WebHook 也打一遍。
+     */
+    gate(req, res, 'submit', params.id)
     const form = pickForm(params.id)
     if (!form) fail(404, '表单不存在')
     if (form.status !== 'published') fail(403, '表单未发布')
@@ -373,6 +390,8 @@ export default function register(r) {
 
   /** 公开：按编号查询自己的答卷 */
   r.get('/api/public/forms/:id/query', async (req, res, { params }) => {
+    // 查询接口带编号暴力试，等于把别人答卷的编号当密码猜
+    gate(req, res, 'query', params.id)
     const url = new URL(req.url, 'http://x')
     const id = url.searchParams.get('submissionId') || url.searchParams.get('code')
     if (!id) fail(400, '缺少答卷编号')
@@ -690,6 +709,7 @@ export default function register(r) {
 
   /** 公开榜单：匿名入口，名字打码、只给前 N 名，且必须由表单开关显式打开 */
   r.get('/api/public/forms/:id/ranking', async (req, res, { params }) => {
+    gate(req, res, 'query', params.id)
     const form = pickForm(params.id)
     if (!form) fail(404, '表单不存在')
     if (form.status !== 'published') fail(403, '表单未发布')

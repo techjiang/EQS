@@ -267,6 +267,16 @@ POST /api/banks/paper
 交卷时服务端会把答卷数据里引用到的文件（`{id,url,...}`）认领到该答卷，
 `GET /api/forms/:id/attachments.zip` 才能打全。
 
+**上传类型按真实内容判断**：`.html / .svg / .xml / .js / .css` 等「浏览器会当页面执行」的扩展名一律 `415`，
+声明成图片实为 HTML、无扩展名但开头像网页的同样拒绝。读取时非图片/PDF/音视频/纯文本一律转成
+`Content-Disposition: attachment`，且所有文件响应带 `Content-Security-Policy: sandbox` 与 `nosniff`。
+
+**限流**：`POST /api/upload` 默认每分钟每 IP 60 次（登录用户 5 倍额度），交卷与答卷查询各 120 次，
+可在「系统设置 → 站点 → 公开接口频率上限」调整。超出返回 `429`，响应头带 `Retry-After`（秒）。
+
+**跨域**：只对同源和「跨域白名单」里的来源回 `Access-Control-Allow-Origin`。白名单默认空，
+需要单独部署前端或让自有系统直连时再填；`X-API-Key` 的服务端调用不受影响（那本来就不受浏览器同源策略约束）。
+
 ## 答卷
 
 | 方法 | 路径 | 说明 |
