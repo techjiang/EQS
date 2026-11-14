@@ -1,5 +1,5 @@
 import crypto from 'node:crypto'
-import { get, run, setting, setSetting } from './db.js'
+import { get, all, run, setting, setSetting } from './db.js'
 import { parseCookies, fail, clientIp } from './http.js'
 
 const SECRET = (() => {
@@ -24,24 +24,78 @@ export function verifyPassword(pwd, stored) {
 
 const b64 = s => Buffer.from(s).toString('base64url')
 
-export function signSession(payload) {
-  const body = b64(JSON.stringify({ iat: Date.now(), ...payload }))
-  const sig = crypto.createHmac('sha256', SECRET).update(body).digest('base64url')
-  return `${body}.${sig}`
+/**
+ * 会话 = 服务端一行记录，Cookie 里只放一个不可猜的随机串。
+ *
+ * 以前是「HMAC 签名的 Cookie」，签名本身没问题，问题在于服务端没有那份记录：
+ * 除了改密码那一下，没有任何办法单独作废某一条会话 ——
+ * 手机丢了、电脑借人用过、在网吧登过，都只能「等 7 天」。
+ * 签发一串随机 token、库里存它的 sha256，就能做到「按设备踢人」。
+ */
+export const SESSION_TTL = 7 * 864e5
+const TOUCH_MS = 60 * 1000
+
+const sha256 = s => crypto.createHash('sha256').update(String(s)).digest('hex')
+
+export function createSession(userId, req = null, ip = '', ua = '') {
+  const token = crypto.randomBytes(32).toString('hex')
+  const id = crypto.randomBytes(12).toString('hex')
+  const t = new Date()
+  const exp = new Date(t.getTime() + SESSION_TTL)
+  run(
+    `INSERT INTO sessions(id, token_hash, user_id, ip, ua, created_at, last_seen_at, expires_at)
+     VALUES(?,?,?,?,?,?,?,?)`,
+    id, sha256(token), userId,
+    String(ip || (req ? clientIp(req) : '') || '').slice(0, 64),
+    String(ua || (req?.headers?.['user-agent'] || '')).slice(0, 300),
+    t.toISOString(), t.toISOString(), exp.toISOString()
+  )
+  // 顺手清掉过期记录，别让这张表无限长
+  try { run('DELETE FROM sessions WHERE expires_at < ?', t.toISOString()) } catch {}
+  return { token, id }
 }
 
+export const sessionCookie = token =>
+  `eqs_token=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${SESSION_TTL / 1000}`
+
+export const clearCookie = () => 'eqs_token=; Path=/; HttpOnly; Max-Age=0'
+
+/** 读会话：库里查得到、没被吊销、没过期，才算数 */
 export function readSession(req) {
   const token = parseCookies(req).eqs_token
   if (!token) return null
-  const [body, sig] = token.split('.')
-  if (!body || !sig) return null
-  const expect = crypto.createHmac('sha256', SECRET).update(body).digest('base64url')
-  if (sig.length !== expect.length || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expect))) return null
-  try {
-    const payload = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'))
-    if (payload.exp && payload.exp < Date.now()) return null
-    return payload
-  } catch { return null }
+  const row = get('SELECT * FROM sessions WHERE token_hash = ?', sha256(token))
+  if (!row) return null
+  if (row.revoked_at) return null
+  if (row.expires_at && row.expires_at < new Date().toISOString()) return null
+  // last_seen 不必每次请求都写库：一分钟一次足够画出「最近活跃」
+  if (!row.last_seen_at || Date.now() - new Date(row.last_seen_at).getTime() > TOUCH_MS) {
+    try {
+      run('UPDATE sessions SET last_seen_at = ?, ip = ? WHERE id = ?', new Date().toISOString(), clientIp(req).slice(0, 64), row.id)
+    } catch {}
+  }
+  return { sid: row.id, uid: row.user_id, iat: new Date(row.created_at).getTime(), exp: new Date(row.expires_at).getTime() }
+}
+
+export function revokeSession(sid, byUserId = 0) {
+  run('UPDATE sessions SET revoked_at = ?, revoked_by = ? WHERE id = ? AND revoked_at IS NULL',
+    new Date().toISOString(), byUserId, String(sid))
+}
+
+/** 作废某个用户的会话；exceptSid 用来「退出其它设备」时保留当前这条 */
+export function revokeUserSessions(userId, { exceptSid = '', byUserId = 0 } = {}) {
+  const now2 = new Date().toISOString()
+  if (exceptSid) {
+    run('UPDATE sessions SET revoked_at = ?, revoked_by = ? WHERE user_id = ? AND id <> ? AND revoked_at IS NULL', now2, byUserId, userId, String(exceptSid))
+  } else {
+    run('UPDATE sessions SET revoked_at = ?, revoked_by = ? WHERE user_id = ? AND revoked_at IS NULL', now2, byUserId, userId)
+  }
+}
+
+export function listSessions(userId) {
+  return all(`SELECT id, ip, ua, created_at, last_seen_at, expires_at FROM sessions
+    WHERE user_id = ? AND revoked_at IS NULL AND expires_at > ? ORDER BY last_seen_at DESC`,
+    userId, new Date().toISOString())
 }
 
 export const ROLE_PERMS = {

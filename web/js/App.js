@@ -20,6 +20,7 @@ import Users from './views/Users.js'
 import PublicForm from './views/PublicForm.js'
 import Exams from './views/Exams.js'
 import Screen from './views/Screen.js'
+import Sessions from './views/Sessions.js'
 
 const NAV = [
   { group: '工作', key: 'group.work', items: [
@@ -37,6 +38,7 @@ const NAV = [
   { group: '系统', key: 'group.system', items: [
     { path: '/users', name: '用户权限', key: 'nav.users', icon: 'users', admin: true },
     { path: '/recycle', name: '回收中心', key: 'nav.recycle', icon: 'recycle' },
+    { path: '/sessions', name: '登录设备', key: 'nav.sessions', icon: 'shield' },
     { path: '/settings', name: '系统设置', key: 'nav.settings', icon: 'settings', admin: true }
   ]}
 ]
@@ -107,6 +109,7 @@ export default {
       if (p === '/banks') return Banks
       if (/^\/banks\/\d+\/practice/.test(p)) return Practice
       if (p === '/recycle') return Recycle
+      if (p === '/sessions') return Sessions
       // 直接敲地址也不能进：菜单收起来了，地址栏还留着后门就白收
       if (p === '/settings') return state.user?.perms?.includes('*') ? Settings : Forbidden
       if (p === '/users') return state.user?.perms?.includes('*') ? Users : Forbidden

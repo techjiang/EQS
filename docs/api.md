@@ -15,6 +15,13 @@
 | POST | `/api/auth/logout` | 退出登录 |
 | GET | `/api/auth/me` | 当前用户与权限 |
 | PUT | `/api/auth/me` | 修改昵称/邮箱/头像/密码 |
+| GET | `/api/auth/sessions` | 当前账号的登录会话列表（设备 / IP / 最近活跃 / 是否当前） |
+| DELETE | `/api/auth/sessions/:id` | 让指定设备下线；返回 `self: true` 表示踢的是自己 |
+| POST | `/api/auth/sessions/revoke-others` | 退出除当前这台之外的全部设备 |
+
+> 会话存在服务端 `sessions` 表，Cookie 里只放一个随机串（库里存它的 sha256）。
+> 所以退出登录、踢某台设备、改密码、被管理员重置密码或停用账号，都是**立刻生效**的；
+> 以前是签名 Cookie，除了改密码没有任何办法单独作废某一条。
 
 ## 表单
 

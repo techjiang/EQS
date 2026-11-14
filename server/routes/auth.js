@@ -1,6 +1,9 @@
 import { get, run, now, log, setting } from '../lib/db.js'
 import { readJson, fail, clientIp, sendJson } from '../lib/http.js'
-import { hashPassword, verifyPassword, signSession, requireUser, currentUser, ensureAdmin, seedRoles, newApiKey, stampPasswordChange } from '../lib/auth.js'
+import {
+  hashPassword, verifyPassword, requireUser, currentUser, ensureAdmin, seedRoles, newApiKey, stampPasswordChange,
+  createSession, sessionCookie, clearCookie, readSession, revokeSession, revokeUserSessions, listSessions, SESSION_TTL, can
+} from '../lib/auth.js'
 
 /**
  * 登录失败限速。
@@ -49,9 +52,9 @@ export default function register(r) {
     if (user.status !== 1) fail(403, '账号已被禁用')
     run('UPDATE users SET last_login_at = ? WHERE id = ?', now(), user.id)
     log(user, '登录', '', clientIp(req))
-    const token = signSession({ uid: user.id, exp: Date.now() + 7 * 864e5 })
+    const { token } = createSession(user.id, req, ip, req.headers['user-agent'] || '')
     sendJson(res, 200, { ok: true, user: { id: user.id, username: user.username, nickname: user.nickname, avatar: user.avatar } }, {
-      'Set-Cookie': `eqs_token=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${7 * 86400}`
+      'Set-Cookie': sessionCookie(token)
     })
   })
 
@@ -67,12 +70,16 @@ export default function register(r) {
     run('INSERT INTO users(username, nickname, password, email, role_id, status, created_at) VALUES(?,?,?,?,?,1,?)',
       String(username).trim(), nickname || username, hashPassword(password), email || '', role.id, now())
     const user = get('SELECT * FROM users WHERE username = ?', String(username).trim())
-    const token = signSession({ uid: user.id, exp: Date.now() + 7 * 864e5 })
-    sendJson(res, 200, { ok: true }, { 'Set-Cookie': `eqs_token=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${7 * 86400}` })
+    const { token } = createSession(user.id, req, clientIp(req), req.headers['user-agent'] || '')
+    sendJson(res, 200, { ok: true }, { 'Set-Cookie': sessionCookie(token) })
   })
 
   r.post('/api/auth/logout', async (req, res) => {
-    sendJson(res, 200, { ok: true }, { 'Set-Cookie': 'eqs_token=; Path=/; HttpOnly; Max-Age=0' })
+    // 退出不只是「把浏览器里的 Cookie 删掉」：服务端那一条也要吊销，
+    // 否则抓到的 Cookie 在别处还能用满 7 天。
+    const session = readSession(req)
+    if (session?.sid) revokeSession(session.sid)
+    sendJson(res, 200, { ok: true }, { 'Set-Cookie': clearCookie() })
   })
 
   r.get('/api/auth/me', async (req, res) => {
@@ -104,7 +111,8 @@ export default function register(r) {
       stampPasswordChange(user.id)
       log(user, '修改密码', '')
       // 旧会话全部作废（包含当前这条）：让用户拿新密码重新登录一次，才知道密码真的换了
-      return sendJson(res, 200, { ok: true, relogin: true }, { 'Set-Cookie': 'eqs_token=; Path=/; HttpOnly; Max-Age=0' })
+      revokeUserSessions(user.id, { byUserId: user.id })
+      return sendJson(res, 200, { ok: true, relogin: true }, { 'Set-Cookie': clearCookie() })
     }
     sendJson(res, 200, { ok: true })
   })
@@ -115,4 +123,70 @@ export default function register(r) {
     requireUser(req)
     fail(403, 'API Key 请由管理员在「系统设置 → API Key」中创建')
   })
+
+  /* ---------------- 登录设备（会话） ---------------- */
+
+  /**
+   * 当前账号的会话列表。
+   * 之前会话是签名 Cookie，服务端没有记录，于是「我登过哪些设备」这件事根本无从回答。
+   */
+  r.get('/api/auth/sessions', async (req, res) => {
+    const me = requireUser(req)
+    const cur = readSession(req)
+    const rows = listSessions(me.id).map(s => ({
+      id: s.id,
+      ip: s.ip || '-',
+      device: describeUa(s.ua),
+      ua: s.ua || '',
+      createdAt: s.created_at,
+      lastSeenAt: s.last_seen_at,
+      expiresAt: s.expires_at,
+      current: s.id === cur?.sid
+    }))
+    sendJson(res, 200, { ok: true, data: rows })
+  })
+
+  /** 踢掉某一台设备；踢自己 = 退出当前登录 */
+  r.delete('/api/auth/sessions/:id', async (req, res, { params }) => {
+    const me = requireUser(req)
+    const row = get('SELECT * FROM sessions WHERE id = ?', String(params.id))
+    if (!row) fail(404, '会话不存在')
+    // 只能踢自己的：别人家的设备列表里不该出现你的 id
+    if (row.user_id !== me.id && !can(me, '*')) fail(403, '无权操作其他账号的会话')
+    revokeSession(row.id, me.id)
+    log(me, '下线设备', `${row.ip || '-'} ${describeUa(row.ua)}`)
+    const cur = readSession(req)
+    sendJson(res, 200, { ok: true, self: row.user_id === me.id && row.id === cur?.sid })
+  })
+
+  /** 退出其它所有设备 */
+  r.post('/api/auth/sessions/revoke-others', async (req, res) => {
+    const me = requireUser(req)
+    const cur = readSession(req)
+    revokeUserSessions(me.id, { exceptSid: cur?.sid || '', byUserId: me.id })
+    log(me, '退出其它设备', '')
+    sendJson(res, 200, { ok: true })
+  })
+}
+
+/** 把 User-Agent 归成人话：这条会话到底是哪台设备 */
+function describeUa(ua) {
+  const s = String(ua || '')
+  if (!s) return '未知设备'
+  const os = /iPhone/i.test(s) ? 'iPhone'
+    : /iPad/i.test(s) ? 'iPad'
+    : /iPod/i.test(s) ? 'iPod'
+    : /Android/i.test(s) ? (/Mobile/i.test(s) ? 'Android 手机' : 'Android 平板')
+    : /Windows/i.test(s) ? 'Windows'
+    : /Macintosh|Mac OS X/i.test(s) ? 'macOS'
+    : /Linux/i.test(s) ? 'Linux' : ''
+  const br = /Edg\//i.test(s) ? 'Edge'
+    : /OPR\/|Opera/i.test(s) ? 'Opera'
+    : /Firefox\//i.test(s) ? 'Firefox'
+    : /Chrome\//i.test(s) ? 'Chrome'
+    : /Safari\//i.test(s) ? 'Safari'
+    : /curl|node|python|axios/i.test(s) ? '脚本 / 客户端'
+    : /bot|spider|crawler/i.test(s) ? '爬虫' : ''
+  const name = [os, br].filter(Boolean).join(' · ')
+  return name || s.slice(0, 40)
 }

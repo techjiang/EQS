@@ -158,6 +158,19 @@ CREATE TABLE IF NOT EXISTS logs (
   ip TEXT DEFAULT '',
   created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS sessions (
+  id TEXT PRIMARY KEY,
+  token_hash TEXT NOT NULL UNIQUE,
+  user_id INTEGER NOT NULL,
+  ip TEXT DEFAULT '',
+  ua TEXT DEFAULT '',
+  created_at TEXT NOT NULL,
+  last_seen_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  revoked_at TEXT,
+  revoked_by INTEGER DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id, revoked_at);
 CREATE TABLE IF NOT EXISTS i18n (
   lang TEXT NOT NULL,
   key TEXT NOT NULL,

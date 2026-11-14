@@ -3,8 +3,8 @@ import os from 'node:os'
 import path from 'node:path'
 import crypto from 'node:crypto'
 import { get, all, run, now, setting, setSetting, DATA_DIR, log, db, switchDb } from '../lib/db.js'
-import { readBody, sendJson, fail, readJson } from '../lib/http.js'
-import { requireUser, can, signSession } from '../lib/auth.js'
+import { readBody, sendJson, fail, readJson, clientIp } from '../lib/http.js'
+import { requireUser, can, createSession, sessionCookie } from '../lib/auth.js'
 import { exportBackup, parseMultipart, extractZip } from './files.js'
 import { smtpSend, wxAccessToken } from '../lib/notify.js'
 import { generateForm } from '../lib/ai.js'
@@ -145,8 +145,8 @@ export default function register(r) {
     if (!token.access_token) return redirectTo(res, '/login?error=oauth')
     const info = await (await fetch('https://www.googleapis.com/oauth2/v2/userinfo', { headers: { Authorization: `Bearer ${token.access_token}` } })).json()
     const user = await upsertOAuthUser({ email: info.email, nickname: info.name || info.email, avatar: info.picture })
-    const session = signSession({ uid: user.id, exp: Date.now() + 7 * 864e5 })
-    res.writeHead(302, { Location: '/', 'Set-Cookie': `eqs_token=${session}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${7 * 86400}` })
+    const { token: sess } = createSession(user.id, req, clientIp(req), req.headers['user-agent'] || '')
+    res.writeHead(302, { Location: '/', 'Set-Cookie': sessionCookie(sess) })
     res.end()
   })
 
@@ -174,8 +174,8 @@ export default function register(r) {
     if (!token.access_token) return redirectTo(res, '/login?error=oauth')
     const info = await (await fetch(`https://api.weixin.qq.com/sns/userinfo?access_token=${token.access_token}&openid=${token.openid}`)).json()
     const user = await upsertOAuthUser({ username: `wx_${info.openid}`, nickname: info.nickname, avatar: info.headimgurl })
-    const session = signSession({ uid: user.id, exp: Date.now() + 7 * 864e5 })
-    res.writeHead(302, { Location: '/', 'Set-Cookie': `eqs_token=${session}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${7 * 86400}` })
+    const { token: sess } = createSession(user.id, req, clientIp(req), req.headers['user-agent'] || '')
+    res.writeHead(302, { Location: '/', 'Set-Cookie': sessionCookie(sess) })
     res.end()
   })
 

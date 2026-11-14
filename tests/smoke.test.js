@@ -252,13 +252,16 @@ try {
   r = await req('POST', '/api/users', { username: 'tester', password: 'tester123' })
   assert(r.status === 409, '重复账号被拒绝')
 
-  const adminCookie = cookie
+  // 退出登录现在会吊销服务端那条会话（以前只删浏览器 Cookie），
+  // 所以后面继续用管理员身份，必须重新登录拿一条新的。
   await req('POST', '/api/auth/logout')
   cookie = ''
   r = await req('POST', '/api/auth/login', { username: 'tester', password: 'tester123' })
   assert(r.status === 200, '普通用户登录成功')
   r = await req('GET', '/api/settings')
   assert(r.status === 403, '普通用户无权读取系统设置')
+  const adminCookie = await asUser('admin', 'test-pass-123')
+  assert(!!adminCookie, '退出后用密码重新登录拿到新会话')
   cookie = adminCookie
 
   console.log('\n[10] 回收中心与备份')
@@ -1548,6 +1551,84 @@ try {
     cookie = adminCookie
     const subs = (await req('GET', `/api/submissions?formId=${fId}`)).json
     assert(subs.total === 0, '越权写入全部没落库', JSON.stringify(subs.total))
+  }
+
+  console.log('\n[48] 登录会话：服务端可撤销、按设备踢人')
+  {
+    const adminCookie = cookie
+
+    // 三条会话，各自来自不同「设备」
+    const uaA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) Safari/604.1'
+    const uaB = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0 Safari/537.36'
+    const login = async (ua) => {
+      const res = await fetch(BASE + '/api/auth/login', {
+        method: 'POST', headers: { 'Content-Type': 'application/json', 'User-Agent': ua },
+        body: JSON.stringify({ username: 'admin', password: 'test-pass-123' })
+      })
+      const sc = res.headers.get('set-cookie') || ''
+      return sc.split(';')[0]
+    }
+    const ckA = await login(uaA)
+    const ckB = await login(uaB)
+    assert(!!ckA && !!ckB && ckA !== ckB, '同一账号在两台设备登录，拿到两条不同的会话')
+
+    let p = await call(ckA, 'GET', '/api/auth/sessions')
+    assert(p.status === 200 && p.json.data.length >= 2, '能看到自己的会话列表', String(p.status))
+    const list = p.json.data
+    assert(list.filter(x => x.current).length === 1, '列表里只有一条标着「当前登录」')
+    assert(list.some(x => /iPhone/.test(x.device)) && list.some(x => /Windows/.test(x.device)), 'User-Agent 被翻译成可读设备名', JSON.stringify(list.map(x => x.device)))
+    assert(!JSON.stringify(list).includes('token_hash'), '会话列表不下发 token 哈希')
+
+    // 踢掉 Windows 那台
+    const target = list.find(x => /Windows/.test(x.device))
+    p = await call(ckA, 'DELETE', '/api/auth/sessions/' + target.id)
+    assert(p.status === 200 && p.json.self === false, '能踢掉指定设备', String(p.status))
+    p = await call(ckB, 'GET', '/api/forms')
+    assert(p.status === 401, '被踢的那条会话立刻失效（不用等 7 天）', String(p.status))
+    p = await call(ckA, 'GET', '/api/forms')
+    assert(p.status === 200, '当前这台设备不受影响', String(p.status))
+
+    // 退出登录必须吊销服务端那一条：只删浏览器 Cookie，抓到的 Cookie 还能用满 7 天
+    const ckLogout = await login(uaB)
+    p = await call(ckLogout, 'POST', '/api/auth/logout')
+    assert(p.status === 200, '退出登录成功')
+    p = await call(ckLogout, 'GET', '/api/forms')
+    assert(p.status === 401, '退出后的旧 Cookie 在服务端已作废', String(p.status))
+
+    // 别人家的会话不能被我踢
+    await req('POST', '/api/settings/site', { allowRegister: true })
+    await req('POST', '/api/auth/register', { username: 'sessionuser', password: 'session-123' })
+    const otherCk = await asUser('sessionuser', 'session-123')
+    const otherSid = (await call(otherCk, 'GET', '/api/auth/sessions')).json.data[0].id
+    p = await call(ckA, 'DELETE', '/api/auth/sessions/' + otherSid)
+    assert(p.status === 200 || p.status === 403, '管理员可以清理他人会话但不报错', String(p.status))
+    p = await call(otherCk, 'GET', '/api/forms')
+    assert(p.status === 401, '被管理员清掉的他人会话也立即失效', String(p.status))
+
+    // 「退出其它设备」保留当前这条
+    const ck1 = await login(uaA)
+    const ck2 = await login(uaB)
+    p = await call(ck1, 'POST', '/api/auth/sessions/revoke-others', {})
+    assert(p.status === 200, '一键退出其它设备')
+    assert((await call(ck2, 'GET', '/api/forms')).status === 401, '其它设备被踢掉')
+    assert((await call(ck1, 'GET', '/api/forms')).status === 200, '当前设备保持登录')
+
+    // 伪造 / 篡改的 Cookie 一律无效（以前是 HMAC 签名串，现在是库里的随机串）
+    p = await call('eqs_token=deadbeef', 'GET', '/api/forms')
+    assert(p.status === 401, '伪造的会话串无效')
+
+    // 停用账号后，手里那条 Cookie 立刻不再通行
+    // 「退出其它设备」把此前的 adminCookie 也吊销了，这里改用 ck1
+    cookie = ck1
+    await req('POST', '/api/settings/site', { allowRegister: true })
+    await req('POST', '/api/auth/register', { username: 'tobedisabled', password: 'disabled-123' })
+    const disabledCk = await asUser('tobedisabled', 'disabled-123')
+    const du = (await req('GET', '/api/users')).json.data.find(u => u.username === 'tobedisabled')
+    // 注意：注册接口会下发新 Cookie，把全局身份顶掉——这里显式用管理员那条
+    const dp = await call(ck1, 'PUT', '/api/users/' + du.id, { status: 0 })
+    assert(dp.status === 200, '停用账号成功', dp.status + ' ' + JSON.stringify(dp.json))
+    p = await call(disabledCk, 'GET', '/api/forms')
+    assert(p.status === 401 || p.status === 403, '停用账号后旧会话不再通行', String(p.status))
   }
 
   console.log('\n[44] 前端静态资源')

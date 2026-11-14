@@ -1,6 +1,6 @@
 import { get, all, run, now, log, setting, setSetting } from '../lib/db.js'
 import { readJson, fail, sendJson, clientIp } from '../lib/http.js'
-import { requireUser, requirePerm, can, hashPassword, verifyPassword, stampPasswordChange } from '../lib/auth.js'
+import { requireUser, requirePerm, can, hashPassword, verifyPassword, stampPasswordChange, revokeUserSessions } from '../lib/auth.js'
 import { storageConfig } from '../lib/storage.js'
 import { smtpSend, sendSms, dispatchWebhooks } from '../lib/notify.js'
 import { aiConfig, generateForm, localGenerate } from '../lib/ai.js'
@@ -126,7 +126,9 @@ export default function register(r) {
     if (!sets.length) fail(400, '没有需要更新的内容')
     run(`UPDATE users SET ${sets.join(', ')} WHERE id = ?`, ...args, target.id)
     // 管理员重置了别人的密码：那个人手里的旧会话必须立刻失效，否则「重置」形同虚设
-    if (body.password) stampPasswordChange(target.id)
+    if (body.password) { stampPasswordChange(target.id); revokeUserSessions(target.id, { byUserId: me.id }) }
+    // 禁用账号同理：会话在库里，不吊销的话手里那条 Cookie 还能用到 7 天后
+    if (body.status !== undefined && !body.status) revokeUserSessions(target.id, { byUserId: me.id })
     log(me, '修改用户', target.username)
     sendJson(res, 200, { ok: true })
   })
@@ -139,6 +141,7 @@ export default function register(r) {
     if (target.id === me.id) fail(400, '不能删除自己')
     if (target.username === 'admin') fail(400, '内置管理员不可删除')
     run('DELETE FROM users WHERE id = ?', target.id)
+    revokeUserSessions(target.id, { byUserId: me.id })
     log(me, '删除用户', target.username)
     sendJson(res, 200, { ok: true })
   })
