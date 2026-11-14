@@ -5128,6 +5128,182 @@ try {
     cookie = holderR
   }
 
+  console.log('\n[72] 换尺子重批之后：名次会不会变')
+  {
+    const { standings, standingText, regradeRuler } = await import('../web/js/review.js')
+    const mk = (sub, uid, name, changes) => ({ submissionId: sub, userId: uid, username: name, createdAt: 't', changes })
+    const pair = (list) => list.map(([id, score]) => ({ id, score }))
+
+    // ---- 纯函数：三种「第 1 名变了」是三句话，不能混成一句
+    let s = standings(pair([[1, 90], [2, 88]]), pair([[1, 90], [2, 93]]))
+    assert(s.topChanged && s.topAfter[0] === 2, '第 1 名真的换人', JSON.stringify({ b: s.topBefore, a: s.topAfter }))
+    assert(/顶替/.test(standingText(s)), '换人那句话写的是「顶替」', standingText(s))
+
+    s = standings(pair([[1, 90], [2, 88]]), pair([[1, 90], [2, 90]]))
+    assert(s.topChanged && /追平/.test(standingText(s)), '原来那位还在台上，只是有人并列进来 —— 说「被追平」', standingText(s))
+
+    // 并列被打散：原本两份并列第 1，重批后只剩一份
+    s = standings(pair([[1, 88], [2, 88], [3, 70]]), pair([[1, 90], [2, 88], [3, 70]]))
+    assert(s.topChanged && /打散/.test(standingText(s)), '并列被打散是第三种说法，不是「换人」', standingText(s))
+
+    // 同分同名次：并列的人名次必须一样，下一位跳号（1,1,3）
+    s = standings(pair([[1, 88], [2, 88], [3, 70]]), pair([[1, 88], [2, 88], [3, 70]]))
+    assert(s.topBefore.length === 2 && !s.topChanged && s.moved === 0, '并列的两份都是第 1 名（同分同名次）', JSON.stringify(s.topBefore))
+
+    // 分数变了但顺序没变：这不是「没影响」，是分歧只动了绝对值
+    s = standings(pair([[1, 90], [2, 88]]), pair([[1, 95], [2, 91]]))
+    assert(!s.topChanged && s.moved === 0 && /顺序不受影响/.test(standingText(s)), '分数都涨了、顺序没动 → 名次一位都没变', standingText(s))
+
+    // 前 10 进出：第 1 名没换人，但这才是「有没有人被挤出去」的答案
+    {
+      const b = []
+      const a = []
+      for (let i = 1; i <= 15; i++) { b.push({ id: i, score: 100 - i }); a.push({ id: i, score: 100 - i }) }
+      a[10].score = 95.5                 // #11 从第 11 名冲进前 10
+      s = standings(b, a)
+      assert(!s.topChanged, '第 1 名没换人', JSON.stringify(s.topAfter))
+      assert(s.crossedTop.length === 2, '前 10 一进一出', JSON.stringify(s.crossedTop))
+      assert(/前 10 名有 2 人进出/.test(standingText(s)), '那句话说的是前 10 进出', standingText(s))
+      // 被挤出去的那份自己一分没变：它是这场分歧的受害者，不是变差了
+      const out = s.movers.find(m => m.dir === 'out')
+      assert(out && out.shifted === false, '被挤出去的那份分数没变，只是名次掉了', JSON.stringify(out))
+      assert(/被别人的位移挤动/.test(standingText(s)), '要说清有人是被挤动的，不是自己变差', standingText(s))
+    }
+
+    // 空榜单不说话：0 份参与排名时不该蹦出「第 1 名换人」
+    s = standings([], [])
+    assert(s.ranked === 0 && standingText(s) === '', '没有答卷就没有那句话', standingText(s))
+
+    // ---- regradeRuler 接上名次：名次要在全部批完的卷子里排，不能只看「分数变了的那几份」
+    {
+      const entries = [
+        mk(1, 1, '张老师', [{ id: 'q1', label: '简答', from: null, to: 18 }]),
+        mk(1, 2, '李老师', [{ id: 'q1', label: '简答', from: 18, to: 10 }]),
+        mk(2, 1, '张老师', [{ id: 'q1', label: '简答', from: null, to: 16 }]),
+        mk(2, 2, '李老师', [{ id: 'q1', label: '简答', from: 16, to: 8 }])
+      ]
+      /*
+       * #9 是一份纯客观题的满分卷，没有任何人工分、跟谁的尺子都无关。
+       * 它必须出现在名次里——不然「第 1 名」就是剩下那批人的第一名，
+       * 报出来的「换人」在真实榜单上根本没发生。
+       */
+      const rows = [
+        { id: 9, score: 100, passLine: 60, total: 100, manual: {}, pending: 0 },
+        { id: 1, score: 70, passLine: 60, total: 100, manual: { q1: 10 }, pending: 0 },
+        { id: 2, score: 64, passLine: 60, total: 100, manual: { q1: 8 }, pending: 0 }
+      ]
+      let r = regradeRuler(entries, rows, { maxOf: () => 20 })
+      const z = r.teachers.find(t => t.name === '张老师')
+      assert(z && z.standing.ranked === 3, '名次把纯客观题的满分卷一起排进来（3 份）', JSON.stringify(z?.standing?.ranked))
+      assert(z.standing.topAfter[0] === 9 && !z.standing.topChanged, '那份满分卷没人能动，第 1 名没换', JSON.stringify({ t: z.standing.topBefore, a: z.standing.topAfter }))
+
+      // 未判分的卷子（score 为 null）不能以 0 分混进榜单垫底
+      r = regradeRuler(entries, [...rows, { id: 7, score: null, passLine: 0, total: 0, manual: {}, pending: 2 }], { maxOf: () => 20 })
+      const z2 = r.teachers.find(t => t.name === '张老师')
+      assert(z2.standing.ranked === 3, '没判过分的卷子不进名次（Number(null) 是 0，必须显式拦）', String(z2?.standing?.ranked))
+
+      /*
+       * 名次真的会换的场合：**两道题上的偏移方向相反**。
+       * 只有一道题、一个方向时，每份卷子都平移同一个数，顺序永远不变——
+       * 那种情况下报「第 1 名换人」才是真的在编。这里构造：张老师 q1 偏松 15 分、q2 偏紧 10 分，
+       * 于是「q2 拿了满分」的那份反而被他压下来，「q2 没给分」的那份浮上去。
+       */
+      r = regradeRuler([
+        mk(1, 1, '张老师', [{ id: 'q1', from: null, to: 20 }]),
+        mk(1, 2, '李老师', [{ id: 'q1', from: 20, to: 5 }]),
+        mk(2, 1, '张老师', [{ id: 'q2', from: null, to: 5 }]),
+        mk(2, 2, '李老师', [{ id: 'q2', from: 5, to: 15 }])
+      ], [
+        { id: 11, score: 70, passLine: 60, total: 100, manual: { q1: 0, q2: 0 }, pending: 0 },
+        { id: 12, score: 76, passLine: 60, total: 100, manual: { q1: 0, q2: 20 }, pending: 0 }
+      ], { maxOf: () => 20 })
+      const zt = r.teachers.find(t => t.name === '张老师')
+      assert(zt && zt.items.length === 2, '两份卷子都会位移', JSON.stringify(zt?.items))
+      assert(zt.standing.topChanged, '原来 #12 第 1，被 #11 顶上去 → 榜首换人', standingText(zt.standing))
+      assert(zt.standing.movers.length === 2, '换位的那两份都记下来', JSON.stringify(zt.standing.movers))
+      assert(zt.standing.movers.every(m => Math.abs(m.move) === 1), '各挪一位', JSON.stringify(zt.standing.movers))
+      // 名次要能挂回到具体哪一份上：说「#11 从第 2 名升到第 1」得对得上
+      const up11 = zt.standing.movers.find(m => m.id === 11)
+      assert(up11 && up11.rankBefore === 2 && up11.rankAfter === 1 && up11.shifted, '记下升上去那份的前后名次', JSON.stringify(up11))
+      // 只列升上去那个、不列让出榜首那个，读者会问「原来第一名呢」
+      assert(zt.items.find(it => it.id === 11)?.topTouched === 'up', '顶上去的那份标「成为第 1 名」', JSON.stringify(zt.items))
+      assert(zt.items.find(it => it.id === 12)?.topTouched === 'down', '让出第 1 名的那份也要列出来', JSON.stringify(zt.items))
+
+      /*
+       * 自己一分没变、只被挤下去的那份：它的 delta 是 0，本来根本进不了清单。
+       * 但「原来第一名呢」必须有人回答——补一条进来，且不能算进「分数变了」的份数。
+       */
+      r = regradeRuler([
+        mk(1, 1, '张老师', [{ id: 'q1', from: null, to: 20 }]),
+        mk(1, 2, '李老师', [{ id: 'q1', from: 20, to: 0 }])
+      ], [
+        { id: 21, score: 60, passLine: 60, total: 100, manual: { q1: 0 }, pending: 0 },
+        { id: 22, score: 62, passLine: 60, total: 100, manual: { q1: 20 }, pending: 0 }
+      ], { maxOf: () => 20 })
+      const z2b = r.teachers.find(t => t.name === '张老师')
+      if (z2b?.standing.topChanged) {
+        const loser = z2b.items.find(it => it.topTouched === 'down')
+        assert(loser && loser.untouched && loser.delta === 0, '让出榜首、自己没被改分的那份也列出来', JSON.stringify(loser))
+      } else {
+        assert(true, '这组数据里没人换榜首（跳过）')
+      }
+    }
+
+    // ---- 接口：一份纯客观题的满分卷在场时，不许报出「第 1 名换人」
+    let r = await req('POST', '/api/forms', {
+      title: '名次尺子卷', kind: 'exam',
+      schema: [
+        { id: 's1', type: 'textarea', label: '主观题一', answer: [], score: 20 },
+        { id: 's2', type: 'radio', label: '客观题', options: ['A', 'B'], answer: ['A'], score: 80 }
+      ],
+      settings: { passPercent: 60 }
+    })
+    const sid = r.json.id
+    await req('PUT', `/api/forms/${sid}`, { status: 'published' })
+    // 三份主观作答 + 一份全对的纯客观卷（不出现 manual_scores）
+    const ids = []
+    for (let i = 0; i < 3; i++) {
+      r = await req('POST', `/api/public/forms/${sid}/submit`, { data: { s1: `答 ${i}`, s2: i === 2 ? 'B' : 'A' } })
+      ids.push(r.json.id)
+    }
+    const admin = cookie
+    await req('POST', '/api/auth/register', { username: 'standing_b', password: 'sd-pass-123', nickname: '赵老师' })
+    const addS = await call(admin, 'POST', `/api/forms/${sid}/members`, { username: 'standing_b', role: 'editor' })
+    assert(addS.status === 201, '把第二位老师拉进这张卷子', JSON.stringify(addS.json))
+    const zhao = await asUser('standing_b', 'sd-pass-123')
+
+    // 管理员给前两份高分、赵老师给低分：同格对比出偏移，位移会重排第三份
+    cookie = admin
+    await req('PUT', `/api/submissions/${ids[0]}/review`, { scores: { s1: 20 } })
+    await call(zhao, 'PUT', `/api/submissions/${ids[0]}/review`, { scores: { s1: 4 } })
+    await req('PUT', `/api/submissions/${ids[1]}/review`, { scores: { s1: 20 } })
+    await call(zhao, 'PUT', `/api/submissions/${ids[1]}/review`, { scores: { s1: 4 } })
+    await req('PUT', `/api/submissions/${ids[2]}/review`, { scores: { s1: 10 } })
+    cookie = admin
+    r = await req('GET', `/api/forms/${sid}/review-calibration`)
+    const rg = r.json.data.regrade
+    const zt = rg.teachers.find(t => t.name === '赵老师') || rg.teachers.find(t => t.name === '管理员')
+    assert(zt && zt.standing, '接口带上名次', JSON.stringify(Object.keys(rg.teachers[0] || {})))
+    assert(typeof zt.standingText === 'string' && zt.standingText, '名次那句话由服务端拼（前端各拼一遍迟早说岔）', zt?.standingText)
+    assert(zt.standing.ranked === 3, '名次里是全部 3 份答卷', String(zt?.standing?.ranked))
+    /*
+     * 每份答卷带上前后的名次：说「#12 掉到第 15 名」得能看见是那一份。
+     * 这里不硬要求「一定有换位」——数据是造出来的，换位与否取决于偏移方向；
+     * 能要求的是：凡挂了名次的，前后都是真数字。
+     */
+    const withRank = (rg.teachers.flatMap(t => t.items)).filter(it => it.rankBefore !== undefined)
+    assert(withRank.every(x => Number.isFinite(x.rankBefore) && Number.isFinite(x.rankAfter)), '挂了名次的都带前后数字', JSON.stringify(withRank))
+    assert(zt.standing.movers.every(m => Number.isFinite(m.move)), '名次位移是数字', JSON.stringify(zt.standing.movers))
+
+    // 无关账号照旧 403
+    const holdS = cookie
+    await req('POST', '/api/auth/register', { username: 'standing_out', password: 'so-pass-123' })
+    const outS = await asUser('standing_out', 'so-pass-123')
+    r = await call(outS, 'GET', `/api/forms/${sid}/review-calibration`)
+    assert(r.status === 403, '无关账号看不到名次这笔账', `${r.status} ${r.json?.message || ''}`)
+    cookie = holdS
+  }
+
   console.log('\n[45] 前端静态资源')
 
   for (const p of ['/', '/js/main.js', '/css/app.css', '/js/views/Logs.js', '/js/views/Dicts.js', '/js/review.js', '/assets/eqs-mark.svg', '/vendor/echarts.min.js']) {

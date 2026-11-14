@@ -624,18 +624,142 @@ export function bandText(band) {
  *  - **负数与超满分一律剪回 [0, 满分]**：一位老师整体偏松 6 分，平移到一道已经给了满分的题上
  *    会得到 26/20，而超纲的分数不是成绩。
  */
-// 换边的全留，其余按位移补到 n 条：截断不能把「上岸的人」截掉
-function flipsFirst(items, n) {
-  const flip = []
-  const rest = []
-  for (const it of items) (it.flip ? flip : rest).push(it)
-  const byMove = (a, b) => Math.abs(b.delta) - Math.abs(a.delta)
-  flip.sort(byMove)
-  rest.sort(byMove)
-  return flip.concat(rest).slice(0, Math.max(n, flip.length))
+/**
+ * 名次表：分数降序，同分同名次（与榜单 ranking.js 同一口径——名次 = 比我高的人数 + 1）。
+ *
+ * 不用 O(n²) 的两两比较：一场几千份答卷乘以每位老师就是上亿次比较，而这只是排序后
+ * 顺着走一遍的事。同分用「第一次出现的下标 + 1」，于是并列的下一位要跳号（1,1,3）。
+ */
+function ranksBy(list) {
+  const sorted = [...list].sort((a, b) => b.score - a.score)
+  const ranks = new Map()
+  // prev 存的是「上一个分数」本身，不是上一行：拿行对象去比会一路比成 undefined，
+  // 于是每行都拿到自己的下标当名次，并列的人被拆成 1、2、3
+  let rank = 0
+  let prev = null
+  sorted.forEach((s, i) => {
+    if (prev === null || s.score !== prev) { rank = i + 1; prev = s.score }
+    ranks.set(s.id, rank)
+  })
+  return ranks
 }
 
-export function regradeRuler(entries = [], rows = [], { maxOf = () => 0 } = {}) {
+/**
+ * 换一把尺子重批之后，**名次会不会变**。
+ *
+ * 上一轮已经能回答「谁会被推出及格线」。但及格线是行政上的线，教研组真正吵的常常是另一件事：
+ * 按李老师那把尺子重批，第一名还是不是原来那个人。这句话以前答不出来——
+ * 分数位移了 12 分，读者自己没法在心里把几十份卷子重排一遍。
+ *
+ * 三件事必须分开说：
+ *  - **第 1 名换人**，和**前 10 名进出**，不是同一件事。榜首换人才是「这场分歧改变了结论」；
+ *    前 10 里挪两位，多数时候没人会去申诉。
+ *  - **同一个人的名次没动，不等于这场分歧不存在**：分数变了但顺序没变，说明分歧集中在
+ *    同一批卷子上，它只影响分数的绝对值，不影响谁排在谁前面。这句话本身就是结论。
+ *  - **并列要照榜单的规矩算**：3 份同分并列第 1，重批后其中一份上浮 2 分成了唯一第一，
+ *    这算「第 1 名换人」——原来那三个人都是第一，现在只有他一个。
+ *
+ * 名次只在**已批完的卷子**里算：还有主观题没给分的卷子，分数本身还会涨，
+ * 它的名次是个还没定下来的数。把它硬塞进榜单，会让第 3 名凭空掉到第 4 名。
+ */
+export function standings(before = [], after = [], { topN = 10 } = {}) {
+  // before/after: [{ id, score }]，同一批答卷的两个版本（换尺子前后）
+  const rb = ranksBy(before)
+  const ra = ranksBy(after)
+  const topB = before.filter(s => rb.get(s.id) === 1).map(s => s.id).sort((a, b) => a - b)
+  const topA = after.filter(s => ra.get(s.id) === 1).map(s => s.id).sort((a, b) => a - b)
+  const topChanged = topB.length !== topA.length || topB.some((id, i) => id !== topA[i])
+  const scoreAfter = new Map(after.map(s => [s.id, s.score]))
+  const crossedTop = []
+  let moved = 0
+  let pushed = 0
+  let maxMove = 0
+  const movers = []
+  for (const s of before) {
+    const was = rb.get(s.id)
+    const is = ra.get(s.id)
+    if (was === undefined || is === undefined) continue
+    const move = was - is           // 正数 = 名次上升（数字变小）
+    // 分数没动、名次却掉了：这不是「他变差了」，是别人浮上去了。这种卷子不进分数变动清单，
+    // 但它确实是这场分歧的受害者——一句话要说出来，否则读者只看到名次变了却找不到原因
+    const shifted = scoreAfter.get(s.id) !== s.score
+    if (move) {
+      moved++
+      if (!shifted) pushed++
+      maxMove = Math.max(maxMove, Math.abs(move))
+    }
+    // 进出前 N 单独记：第 1 名没换人时，这才是「有没有人因此被挤出去」的答案
+    const wasTop = was <= topN
+    const isTop = is <= topN
+    if (wasTop !== isTop || move) movers.push({ id: s.id, rankBefore: was, rankAfter: is, move, shifted, dir: wasTop === isTop ? '' : (isTop ? 'in' : 'out') })
+    if (wasTop !== isTop) crossedTop.push({ id: s.id, dir: isTop ? 'in' : 'out', rankBefore: was, rankAfter: is })
+  }
+  // 进出前 N 的排最前，然后按位移大小：挪得最多的人是这张表要指出来的人
+  movers.sort((a, b) => (b.dir ? 1 : 0) - (a.dir ? 1 : 0) || Math.abs(b.move) - Math.abs(a.move))
+  return {
+    ranked: before.length,
+    topBefore: topB,
+    topAfter: topA,
+    topChanged,
+    crossedTop: crossedTop.sort((a, b) => Math.abs(b.move) - Math.abs(a.move)),
+    moved,
+    // 分数没变、被别人的位移挤动名次的份数
+    pushed,
+    maxMove,
+    topN,
+    movers
+  }
+}
+
+/**
+ * 名次那句话。
+ *
+ * 三种「第 1 名变了」要说成三句不同的中文，混成一句「第 1 名换人」会误导人：
+ *  - **真的换人**：原来那个人被挤下去了。这才是「这场分歧改变了结论」。
+ *  - **有人追平**：原来独占第一的那位还在台上，只是旁边多站了一个。
+ *  - **并列被打散**：原本三份并列第一，现在只剩一份——掉下去的那两份并没有变差，
+ *    只是别人浮上去了，但榜单上从此有了唯一的第一名。
+ */
+export function standingText(s) {
+  if (!s || !s.ranked) return ''
+  const zh = n => `#${n}`
+  if (s.topChanged) {
+    const gone = s.topBefore.filter(id => !s.topAfter.includes(id))
+    const come = s.topAfter.filter(id => !s.topBefore.includes(id))
+    if (come.length && gone.length) return `第 1 名换人：${come.map(zh).join('、')} 顶替 ${gone.map(zh).join('、')}`
+    if (come.length) return `第 1 名被追平：${come.map(zh).join('、')} 并列进来`
+    return `并列被打散：原本 ${s.topBefore.length} 份并列第 1，现在由 ${s.topAfter.map(zh).join('、')} 独走`
+  }
+  // 句子里不再重复「名次」两个字：界面上那颗标签已经写了，叠起来是「名次名次有 3 份挪了位」
+  const pushedNote = s.pushed ? `（其中 ${s.pushed} 份自己的分没变，是被别人的位移挤动的）` : ''
+  if (s.crossedTop.length) return `第 1 名不变，但前 ${s.topN} 名有 ${s.crossedTop.length} 人进出，最大移动 ${s.maxMove} 位${pushedNote}`
+  // 分数变了、名次没变：这不是「没影响」，而是分歧只动了绝对值、没动谁排在谁前面
+  if (s.moved) return `有 ${s.moved} 份挪了位，但前 ${s.topN} 名没人进出${pushedNote}`
+  return `一位都没变（${s.ranked} 份里的顺序不受影响）`
+}
+
+/**
+ * 逐份清单的排法，也是「哪些必须列出来」的规则：
+ *
+ *  1. **换边的**（及格线）：这是这块最硬的结论，一份都不能省。
+ *  2. **牵扯榜首的**：把第 1 名顶下去的那份、被顶下去的那份。
+ *     只列「升上去的那个」是不完整的——读者会问「原来第一名呢」。
+ *  3. **前 N 进出的**：第 1 名没换人时，这才是「有没有人被挤出去」的答案。
+ *  4. 其余按位移大小。
+ *
+ * 前三类一律留全，剩余名额才按位移补：说了「6 人上岸」却只列 5 条，
+ * 读者数一遍会以为结论有假。
+ */
+function flipsFirst(items, n) {
+  const hard = items.filter(it => it.flip || it.topTouched)
+  const rest = items.filter(it => !it.flip && !it.topTouched)
+  const byMove = (a, b) => Math.abs(b.delta) - Math.abs(a.delta)
+  hard.sort(byMove)
+  rest.sort(byMove)
+  return hard.concat(rest).slice(0, Math.max(n, hard.length))
+}
+
+export function regradeRuler(entries = [], rows = [], { maxOf = () => 0, topN = 10 } = {}) {
   // rows: [{ id, score, passed, manual, passLine, total, pending }]，pending 是还没给分的主观题数
   const { cells, teachers } = replayCells(entries)
   // 每位老师每道题的偏移（只从「同格 ≥2 人」的格子里取）：考生水平在减法里抵消掉
@@ -683,7 +807,17 @@ export function regradeRuler(entries = [], rows = [], { maxOf = () => 0 } = {}) 
     let passBefore = 0
     let maxMove = 0
     const items = []
+    // 名次要跟没被动过的卷子一起排：只拿「分数变了的那几份」排序，
+    // 第 1 名永远是它们里的第一名，而真实榜单上可能有一份纯客观题的满分卷根本不受影响
+    const beforeList = []
+    const afterList = []
     for (const row of rows) {
+      /*
+       * 还没判过分的卷子（score 为 null）不入名次，也不进这笔账。
+       * Number(null) 是 0——不显式拦一下，未判分的卷子会以 0 分混进榜单垫底，
+       * 名次总数凭空多出几十位。成绩榜本身也是这么筛的（`score IS NOT NULL`）。
+       */
+      if (row.score === null || row.score === undefined) continue
       const cur = Number(row.score)
       const line = Number(row.passLine)
       if (!Number.isFinite(cur) || !Number.isFinite(line)) continue
@@ -713,8 +847,10 @@ export function regradeRuler(entries = [], rows = [], { maxOf = () => 0 } = {}) 
         delta += next - now
         projected++
       }
-      if (!delta) continue
       const after = Math.max(Math.min(cur + delta, Number(row.total) || Infinity), 0)
+      beforeList.push({ id: row.id, score: round100(cur) })
+      afterList.push({ id: row.id, score: round100(after) })
+      if (!delta) continue
       const move = round100(after - cur)
       changed++
       if (move > 0) up++
@@ -725,6 +861,58 @@ export function regradeRuler(entries = [], rows = [], { maxOf = () => 0 } = {}) 
       if (is && !was) flipUp++
       if (was && !is) flipDown++
       items.push({ id: row.id, from: round100(cur), to: round100(after), delta: move, flip: is === was ? '' : (is ? 'up' : 'down') })
+    }
+    /*
+     * 名次：及格线是行政上的线，教研组真正吵的常常是「按他的尺子重批，第一名还是不是原来那个」。
+     * 分数位移了 12 分，读者自己没法在心里把几十份卷子重排一遍——这里替他们排。
+     */
+    const st = standings(beforeList, afterList, { topN })
+    /*
+     * 把「牵扯榜首」的份子挂到逐份清单上。
+     * 只列升上去那个、不列被顶下来那个，读者会问「原来第一名呢」——
+     * 而那份卷子可能一分没变（他是被别人挤下去的），本来根本进不了这张表。
+     */
+    for (const it of items) {
+      if (!st.topBefore.includes(it.id) && !st.topAfter.includes(it.id)) continue
+      const wasTop = st.topBefore.includes(it.id)
+      const isTop = st.topAfter.includes(it.id)
+      if (wasTop !== isTop) it.topTouched = isTop ? 'up' : 'down'
+    }
+    /*
+     * 名次挪了、分数却一分没变的那几份：delta 是 0，本来压根进不了 items。
+     * 可界面上写着「名次有 16 份挪了位」，读者却只看到 7 行，剩下 9 行去哪了？
+     * 补一条进来并标 `untouched`（分数没被改），它们不进 `changed` 计数——确实没人动过分。
+     */
+    /*
+     * 「被追平」时，原来那位还在榜首。只列挤进来的人，读者照样会问「原来那个呢」——
+     * 所以把仍在榜首的那几份也补一条（hold），让这一组分能自己读成一句话。
+     */
+    if (st.topChanged) {
+      for (const id of st.topBefore.filter(x => st.topAfter.includes(x))) {
+        if (items.some(it => it.id === id)) {
+          const it = items.find(x => x.id === id)
+          it.topTouched = 'hold'
+          continue
+        }
+        const row = rows.find(x => Number(x.id) === Number(id))
+        if (!row || row.score === null || row.score === undefined) continue
+        items.push({
+          id, from: round100(row.score), to: round100(row.score), delta: 0,
+          flip: '', untouched: true, topTouched: 'hold'
+        })
+      }
+    }
+    for (const m of st.movers) {
+      if (items.some(it => it.id === m.id)) continue
+      const row = rows.find(x => Number(x.id) === Number(m.id))
+      if (!row || row.score === null || row.score === undefined) continue
+      const isTop = st.topAfter.includes(m.id)
+      const wasTop = st.topBefore.includes(m.id)
+      items.push({
+        id: m.id, from: round100(row.score), to: round100(row.score), delta: 0,
+        flip: '', untouched: true,
+        topTouched: wasTop === isTop ? '' : (isTop ? 'up' : 'down')
+      })
     }
     out.push({
       key,
@@ -741,6 +929,7 @@ export function regradeRuler(entries = [], rows = [], { maxOf = () => 0 } = {}) 
       passBefore,
       // 没变的那几份成绩不动，所以过线人数就是「原来的 + 上岸 − 落榜」，不必再数一遍
       passAfter: passBefore + flipUp - flipDown,
+      standing: st,
       maxMove: round100(maxMove),
       /*
        * 换边的那几份排最前面，然后才按位移大小。
@@ -748,7 +937,7 @@ export function regradeRuler(entries = [], rows = [], { maxOf = () => 0 } = {}) 
        * 读者就得自己一行行找哪几个人的名字变了颜色。
        *
        * 也不能截断到固定条数：说「6 人越线上岸」却只列出 5 条，第 6 个人就这么没了，
-       * 读者数一遍会以为结论有假。换边的一律留全，剩下的名额才按位移补。
+       * 读者数一遍会以为结论有假。换边的、牵扯榜首的一律留全，剩下的名额才按位移补。
        */
       items: flipsFirst(items, 8)
     })
@@ -767,13 +956,21 @@ export function regradeRuler(entries = [], rows = [], { maxOf = () => 0 } = {}) 
       current: (lastWriter.get(t.key) || 0) >= cells.size && cells.size > 0
     })
   }
-  const kept = out.filter(t => t.changed > 0).sort((a, b) => (b.flipUp + b.flipDown) - (a.flipUp + a.flipDown) || b.changed - a.changed)
+  /*
+   * 排序：先看有没有人因为他换边（及格线），再看有没有把第 1 名换掉，最后才是改了多少份。
+   * 「榜首换人」比「前 10 挪两位」重，但它比「8 人越线上岸」轻——及格线是行政后果。
+   */
+  const kept = out.filter(t => t.changed > 0)
+    .sort((a, b) => (b.flipUp + b.flipDown) - (a.flipUp + a.flipDown)
+      || (b.standing?.topChanged ? 1 : 0) - (a.standing?.topChanged ? 1 : 0)
+      || b.changed - a.changed)
   return {
     teachers: kept,
     // 重批等于现状的人：现在的分就是他落下的，不列出来会让读者以为漏了一个
     settled,
     // 分母要说清：没批完的卷子不参与，「36 份里 8 人上岸」和「36 份里 8 人上岸，另有 5 份还没批完」不是同一句话
     reviewed: rows.length - unfinished,
+    topN,
     unfinished,
     note: kept.length
       ? ''

@@ -39,7 +39,7 @@ import { submissionsXlsx, submissionsHead, submissionRow } from '../lib/sheet.js
 import { writeXlsxStream } from '../lib/xlsx.js'
 import { signFileUrl, signFileUrls, signHtmlFiles, QUERY_FILE_TTL } from '../lib/fileAccess.js'
 // 份数/分数的留痕口径只有一份：前端也是这套（web/js/review.js），两边说的必须是同一件事
-import { scoreChanges, changeText, calibrate, gapLevel, reviewDrift, driftText, regradeRuler, regradeText } from '../../web/js/review.js'
+import { scoreChanges, changeText, calibrate, gapLevel, reviewDrift, driftText, regradeRuler, regradeText, standingText } from '../../web/js/review.js'
 
 function fingerprint(req, extra = {}) {
   return {
@@ -912,13 +912,21 @@ export default function register(r) {
      * 区间回答「这一份会怎么变」，尺度回答「谁偏松几分」，走向回答「他后来收没收」——
      * 这三件拼起来还差一句：按李老师那把松尺子重批，及格的人会多出几个。
      *
-     * 只读有主观分的答卷：没人批过的卷子换谁的尺子都一样，读它们只是白扫一遍。
+     * 读的是**全部**答卷，不是「有主观分的那些」。
+     *
+     * 以前这里按 manual_scores 非空筛，只把被人批过的卷子读进来——算及格线时没毛病
+     * （没人批过的卷子位移是 0），但算名次就错了：一份纯客观题、没有任何人工分的卷子
+     * 不会出现在榜单里，于是「第 1 名」是剩下那批人里的第一名。
+     * 实测就撞上了：一份 100 分的纯客观卷被整段漏掉，报出「第 1 名换人」，
+     * 而真实榜单上那份卷子从头到尾没动过。
+     *
+     * 代价是这一屏要扫一遍答卷表（与阅卷队列同一个量级）——换来的是名次和成绩榜对得上。
      * 及格线与题目总分都走 gradeSubmission，和成绩单同一口径——这里不能自己再算一遍
      * 「总分 = 各题分值相加」，那会漏掉条件跳转跳过的题，算出来的线跟榜单上差几分。
      */
     const graded = []
     for (const row of each(`SELECT id, data, score, passed, manual_scores FROM submissions
-        WHERE form_id = ? AND deleted_at IS NULL AND manual_scores NOT IN ('', '{}', 'null')`, form.id)) {
+        WHERE form_id = ? AND deleted_at IS NULL`, form.id)) {
       const data = safeJson(row.data, {})
       const manual = manualScoresOf(row)
       const g = gradeSubmission(form.schema, data, form.settings, manual)
@@ -930,7 +938,17 @@ export default function register(r) {
       })
     }
     const regrade = regradeRuler(entries, graded, { maxOf })
-    for (const t of regrade.teachers) t.text = regradeText(t)
+    for (const t of regrade.teachers) {
+      t.text = regradeText(t)
+      // 名次那句话在服务端拼一次：前端各拼一遍，「第 1 名换人」和「被追平」迟早会被说成同一句
+      t.standingText = standingText(t.standing)
+      // 每份答卷的名次变化挂回 items 上：说「#12 掉到 #15」得能看见是那一份
+      const moved = new Map((t.standing?.movers || []).map(m => [m.id, m]))
+      for (const it of t.items) {
+        const m = moved.get(it.id)
+        if (m) { it.rankBefore = m.rankBefore; it.rankAfter = m.rankAfter; it.rankMove = m.move }
+      }
+    }
     sendJson(res, 200, {
       ok: true,
       data: {

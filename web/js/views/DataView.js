@@ -5,7 +5,7 @@ import { ok, err, confirmBox, fmtDate, Empty, Modal, Pagination, escapeHtml } fr
 import { Icon } from '../icons.js'
 import { renderControl, answerDisplay } from '../renderer.js'
 import { buildFlow } from '../flow.js'
-import { batchPayload, nextIndex, reviewProgress, afterSave, elapsedSeconds, changeText, changeLine, humanSeconds, gapLevel, bandText, biasText, regradeText } from '../review.js'
+import { batchPayload, nextIndex, reviewProgress, afterSave, elapsedSeconds, changeText, changeLine, humanSeconds, gapLevel, bandText, biasText, regradeText, standingText } from '../review.js'
 
 export default {
   setup() {
@@ -1025,6 +1025,9 @@ export default {
                     '及格线不动——换尺子不改变题目分值，动的是人。这 ' + calibration.value.regrade.reviewed
                     + ' 份批完的卷子里：他真批过的那几格是把他给的分换回去（事实），'
                     + '他没批过的格子按他在这道题上的口径平移（投影）。'
+                    // 名次一起排：分数位移了 12 分，读者自己没法在心里把几十份卷子重排一遍
+                    + `名次在第 1 名与前 ${calibration.value.regrade.topN || 10} 名这两档上说，`
+                    + '「第 1 名换人」才是这场分歧改变了结论。'
                     // 没批完的卷子总分还会涨，拿它算「会不会过线」算的是个还没定下来的数
                     + (calibration.value.regrade.unfinished
                       ? `另有 ${calibration.value.regrade.unfinished} 份还有主观题没批完，不参与这笔账。`
@@ -1044,22 +1047,62 @@ export default {
                         ? h('span', { class: ['tag', t.flipUp > t.flipDown ? 'ok' : 'warn'] }, regradeText(t))
                         : h('span', { class: 'tag' }, regradeText(t))
                     ]),
+                    /*
+                     * 名次那一行。及格线是行政上的线，教研组真正吵的常常是「按他的尺子重批，
+                     * 第一名还是不是原来那个」。榜首换人用 danger 标出来——这一块里只有它
+                     * 意味着「这场分歧改变了结论」，其余的都只是分数绝对值变了。
+                     */
+                    t.standing?.ranked
+                      ? h('div', { class: 'small', style: 'margin-top:4px' }, [
+                          h('span', {
+                            class: ['tag', t.standing.topChanged ? 'danger' : (t.standing.crossedTop.length ? 'warn' : '')],
+                            style: 'margin-right:8px'
+                          }, '名次'),
+                          h('span', { style: t.standing.topChanged ? 'color:var(--danger)' : 'color:var(--text-2)' },
+                            t.standingText || standingText(t.standing)),
+                          h('span', { class: 'muted', style: 'margin-left:8px' },
+                            `共 ${t.standing.ranked} 份参与排名`)
+                        ])
+                      : null,
                     // 逐份列出位移最大的几份：抽象的「5 人上岸」读者没法追，得能看见是哪几份
                     ...t.items.map(it => h('div', {
                       class: 'small', style: 'margin-top:6px;color:var(--text-2)'
                     }, [
                       h('span', { class: 'mono muted', style: 'margin-right:6px' }, `#${it.id}`),
-                      h('span', {}, `${it.from} → ${it.to} 分`),
-                      h('span', { class: 'muted', style: 'margin-left:8px' },
-                        `${it.delta > 0 ? '+' : ''}${it.delta}`),
+                      // 自己一分没变、只被挤了名次的那份：写「63 → 63 分」等于说了一遍废话
+                      it.untouched
+                        ? h('span', {}, `${it.from} 分（没被改分）`)
+                        : h('span', {}, `${it.from} → ${it.to} 分`),
+                      it.untouched
+                        ? null
+                        : h('span', { class: 'muted', style: 'margin-left:8px' },
+                            `${it.delta > 0 ? '+' : ''}${it.delta}`),
+                      // 把第 1 名顶下去 / 被顶下去：这两份放在一起看才成一句话
+                      it.topTouched === 'up'
+                        ? h('span', { class: 'tag ok', style: 'margin-left:8px' }, '成为第 1 名')
+                        : it.topTouched === 'down'
+                          ? h('span', { class: 'tag warn', style: 'margin-left:8px' }, '让出第 1 名')
+                          // 被追平：原来那位还在榜首，只是旁边多站了一个
+                          : it.topTouched === 'hold'
+                            ? h('span', { class: 'tag', style: 'margin-left:8px' }, '仍在第 1 名，被追平')
+                            : null,
                       it.flip === 'up'
                         ? h('span', { class: 'tag ok', style: 'margin-left:8px' }, '越线上岸')
-                        : it.flip === 'down' ? h('span', { class: 'tag warn', style: 'margin-left:8px' }, '掉到线下') : null
+                        : it.flip === 'down' ? h('span', { class: 'tag warn', style: 'margin-left:8px' }, '掉到线下') : null,
+                      // 名次变化跟分数变化写在一起：说「#12 掉到第 15 名」得能看见是那一份
+                      it.rankMove
+                        ? h('span', { class: 'muted', style: 'margin-left:8px' },
+                            `名次 #${it.rankBefore} → #${it.rankAfter}`)
+                        : null
                     ])),
-                    // 说了「6 人上岸」却少列一条，读者数一遍会以为结论有假：换边的一份都不能省
-                    t.changed > t.items.length
+                    /*
+                     * 说了「6 人上岸」却少列一条，读者数一遍会以为结论有假：换边的一份都不能省。
+                     * 计数要减掉 untouched 那几条——它们是「只被挤了名次、分数没人动」的，
+                     * 混进分子会得出「另有 -1 份也动了」。
+                     */
+                    t.changed > t.items.filter(it => !it.untouched).length
                       ? h('div', { class: 'small muted', style: 'margin-top:4px' },
-                          `另有 ${t.changed - t.items.length} 份也动了，但没换边，未列`)
+                          `另有 ${t.changed - t.items.filter(it => !it.untouched).length} 份也动了，但没换边、没换榜首，未列`)
                       : null,
                     h('div', { class: 'small muted', style: 'margin-top:4px' },
                       `事实替换 ${t.facts} 格 · 外推 ${t.projected} 格`)
