@@ -5,7 +5,7 @@ import { ok, err, confirmBox, fmtDate, Empty, Modal, Pagination, escapeHtml } fr
 import { Icon } from '../icons.js'
 import { renderControl, answerDisplay } from '../renderer.js'
 import { buildFlow } from '../flow.js'
-import { batchPayload, nextIndex, reviewProgress, afterSave, elapsedSeconds, changeText, changeLine, humanSeconds, gapLevel, bandText } from '../review.js'
+import { batchPayload, nextIndex, reviewProgress, afterSave, elapsedSeconds, changeText, changeLine, humanSeconds, gapLevel, bandText, biasText } from '../review.js'
 
 export default {
   setup() {
@@ -353,6 +353,58 @@ export default {
      * 系统只是把两条并排摆着，成绩单照旧只有一个总分。教研组真做的事是
      * 「同一道题先各自批 10 份，对一遍尺子再开工」——这件事现在能看了。
      */
+    /**
+     * 尺子的时间走向：一排偏移柱。
+     *
+     * 纵轴是「同一格上这位老师与同格其他人的平均分之差」，零线以上是给得偏高、以下是偏低。
+     * 不用 SVG 折线：一条 viewBox 220×44 的线塞进 800px 的卡片里，等比缩放后只能挤在中间，
+     * 而横向拉伸会把描边和圆点一起压扁。柱子用 CSS 百分比画，宽度跟着容器走，不需要换算。
+     *
+     * 刻度由整张表共用（driftScale）：每位老师各用各的刻度，+0.5 和 +9 会长成一样高，
+     * 而这张表存在的意义正是「谁松得多」。
+     */
+    const driftScale = (drift) => {
+      const values = drift.buckets.flatMap(b => b.teachers.map(t => t.bias))
+      if (!values.length) return { lo: -1, hi: 1 }
+      const lo = Math.min(0, ...values)
+      const hi = Math.max(0, ...values)
+      // 上下各留 12% 余量：最矮的那根柱若顶到边框，柱上的读数就得压在柱子里，读不出来
+      const pad = (hi - lo || 1) * 0.12
+      return { lo: lo - pad, hi: hi + pad }
+    }
+    const driftBars = (drift, key, scale) => {
+      const span = scale.hi - scale.lo || 1
+      const zero = (scale.hi / span) * 100
+      return h('div', { class: 'drift-chart' }, [
+        // 零线：偏移 0 分的意思是「和同格其他人给的一样」，这条线才是基准，不是中间那条
+        h('div', { class: 'drift-zero', style: `top:${zero}%` }),
+        ...drift.buckets.map(b => {
+          const t = b.teachers.find(x => x.key === key)
+          if (!t) {
+            // 这个时间段里没有可比的一格：空着，不补一个 0 分进去——
+            // 补 0 会长成一根「他和别人给得一样」的柱子，而事实是那段时间没有证据
+            return h('div', { class: 'drift-col' }, [h('i', { class: 'drift-gap', title: `${b.label} 没有可比的一格` })])
+          }
+          const top = (scale.hi - Math.max(t.bias, 0)) / span * 100
+          const height = (Math.abs(t.bias) / span) * 100
+          return h('div', { class: 'drift-col' }, [
+            h('i', {
+              class: ['drift-bar', t.bias < 0 ? 'neg' : ''],
+              style: `top:${top}%;height:${Math.max(height, 0.6)}%`,
+              title: `${b.label}：${biasText(t.bias)} 分（${t.n} 处对比）`
+            }),
+            // 数值写在柱子那一侧：光看柱高只能读「涨了还是跌了」，具体几分还得靠这行字
+            h('span', {
+              class: 'drift-val',
+              // 负值写在柱下方、正值写在柱上方：标的始终是「这一根柱的读数」，不飘到零线另一侧。
+              // 偏移用 px 而不是百分比：柱子最矮时（不到 1 分）百分比偏移会贴着柱子，读数看不清
+              style: t.bias < 0 ? `top:calc(${top + height}% + 3px)` : `bottom:calc(${100 - top}% + 3px)`
+            }, biasText(t.bias))
+          ])
+        })
+      ])
+    }
+
     const calibration = ref(null)
     const openCalibration = async () => {
       if (!form.value) return err('请先在左上角选择一个具体表单')
@@ -892,6 +944,55 @@ export default {
                   `（${p2.bias > 0 ? p2.a : p2.b} 平均高 ${Math.abs(p2.bias)} 分）`) : h('span', { style: 'margin-left:8px' }, '（没有系统性偏向）')
               ]))
             ]) : null,
+            /*
+             * 尺子随时间的走向。
+             *
+             * 「李老师平均高 4.61 分」是所有制摞在一起的平均值：如果他前 20 份偏松 9 分、
+             * 被教研组长谈过之后后 40 份收紧到 -1 分，平均下来是 +2 分——两极互相抵消，
+             * 于是「谈过之后确实收了」这件事在旧口径里永远既不能被证实也不能被证伪。
+             */
+            calibration.value.drift?.teachers?.length ? h('div', { style: 'margin-top:18px' }, [
+              h('div', { class: 'small', style: 'font-weight:600;margin-bottom:4px' }, '尺子随时间的走向'),
+              h('div', { class: 'small muted', style: 'margin-bottom:10px' },
+                `按${{ day: '天', week: '周', month: '月' }[calibration.value.drift.unit] || '时间'}切分：每个点是「同一格上，这位老师与同格其他人的平均分之差」。`
+                + '绝对分不进这条线——后面那批考生可能就是答得更差，那不叫放宽。'),
+              ...calibration.value.drift.teachers.slice(0, 4).map(t => h('div', { class: 'drift-row' }, [
+                h('div', { class: 'flex between wrap', style: 'gap:8px;align-items:baseline' }, [
+                  h('div', { class: 'flex', style: 'gap:8px;align-items:baseline;min-width:0' }, [
+                    h('b', { class: 'small' }, t.name),
+                    h('span', { class: 'small muted' }, `整体 ${biasText(t.bias)} 分 · ${t.samples} 处对比`)
+                  ]),
+                  // 结论只在首末两段样本都够时才给：一个桶里一格数据说「他收紧了」，那只是运气
+                  t.verdict === '收紧' || t.verdict === '放松'
+                    ? h('span', { class: ['tag', t.verdict === '收紧' ? 'ok' : 'warn'] },
+                        `${t.verdict} ${Math.abs(Math.round(t.delta * 10) / 10)} 分`)
+                    : h('span', { class: 'tag' }, t.verdict)
+                ]),
+                t.first && t.last
+                  ? h('div', { class: 'small muted', style: 'margin-top:2px' },
+                      `${t.first.label}：${biasText(t.first.bias)} → ${t.last.label}：${biasText(t.last.bias)}`)
+                  : null,
+                driftBars(calibration.value.drift, t.key, driftScale(calibration.value.drift))
+              ])),
+              // X 轴只在整张表底部画一次：三行图各带一份桶标签，读起来全是重复的字
+              h('div', { class: 'drift-axis' },
+                calibration.value.drift.buckets.map(b => h('span', {}, b.label))),
+              /*
+               * 零和的实话得说出来：每个人的偏移都相对「同格其他人的均值」，
+               * 所以两个人的走向必然互为镜像。张老师收紧 4.5 分，同格那位就是放松 4.5 分——
+               * 这不是两条独立证据，是一件事的两个方向。
+               */
+              calibration.value.drift.teachers.length > 1
+                ? h('div', { class: 'small muted', style: 'margin-top:4px' },
+                    '同一格里所有人的偏移加起来是 0，所以两个人的走向互为镜像：一个人收紧多少，同格那位就是放松多少。')
+                : null
+            ]) : (calibration.value.drift?.note
+              // 空的时候也要有个小标题：只甩一句灰字，读者不知道这块本来该长什么样
+              ? h('div', { style: 'margin-top:18px' }, [
+                  h('div', { class: 'small', style: 'font-weight:600;margin-bottom:4px' }, '尺子随时间的走向'),
+                  h('div', { class: 'small muted' }, calibration.value.drift.note)
+                ])
+              : null),
             calibration.value.teachers?.length > 1
               ? h('div', { class: 'small muted', style: 'margin-top:12px' },
                   '参与批阅的账号：' + calibration.value.teachers.map(t => `${t.name || '未知账号'}（${t.gradings} 次）`).join(' · '))

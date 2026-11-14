@@ -4749,6 +4749,168 @@ try {
     cookie = adminB
   }
 
+  console.log('\n[70] 尺子的时间维度：给分随时间往哪走')
+  {
+    // ---- 纯函数：偏移口径（浏览器与服务端共用同一份）
+    {
+      const { reviewDrift, driftText, biasText } = await import('../web/js/review.js')
+      const mk = (sub, uid, name, at, changes) => ({ submissionId: sub, userId: uid, username: name, createdAt: at, changes })
+
+      /*
+       * 绝对分不进这条线。后面那批考生可能就是答得更差——
+       * 「张老师前 20 份平均 15 分、后 40 份平均 12 分」说明不了任何关于尺子的事。
+       */
+      let d = reviewDrift([
+        mk(1, 1, '张老师', '2026-11-01T09:00:00Z', [{ id: 'q', from: null, to: 8 }]),
+        mk(1, 2, '李老师', '2026-11-01T09:10:00Z', [{ id: 'q', from: 8, to: 8 }])
+      ])
+      assert(d.samples === 2, '一格两人批过 → 两个数据点（各自相对对方）', JSON.stringify({ s: d.samples }))
+      const zhang = d.teachers.find(t => t.name === '张老师')
+      assert(zhang && zhang.bias === 0, '两人给同样的分，偏移是 0（不是「他给了 8 分」）', JSON.stringify(zhang))
+
+      // 只有一个人批过的格子不产生数据点：没有对比就没有偏移
+      d = reviewDrift([mk(1, 1, '张老师', '2026-11-01T09:00:00Z', [{ id: 'q', from: null, to: 15 }])])
+      assert(d.samples === 0 && d.teachers.length === 0, '只有一个人批过的地方不产生偏移', JSON.stringify(d.teachers))
+      // 这句写的是「怎么才会有」，不是把上面那句「还没有分歧」再抄一遍
+      assert(/两位老师|同一道题/.test(d.note), '没数据时给出说明', d.note)
+
+      // 撤分不是 0 分：把它当 0 算，一次误操作就能让整条线歪掉
+      d = reviewDrift([
+        mk(1, 1, '张老师', '2026-11-01T09:00:00Z', [{ id: 'q', from: null, to: 10 }]),
+        mk(1, 2, '李老师', '2026-11-01T09:10:00Z', [{ id: 'q', from: 10, to: null }])
+      ])
+      assert(d.samples === 0, '撤分不参与偏移（to 为 null 不算 0 分）', JSON.stringify({ s: d.samples }))
+
+      // 一天之内的数据不谈走向：「前松后紧」可能只是批卷顺序的差别
+      d = reviewDrift([
+        mk(1, 1, '张老师', '2026-11-01T09:00:00Z', [{ id: 'q', from: null, to: 18 }]),
+        mk(1, 2, '李老师', '2026-11-01T09:10:00Z', [{ id: 'q', from: 18, to: 10 }])
+      ])
+      assert(d.unit === 'day' && d.buckets.length === 1, '跨度一天就按天切，只有一个桶', JSON.stringify({ unit: d.unit, b: d.buckets.length }))
+      assert(!/收紧|放松/.test(d.teachers[0].verdict), '只有一个时间段时不下「收紧/放松」的结论', d.teachers[0].verdict)
+
+      // 前松后紧：每格都是同两个人批的，前 6 格张老师高 6 分，后 6 格高 0.5 分
+      const entries = []
+      for (let i = 0; i < 12; i++) {
+        const at = new Date(Date.UTC(2026, 9, 1 + i * 3)).toISOString()
+        const loose = i < 6 ? 6 : 0.5
+        entries.push(mk(100 + i, 1, '张老师', at, [{ id: 'q1', label: '简答', from: null, to: 10 + loose }]))
+        entries.push(mk(100 + i, 2, '李老师', at, [{ id: 'q1', label: '简答', from: null, to: 10 }]))
+      }
+      d = reviewDrift(entries)
+      const z1 = d.teachers.find(t => t.name === '张老师')
+      assert(z1.verdict === '收紧', '前松后紧 → 判为「收紧」', JSON.stringify(z1))
+      assert(z1.first.bias > z1.last.bias, '首段偏移高于末段', JSON.stringify({ f: z1.first, l: z1.last }))
+      assert(Math.abs(z1.delta - (z1.last.bias - z1.first.bias)) < 1e-9, '变化量 = 末段 − 首段', String(z1.delta))
+      assert(/→/.test(driftText(z1)) && /收紧/.test(driftText(z1)), '走向能给一句话', driftText(z1))
+      assert(biasText(4.55) === '+4.6' && biasText(-2) === '-2' && biasText(0) === '0', '偏移带符号，方向一眼看得出',
+        [biasText(4.55), biasText(-2), biasText(0)].join(' '))
+
+      /*
+       * 零和：每个人的偏移都相对「同格其他人的均值」，所以同一桶里加权和必然是 0。
+       * 这条不是巧合，而是「两个人的走向互为镜像」的根据。
+       */
+      const weighted = d.buckets.map(b => b.teachers.reduce((acc, t) => acc + t.bias * t.n, 0))
+      assert(weighted.every(v => Math.abs(v) < 1e-9), '同一桶里所有老师的偏移加权和为 0（互为镜像）', JSON.stringify(weighted))
+
+      // 变化不到 1 分说「没动」：0.6 分的起伏是运气，说成「收紧」只会让人白开一次会
+      // 每个周桶里放两格：桶里只有一格时不算样本，这条线自己就不给结论
+      const flat = []
+      for (let i = 0; i < 8; i++) {
+        const at = new Date(Date.UTC(2026, 9, 5 + Math.floor(i / 2) * 7 + (i % 2))).toISOString()
+        flat.push(mk(200 + i, 1, '张老师', at, [{ id: 'q1', from: null, to: 10.4 }]))
+        flat.push(mk(200 + i, 2, '李老师', at, [{ id: 'q1', from: null, to: 10 }]))
+      }
+      d = reviewDrift(flat)
+      assert(d.teachers.find(t => t.name === '张老师').verdict === '没动', '不到 1 分的变化算「没动」',
+        JSON.stringify(d.teachers.map(t => [t.name, t.verdict, t.delta])))
+
+      // 样本太少的桶不参与首末两段：一桶两格就说「他收紧了」，那只是运气
+      const thin = [
+        mk(1, 1, '张老师', '2026-10-01T09:00:00Z', [{ id: 'q', from: null, to: 18 }]),
+        mk(1, 2, '李老师', '2026-10-01T09:10:00Z', [{ id: 'q', from: 18, to: 10 }]),
+        ...Array.from({ length: 4 }, (_, i) => {
+          const at = new Date(Date.UTC(2026, 9, 12 + i)).toISOString()
+          return [mk(10 + i, 1, '张老师', at, [{ id: 'q', from: null, to: 10.5 }]),
+                  mk(10 + i, 2, '李老师', at, [{ id: 'q', from: 10.5, to: 10 }])]
+        }).flat()
+      ]
+      d = reviewDrift(thin)
+      const zt = d.teachers.find(t => t.name === '张老师')
+      assert(zt.first && zt.first.n >= 2 && zt.first.label !== '10-1', '首段要选样本够的桶，不拿一格数据当结论', JSON.stringify(zt.first))
+
+      // 分桶粒度：跨太多天就按周、按月，否则折线全是毛刺
+      const many = []
+      for (let i = 0; i < 40; i++) {
+        const at = new Date(Date.UTC(2026, 6, 1 + i * 3)).toISOString()
+        many.push(mk(300 + i, 1, '张老师', at, [{ id: 'q', from: null, to: 12 }]))
+        many.push(mk(300 + i, 2, '李老师', at, [{ id: 'q', from: 12, to: 10 }]))
+      }
+      assert(reviewDrift(many).unit === 'month', '跨度四个月就按月切', reviewDrift(many).unit)
+    }
+
+    // ---- 接口：同一份留痕回放，尺度对账与时间走向说的是同一件事
+    let r = await req('POST', '/api/forms', {
+      title: '尺子走向卷', kind: 'exam',
+      schema: [
+        { id: 'd1', type: 'textarea', label: '主观题一', answer: [], score: 20 },
+        { id: 'd2', type: 'textarea', label: '主观题二', answer: [], score: 10 }
+      ],
+      settings: { passPercent: 60 }
+    })
+    const did = r.json.id
+    await req('PUT', `/api/forms/${did}`, { status: 'published' })
+    const ds = []
+    for (let i = 0; i < 4; i++) {
+      r = await req('POST', `/api/public/forms/${did}/submit`, { data: { d1: `答 ${i}`, d2: `补 ${i}` } })
+      ds.push(r.json.id)
+    }
+    r = await req('GET', `/api/forms/${did}/review-calibration`)
+    assert(r.status === 200 && r.json.data.drift, '尺度接口带上时间走向', JSON.stringify(Object.keys(r.json.data || {})))
+    assert(r.json.data.drift.samples === 0, '还没人对比过 → 走向里没有数据点', JSON.stringify(r.json.data.drift.samples))
+
+    const dAdmin = cookie
+    await req('POST', '/api/auth/register', { username: 'drift_b', password: 'db-pass-123', nickname: '王老师' })
+    const addD = await call(dAdmin, 'POST', `/api/forms/${did}/members`, { username: 'drift_b', role: 'editor' })
+    assert(addD.status === 201, '把第二位老师拉进这张卷子', JSON.stringify(addD.json))
+    const wang = await asUser('drift_b', 'db-pass-123')
+
+    // 同一份卷子的同一道题，两个人先后给分：这时候才有可比的一格
+    cookie = dAdmin
+    await req('PUT', `/api/submissions/${ds[0]}/review`, { scores: { d1: 16 } })
+    await call(wang, 'PUT', `/api/submissions/${ds[0]}/review`, { scores: { d1: 10 } })
+    await req('PUT', `/api/submissions/${ds[1]}/review`, { scores: { d1: 8 } })
+    await call(wang, 'PUT', `/api/submissions/${ds[1]}/review`, { scores: { d1: 8 } })
+    cookie = dAdmin
+    r = await req('GET', `/api/forms/${did}/review-calibration`)
+    const dr = r.json.data.drift
+    assert(dr.samples === 2, '只有两人都给过分的那一格产生数据点（同分不留痕的那格没有）', JSON.stringify(dr.samples))
+    assert(dr.teachers.length === 2, '两位老师各有一条线', JSON.stringify(dr.teachers.map(t => t.name)))
+    const sumBias = dr.teachers.reduce((acc, t) => acc + t.bias * t.samples, 0)
+    assert(Math.abs(sumBias) < 1e-9, '偏移加权和是 0（互为镜像，不是两条独立证据）', String(sumBias))
+    assert(dr.teachers.every(t => typeof t.text === 'string'), '每条线带一句人话结论', JSON.stringify(dr.teachers.map(t => t.text)))
+
+    // 与「谁偏松」的口径必须对得上：时间走向里的整体偏移，方向要跟两两对账一致
+    const cal2 = r.json.data
+    if (cal2.pairs.length) {
+      const biasSign = Math.sign(cal2.pairs[0].bias)
+      const loose = cal2.pairs[0].bias > 0 ? cal2.pairs[0].a : cal2.pairs[0].b
+      const inDrift = cal2.drift.teachers.find(t => t.name === loose)
+      assert(inDrift && Math.sign(inDrift.bias) === biasSign,
+        '时间走向里的整体偏移与「谁偏松」说的是同一个人、同一个方向', JSON.stringify({ loose, bias: inDrift?.bias }))
+    } else {
+      assert(true, '（当前留痕不足以做两两对账，跳过口径一致性校验）')
+    }
+
+    // 走向只给能批阅的人看：无关账号读不到（它会暴露「谁对哪份卷子放宽了」）
+    const holderD = cookie
+    await req('POST', '/api/auth/register', { username: 'drift_out', password: 'do-pass-123' })
+    const outD = await asUser('drift_out', 'do-pass-123')
+    r = await call(outD, 'GET', `/api/forms/${did}/review-calibration`)
+    assert(r.status === 403, '无关账号看不到尺子走向', `${r.status} ${r.json?.message || ''}`)
+    cookie = holderD
+  }
+
   console.log('\n[44] 阅卷键盘：能提交什么、Enter 往哪走')
 
   {

@@ -180,11 +180,219 @@ function replayCells(entries = []) {
        * 同一位老师改第二遍时 Map 里那一项还在原位，顺序是第一次出现的顺序——
        * 拿它当时间序，会把「先批的人的分」当成现在的分。
        */
-      if (i >= cell.seq) { cell.seq = i; cell.current = { name: teachers.get(key).name, value } }
+      if (i >= cell.seq) { cell.seq = i; cell.current = { name: teachers.get(key).name, value }; cell.lastAt = e.createdAt || '' }
     }
     if ((e.changes || []).length) teachers.get(key).gradings++
   })
   return { cells, teachers }
+}
+
+/**
+ * 两两对账：这一格里，谁比谁松、松多少。
+ *
+ * 抽出来是因为它现在有两个出口：一次性的「谁偏松」（calibrate）和
+ * 「谁的尺子随时间往哪走」（reviewDrift）。抄两遍必然分叉——
+ * 一处把撤分算进去、一处不算，两段结论就会互相打脸。
+ */
+function addPairs(pairs, teachers, given) {
+  for (let i = 0; i < given.length; i++) {
+    for (let j = i + 1; j < given.length; j++) {
+      const [ka, a] = given[i]
+      const [kb, b] = given[j]
+      const [k1, k2] = ka < kb ? [ka, kb] : [kb, ka]
+      const [v1, v2] = ka < kb ? [Number(a.value), Number(b.value)] : [Number(b.value), Number(a.value)]
+      const pk = `${k1}::${k2}`
+      const p = pairs.get(pk) || { a: teachers.get(k1).name, b: teachers.get(k2).name, count: 0, sum: 0, maxGap: 0 }
+      p.count++
+      p.sum += v1 - v2        // 正数 = 前者给得更高
+      p.maxGap = Math.max(p.maxGap, Math.abs(v1 - v2))
+      pairs.set(pk, p)
+    }
+  }
+}
+
+/**
+ * 时间分桶的粒度：先按天，太散了按周，再散按月。
+ *
+ * 不直接给「按天」是因为一场考试可能跨两个月：九十多个日桶画出来是一条毛刺，
+ * 而读者要的是「前松后紧」这种走向，不是每一天的抖动。
+ */
+function bucketPlan(times) {
+  const stamps = times.map(t => new Date(t).getTime()).filter(t => Number.isFinite(t))
+  if (!stamps.length) return 'day'
+  // 用的是跨度而不是「有几个不同的日子」：一场 40 天的考试如果只有 8 天有人批卷，
+  // 按天数算是日桶（8 个），而折线上那 8 个点之间隔着 32 天没人批——那是空白，不是连续
+  const days = Math.max(1, Math.round((Math.max(...stamps) - Math.min(...stamps)) / 86400_000))
+  if (days <= 8) return 'day'
+  if (Math.ceil(days / 7) <= 8) return 'week'
+  return 'month'
+}
+
+const pad = n => String(n).padStart(2, '0')
+const dayKey = d => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+
+/** 某个时刻落在哪个桶里；周桶从周一切，中文环境里周一才是「这周开始」 */
+function bucketKey(unit, at) {
+  const d = new Date(at)
+  if (Number.isNaN(d.getTime())) return ''
+  if (unit === 'month') return `${d.getFullYear()}-${pad(d.getMonth() + 1)}`
+  if (unit === 'week') {
+    const monday = new Date(d.getFullYear(), d.getMonth(), d.getDate())
+    // getDay() 里周日是 0：往前退到周一
+    monday.setDate(monday.getDate() - ((monday.getDay() + 6) % 7))
+    return dayKey(monday)
+  }
+  return dayKey(d)
+}
+
+/** 桶的显示名：日/周桶写「11-12」，月桶写「2026-11」 */
+function bucketLabel(unit, key) {
+  if (!key) return '未知时间'
+  if (unit === 'month') return key
+  const [, m, d] = key.split('-')
+  return `${Number(m)}-${Number(d)}`
+}
+
+const round1 = v => Math.round(Number(v) * 10) / 10
+
+/** 偏移量的写法：正数是「比别人给得高」，带符号才看得出方向 */
+export function biasText(v) {
+  const n = round1(v)
+  if (!Number.isFinite(n)) return '—'
+  return `${n > 0 ? '+' : ''}${n}`
+}
+
+/**
+ * 尺子的时间维度：同一批格子上，某位老师的给分随时间往哪走。
+ *
+ * 区间做的是「他批的这批卷子，换个人批会在什么范围」。但一位老师批前 20 份时偏松、
+ * 被教研组长谈过之后后 40 份收紧——这件事在区间里看不出来：它是历史上所有批阅摞在一起的总和，
+ * 开头那 20 份和后来那 40 份被平均成一个数，于是「谈过之后确实收了」永远无法被证实或证伪。
+ *
+ * **绝对分不进这条线。** 「张老师前 20 份平均 15 分、后 40 份平均 12 分」什么也说明不了——
+ * 后面那 40 位考生可能就是答得更差。所以每个点都是「同一格上，这位老师与同格其他人的
+ * 平均分之差」：只有被两位以上老师批过的格子才产生数据点，考生水平在减法里被抵消掉。
+ * 代价是样本量受限于「被两位老师批过的格子」，这一点在界面上写明，不假装样本充足。
+ *
+ * 其余几条口径：
+ *  - **撤分不参与**（与 crossInfo 同一条判据）：撤分是「这个人对这格没有分数」，不是 0 分。
+ *  - **每位老师用自己的时间**：一格里他最后一次写入的时刻，而不是整条留痕的时间。
+ *  - **样本太少的桶不下结论**：一个桶里只有 1 格就说「他收紧了」，那只是运气。
+ *    门槛定在 2 格——再往上（比如 3）会把「一场 20 份的小考试」整个判成样本不足，
+ *    而那正是最需要被提醒的场合。
+ *  - **只有一天数据就不谈走向**：一天之内的「前松后紧」可能只是批卷顺序的差别。
+ *
+ * 还有一条只能承认的：同一格里所有人的偏移加起来是 0（每个人的偏移都相对同格其他人的均值），
+ * 所以**两个人的走向互为镜像**——张老师收紧 4.5 分，同格那位就是放松 4.5 分。
+ * 这不是两个发现，是一件事的两个方向。这样说比假装有两条独立证据要老实。
+ */
+export function reviewDrift(entries = [], { minSamples = 2 } = {}) {
+  const { cells } = replayCells(entries)
+  const marks = []
+  for (const cell of cells.values()) {
+    // 与 crossInfo 同一条判据：撤分（null）不是 0 分，不参与偏移
+    const given = [...cell.by.entries()].filter(([, v]) => v.value !== null && v.value !== undefined)
+    if (given.length < 2) continue
+    for (const [key, v] of given) {
+      const others = given.filter(([k2]) => k2 !== key).map(([, x]) => Number(x.value))
+      if (!others.length) continue
+      const base = others.reduce((a, b) => a + b, 0) / others.length
+      marks.push({
+        at: v.at || cell.lastAt || '',
+        key,
+        name: v.name || '未知账号',
+        questionId: cell.id,
+        // 正数 = 这一格他比同格其他人给得高
+        diff: Number(v.value) - base
+      })
+    }
+  }
+  const plan = bucketPlan(marks.map(m => m.at))
+  const groups = new Map()
+  for (const m of marks) {
+    const k = bucketKey(plan, m.at)
+    if (!k) continue
+    if (!groups.has(k)) groups.set(k, [])
+    groups.get(k).push(m)
+  }
+  const keys = [...groups.keys()].sort()
+  const buckets = keys.map((key, i) => {
+    const list = groups.get(key)
+    const byTeacher = new Map()
+    for (const m of list) {
+      const t = byTeacher.get(m.key) || { key: m.key, name: m.name, sum: 0, n: 0 }
+      t.sum += m.diff
+      t.n++
+      byTeacher.set(m.key, t)
+    }
+    return {
+      key,
+      label: bucketLabel(plan, key),
+      index: i,
+      // 一桶里有几格被比对过：样本量摆在旁边，读者才知道这条线有几分重量
+      samples: list.length,
+      teachers: [...byTeacher.values()]
+        .map(t => ({ key: t.key, name: t.name, bias: round1(t.sum / t.n), n: t.n }))
+        .sort((a, b) => b.n - a.n)
+    }
+  })
+
+  // 每位老师：整体偏移、首末两段（只取样本够的桶）、走向
+  const teachers = new Map()
+  for (const m of marks) {
+    const t = teachers.get(m.key) || { key: m.key, name: m.name, sum: 0, n: 0 }
+    t.sum += m.diff
+    t.n++
+    teachers.set(m.key, t)
+  }
+  const out = [...teachers.values()].map(t => {
+    const mine = buckets.map(b => ({ label: b.label, entry: b.teachers.find(x => x.key === t.key) }))
+      .filter(x => x.entry && x.entry.n >= minSamples)
+    const first = mine[0] || null
+    const last = mine.length > 1 ? mine[mine.length - 1] : null
+    const delta = first && last ? round1(last.entry.bias - first.entry.bias) : 0
+    return {
+      key: t.key,
+      name: t.name || '未知账号',
+      bias: round1(t.sum / t.n),
+      samples: t.n,
+      first: first ? { label: first.label, bias: first.entry.bias, n: first.entry.n } : null,
+      last: last ? { label: last.label, bias: last.entry.bias, n: last.entry.n } : null,
+      delta,
+      verdict: driftVerdict(delta, first, last)
+    }
+  }).sort((a, b) => b.samples - a.samples)
+
+  return {
+    unit: plan,
+    buckets,
+    teachers: out,
+    samples: marks.length,
+    note: marks.length
+      ? ''
+      // 这句话要说的是「怎么才会有」，而不是把上面那句「还没有分歧」再抄一遍
+      : '等同一道题被两位老师都改过分，这里会出现每个人随时间的走向——只看某个人的绝对分涨跌说明不了尺子松紧，那可能只是考生答得不同'
+  }
+}
+
+/**
+ * 走向的结论。两条门槛：
+ *  - 至少要两个样本够的桶，否则「谈过之后收紧了」只是一句话，不是事实；
+ *  - 变化不到 1 分就说「没动」：0.6 分的起伏在阅卷里就是运气，把它说成「收紧」会让人白开会。
+ */
+function driftVerdict(delta, first, last) {
+  if (!first) return '样本不足'
+  if (!last) return '只有一个时间段可比'
+  if (Math.abs(delta) < 1) return '没动'
+  return delta < 0 ? '收紧' : '放松'
+}
+
+/** 走向的一句话：从 +4.6 走到 +0.9（收紧 3.7 分） */
+export function driftText(t) {
+  if (!t?.first || !t?.last) return ''
+  const arrow = `${biasText(t.first.bias)} → ${biasText(t.last.bias)}`
+  if (t.verdict === '没动') return `${arrow}（基本没动）`
+  return `${arrow}（${t.verdict} ${Math.abs(round1(t.delta))} 分）`
 }
 
 /**
@@ -231,21 +439,7 @@ export function calibrate(entries, { maxOf = () => 0 } = {}) {
     q.max = q.max || max
     q.cells.push({ submissionId: cell.submissionId, gap, ratio: max > 0 ? gap / max : 0, by: given.map(([, v]) => ({ name: v.name, value: Number(v.value) })) })
     questions.set(cell.id, q)
-    // 两两对账：谁比谁松、松多少。两人只对过一道题也算数，只是次数少而己
-    for (let i = 0; i < given.length; i++) {
-      for (let j = i + 1; j < given.length; j++) {
-        const [ka, a] = given[i]
-        const [kb, b] = given[j]
-        const [k1, k2] = ka < kb ? [ka, kb] : [kb, ka]
-        const [v1, v2] = ka < kb ? [Number(a.value), Number(b.value)] : [Number(b.value), Number(a.value)]
-        const pk = `${k1}::${k2}`
-        const p = pairs.get(pk) || { a: teachers.get(k1).name, b: teachers.get(k2).name, count: 0, sum: 0, maxGap: 0 }
-        p.count++
-        p.sum += v1 - v2        // 正数 = 前者给得更高
-        p.maxGap = Math.max(p.maxGap, Math.abs(v1 - v2))
-        pairs.set(pk, p)
-      }
-    }
+    addPairs(pairs, teachers, given)
   }
 
   const list = [...questions.values()]

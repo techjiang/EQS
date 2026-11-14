@@ -461,5 +461,36 @@ table.table{width:100%;border-collapse:collapse;font-size:13.5px}
   padding:9px 12px;margin-bottom:12px;border-radius:10px;
   background:var(--panel-2);border:1px solid var(--line-2);font-size:12.5px;
 }
+/* 尺子的时间走向：一条迷你折线。断线是有意的——那些时间段里没有「同格对比」的数据点，
+   连起来看像是「那段时间他很稳定」，其实是那段时间没有证据 */
+.drift-row{padding:10px 12px;border:1px solid var(--line-2);border-radius:10px;margin-bottom:8px;background:var(--panel)}
+
+/* 偏移柱：零线在偏上还是偏中取决于数据，所以位置由内联百分比给，这里只管形状。
+   负值那半用虚线边框区分——「他给别人偏低」和「他偏高」是两件事，颜色得看得出方向 */
+.drift-chart{
+  position:relative;display:flex;align-items:stretch;gap:6px;
+  /* 底下留一条给「柱子为负值」的读数：那行字写在柱下方，贴着边框会被裁掉半个字 */
+  height:76px;margin-top:10px;padding:0 2px 18px;
+}
+.drift-zero{position:absolute;left:0;right:0;height:0;border-top:1px dashed var(--line);opacity:.9}
+.drift-col{position:relative;flex:1;min-width:0}
+/* 柱子居中且限宽：撑满整列会长成一条横带，看不出「一根柱子有多高」——
+   季度趋势图里每个桶是一根柱，不是一个色块 */
+.drift-bar{
+  position:absolute;left:50%;transform:translateX(-50%);width:min(46px,74%);
+  border-radius:3px;background:var(--brand);opacity:.9;
+}
+.drift-bar.neg{background:var(--warn);opacity:.75}
+.drift-val{
+  position:absolute;left:0;right:0;text-align:center;font-size:10.5px;color:var(--text-3);
+  font-variant-numeric:tabular-nums;pointer-events:none;
+}
+.drift-gap{
+  position:absolute;left:20%;right:20%;top:calc(50% - 1px);height:2px;border-radius:2px;
+  background:repeating-linear-gradient(90deg,var(--line) 0 3px,transparent 3px 6px);
+}
+/* X 轴与柱子对齐：同一套 flex 比例，标签才不会和图错位 */
+.drift-axis{display:flex;gap:6px;padding:0 2px;font-size:11px;color:var(--text-3)}
+.drift-axis span{flex:1;min-width:0;text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .review-logs summary{cursor:pointer;font-weight:600;color:var(--text)}
 .review-log-item{padding:7px 0;border-top:1px dashed var(--line);margin-top:6px}

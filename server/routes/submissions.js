@@ -39,7 +39,7 @@ import { submissionsXlsx, submissionsHead, submissionRow } from '../lib/sheet.js
 import { writeXlsxStream } from '../lib/xlsx.js'
 import { signFileUrl, signFileUrls, signHtmlFiles, QUERY_FILE_TTL } from '../lib/fileAccess.js'
 // 份数/分数的留痕口径只有一份：前端也是这套（web/js/review.js），两边说的必须是同一件事
-import { scoreChanges, changeText, calibrate, gapLevel } from '../../web/js/review.js'
+import { scoreChanges, changeText, calibrate, gapLevel, reviewDrift, driftText } from '../../web/js/review.js'
 
 function fingerprint(req, extra = {}) {
   return {
@@ -899,6 +899,13 @@ export default function register(r) {
     const result = calibrate(entries, { maxOf })
     // 每道题再标一句人话，别让前端各算一遍口径
     for (const q of result.questions) q.level = gapLevel(q.worst?.gap, q.max)
+    /*
+     * 尺子的时间维度：同一个人批前 20 份偏松、被谈过之后后 40 份收紧，这件事在
+     * 「谁偏松 N 分」里看不出来——那是所有历史摞在一起的平均值，两极被互相抵消。
+     * 与尺度对账共用同一份留痕回放，只是换个切法：按时间分桶，每个点仍是「同格对比」的偏移。
+     */
+    const drift = reviewDrift(entries)
+    for (const t of drift.teachers) t.text = driftText(t)
     sendJson(res, 200, {
       ok: true,
       data: {
@@ -909,6 +916,7 @@ export default function register(r) {
          * 而且这句话不能吹：「同分不留痕」（分数没动就不落记录），所以
          * 「两人给分一致」在库里其实是看不见的——能说的只有「没找到改过分的地方」。
          */
+        drift,
         note: result.conflicts ? '' : '还没有同一道题被两位老师给出不同的分（同分不留痕，所以一致的那些看不见）'
       }
     })
