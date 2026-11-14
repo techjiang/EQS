@@ -399,7 +399,10 @@ export default {
                     h('span', { class: 'mono' }, '#' + r.id),
                     r.public_id ? h('div', { class: 'mono', style: 'font-size:11px;color:var(--text-3)' }, r.public_id) : null
                   ]),
-                  r.marked ? h('span', { class: 'tag warn', style: 'margin-left:6px' }, '标记') : null
+                  r.marked ? h('span', { class: 'tag warn', style: 'margin-left:6px' }, '标记') : null,
+                  // 切屏标记：阅卷人扫一眼列表就该知道哪几份值得先看，
+                  // 而不是逐份点开详情去找这个数字
+                  r.flagged ? h('span', { class: 'tag danger', style: 'margin-left:6px', title: `切屏 ${r.switch_count} 次` }, '切屏异常') : null
                 ]),
                 h('td', { class: 'nowrap stick-time' }, fmtDate(r.created_at)),
                 allMode.value ? h('td', {}, r.form_title || '-') : null,
@@ -427,13 +430,24 @@ export default {
       detail.value ? Modal({
         title: `答卷 #${detail.value.id}`, modelValue: true,
         onClose: () => detail.value = null, wide: true,
-        children: h('div', {}, (form.value?.schema || []).filter(f => detail.value.data[f.id] !== undefined).map(f => h('div', { class: 'mb' }, [
+        children: h('div', {}, [
+          // 作答环境先摆出来：切屏次数、耗时、IP 是「这份卷子可不可信」的第一手线索
+          h('div', { class: 'flex wrap small muted mb', style: 'gap:14px' }, [
+            h('span', {}, `提交时间 ${fmtDate(detail.value.created_at)}`),
+            detail.value.duration ? h('span', {}, `耗时 ${Math.round(detail.value.duration / 60)} 分钟`) : null,
+            detail.value.switch_count !== null && detail.value.switch_count !== undefined
+              ? h('span', { style: detail.value.flagged ? 'color:var(--danger)' : '' }, `切屏 ${detail.value.switch_count} 次${detail.value.flagged ? '（异常）' : ''}`)
+              : h('span', {}, '切屏 未记录'),
+            detail.value.ip ? h('span', {}, `IP ${detail.value.ip}`) : null
+          ]),
+          ...(form.value?.schema || []).filter(f => detail.value.data[f.id] !== undefined).map(f => h('div', { class: 'mb' }, [
           h('div', { class: 'small muted' }, f.label),
           h('div', { style: 'font-weight:520;word-break:break-word;white-space:pre-wrap' },
             // 排序题的顺序、矩阵题的行列、子表单的多行，都得按各自的样子摊开：
             // 一律 join 出来的是「丙、乙、甲」和「[object Object]」
             answerDisplay(f, detail.value.data[f.id]) || '-')
-        ])))
+          ]))
+        ])
       }) : null,
 
       review.value ? Modal({

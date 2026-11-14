@@ -267,6 +267,11 @@ export default {
 
     const set = (key, val) => { form.value.settings[key] = val }
     const sget = (key, dft) => form.value.settings[key] ?? dft
+    /* 防作弊是一组嵌套开关，塞在 settings.antiCheat 里：顶层全是布尔与字符串，
+       混进一个对象会让「设置项是不是开着」这类判断变得没法统一 */
+    const setAnti = (key, val) => {
+      form.value.settings.antiCheat = { ...(form.value.settings.antiCheat || {}), [key]: val }
+    }
 
     const previewData = computed(() => defaultData(form.value.schema))
     const previewModel = ref({})
@@ -541,7 +546,36 @@ export default {
           sw('showResult', '交卷后显示逐题对错与解析', true),
           sw('showRank', '交卷后显示我的名次', true),
           sw('showRanking', '公开成绩榜（填写页显示前 10 名）'),
-          h('div', { class: 'hint' }, '成绩榜是匿名入口：只公布名次、打码后的昵称和分数，不公开答卷内容。关掉「逐题对错」时名次也不下发。')
+          h('div', { class: 'hint' }, '成绩榜是匿名入口：只公布名次、打码后的昵称和分数，不公开答卷内容。关掉「逐题对错」时名次也不下发。'),
+          h('div', { style: 'border-top:1px solid var(--line);margin:14px 0' }),
+          h('h4', {}, '防作弊'),
+          h('div', { class: 'field' }, h('label', { class: 'flex between' }, [
+            h('span', {}, '题目乱序（每人一份不同顺序）'),
+            h('div', { class: ['switch', sget('antiCheat')?.shuffleQuestions ? 'on' : ''], onClick: () => setAnti('shuffleQuestions', !sget('antiCheat')?.shuffleQuestions) })
+          ])),
+          h('div', { class: 'field' }, h('label', { class: 'flex between' }, [
+            h('span', {}, '选项乱序'),
+            h('div', { class: ['switch', sget('antiCheat')?.shuffleOptions ? 'on' : ''], onClick: () => setAnti('shuffleOptions', !sget('antiCheat')?.shuffleOptions) })
+          ])),
+          h('div', { class: 'hint' }, [
+            '乱序是「同一份卷子永远同一个顺序」：种子里存在答卷上，逐题回顾按当年那套顺序排。',
+            '有「条件跳转」的卷子只乱选项、不乱题目——跳转语义是「命中即其后作废」，依赖题目先后，一乱就变成另一道题。'
+          ]),
+          h('div', { class: 'field' }, h('label', { class: 'flex between' }, [
+            h('span', {}, '记录切屏次数'),
+            h('div', { class: ['switch', sget('antiCheat')?.detectSwitch ? 'on' : ''], onClick: () => setAnti('detectSwitch', !sget('antiCheat')?.detectSwitch) })
+          ])),
+          sget('antiCheat')?.detectSwitch ? h('div', {}, [
+            row('切屏超过几次标为异常', h('input', {
+              class: 'input', type: 'number', min: 0, max: 999, value: sget('antiCheat')?.maxSwitch ?? 3,
+              onInput: e => setAnti('maxSwitch', Number(e.target.value))
+            }), '0 = 只记录，不标记'),
+            h('div', { class: 'field' }, h('label', { class: 'flex between' }, [
+              h('span', {}, '超限自动交卷'),
+              h('div', { class: ['switch', sget('antiCheat')?.autoSubmit ? 'on' : ''], onClick: () => setAnti('autoSubmit', !sget('antiCheat')?.autoSubmit) })
+            ])),
+            h('div', { class: 'hint' }, '切屏次数由浏览器上报，只能当线索用：它读得准，但改得动。所以这里不会据此判零分，只把卷子标出来给阅卷人看。')
+          ]) : null
         ]) : null,
         h('div', { style: 'border-top:1px solid var(--line);margin:14px 0' }),
         h('h4', {}, '外观'),
@@ -581,7 +615,8 @@ export default {
           row('结束时间', h('input', {
             class: 'input', type: 'datetime-local', value: sget('timeWindow')?.end || '',
             onInput: e => set('timeWindow', { ...(sget('timeWindow') || {}), end: e.target.value })
-          }))
+          })),
+          h('div', { class: 'hint' }, '填了开始时间就是定时发布：到点自动开放，早于这个时间打开链接看到的是「尚未开始」和开放时间，不是「表单未发布」。')
         ]),
         h('div', { style: 'border-top:1px solid var(--line);margin:14px 0' }),
         h('h4', {}, '填写限制'),

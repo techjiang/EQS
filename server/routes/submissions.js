@@ -2,10 +2,12 @@ import crypto from 'node:crypto'
 import { get, all, run, each, now, log } from '../lib/db.js'
 import { readJson, fail, sendJson, clientIp } from '../lib/http.js'
 import { requireUser, requirePerm, currentUser, can } from '../lib/auth.js'
-import { pickForm, validateSubmission, isSubjective, pendingLeft, gradeSubmission, computeStats, createStatsAccumulator, submissionData, paginate, fieldVisible, passLineOf, manualScoresOf, passHintOf, captchaChallenge, safeJson, isAnswerCorrect, answerText, DISPLAY_TYPES } from '../lib/forms.js'
+import { pickForm, formWindow, validateSubmission, isSubjective, pendingLeft, gradeSubmission, computeStats, createStatsAccumulator, submissionData, paginate, fieldVisible, passLineOf, manualScoresOf, passHintOf, captchaChallenge, safeJson, isAnswerCorrect, answerText, DISPLAY_TYPES } from '../lib/forms.js'
 // 逻辑规则只有一份，浏览器与服务端都跑它：页面上看到几道题、哪几道必填，
 // 与服务端判分时的口径必须完全一致
 import { buildFlow, resolveAnswers, renderText } from '../../web/js/flow.js'
+// 乱序也只有一份实现：页面按 seed 打乱，测试按同一个 seed 复现，不靠 Math.random
+import { shuffleSchema } from '../../web/js/shuffle.js'
 
 /** 对外答卷编号：不可猜、无业务含义，只给提交者本人用 */
 export function newPublicId() {
@@ -85,12 +87,11 @@ export function checkLimit(form, req, extra = {}) {
     const used = get(`SELECT COUNT(*) c FROM submissions WHERE ${where.join(' AND ')}`, ...args).c
     if (used >= max) fail(429, `该${limit.perIp && !fp.openid ? 'IP' : '账号'}已提交 ${used} 次，达到上限`)
   }
-  const time = s.timeWindow
-  if (time?.start || time?.end) {
-    const ts = Date.now()
-    if (time.start && ts < new Date(time.start).getTime()) fail(403, '问卷尚未开始')
-    if (time.end && ts > new Date(time.end).getTime()) fail(403, '问卷已结束')
-  }
+  // 开放时间窗和「打开发表单」共用同一个判断（formWindow），
+  // 否则会出现「页面能打开、填完提交才说没开始」这种白填一场的体验
+  const win = formWindow(s)
+  if (win.notStarted) fail(403, `问卷将于 ${s.timeWindow.start.replace('T', ' ')} 开放`)
+  if (win.ended) fail(403, '问卷已于 ' + String(s.timeWindow.end).replace('T', ' ') + ' 结束')
   if (s.needPassword) {
     const given = extra.password || ''
     if (String(given) !== String(s.password || '')) fail(403, '访问密码错误')
@@ -158,9 +159,29 @@ export default function register(r) {
     const form = pickForm(params.id)
     if (!form) fail(404, '表单不存在或已删除')
     if (form.status !== 'published') fail(403, '表单未发布')
+    /*
+     * 定时发布：状态是「已发布」但还没到点（或已过点）时，这里不再直接 403。
+     * 403 的文案是「表单未发布」，而真实情况是「明天九点才开」——
+     * 拿到链接的人只会以为链接坏了。现在把时间窗一起下发，页面自己说清楚什么时候能填。
+     */
+    const win = formWindow(form.settings)
     // 验证码的题面（a + b）必须在这里下发：之前只清空 answer，前端算不出题面，
     // 唯一能对照的答案又被清空了，只能去后台表单详情里翻——验证码整体不可用
-    const schema = form.schema.map(f => {
+    /*
+     * 题目 / 选项乱序。
+     * seed 由服务端生成并跟着答卷一起入库：乱序只有在能重现时才是可解释的——
+     * 老师问「第 3 题为什么错了」，而每个人卷子上的第 3 题都不一样，
+     * 没有种子就永远对不上。同一份答卷在「逐题回顾」里用同一个 seed 重排，看到的还是当年那套顺序。
+     */
+    const anti = form.settings?.antiCheat || {}
+    // 只有真的开了乱序才给种子：没开的卷子下发一个种子，会让人以为「这卷乱过」
+    const shuffling = !!(anti.shuffleQuestions || anti.shuffleOptions)
+    const seed = shuffling ? crypto.randomBytes(6).toString('hex') : ''
+    const shuffledRes = shuffleSchema(form.schema, seed, {
+      questions: !!anti.shuffleQuestions,
+      options: !!anti.shuffleOptions
+    })
+    const schema = shuffledRes.schema.map(f => {
       // 白名单而不是「删掉 answer」：标准答案能藏在任何自定义属性里，
       // 例如 props.answers，删掉顶层 answer 之后它照样下发到浏览器。
       const out = {
@@ -177,7 +198,16 @@ export default function register(r) {
       ok: true,
       data: {
         id: form.id, title: form.title, description: form.description, kind: form.kind,
-        schema, settings: publicSettings(form.settings)
+        schema, settings: publicSettings(form.settings),
+        // 开放时间窗：页面据此把入口换成「尚未开始 / 已结束」，而不是让人白填一场
+        window: win,
+        seed,
+        // 防作弊里「需要浏览器配合」的部分：切屏计数、是否超限即交卷
+        antiCheat: {
+          detectSwitch: !!anti.detectSwitch,
+          maxSwitch: Number(anti.maxSwitch) || 0,
+          autoSubmit: !!anti.autoSubmit
+        }
       }
     })
   })
@@ -208,10 +238,27 @@ export default function register(r) {
       passed = g.passed ? 1 : 0
     }
     const publicId = newPublicId()
-    const result = run(`INSERT INTO submissions(form_id, data, score, passed, duration, user_id, ip, device, openid, wx_nickname, wx_avatar, public_id, created_at, updated_at)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    /*
+     * 切屏次数。
+     * 这个数字由浏览器上报，因此**它只是证据，不是判决**：改一个前端变量就能报 0。
+     * 所以它只有两个用途：给阅卷人一个「值得看一眼」的排序依据，以及超过阈值时把卷子标出来。
+     * 不据此判零分——误判一个真被弹窗打断的考生，比放过一个切屏十次的人代价大得多。
+     */
+    const anti = form.settings?.antiCheat || {}
+    const switchCount = Math.max(0, Math.min(9999, Number(body.switchCount) || 0))
+    const maxSwitch = Number(anti.maxSwitch) || 0
+    const flagged = maxSwitch > 0 && switchCount >= maxSwitch ? 1 : 0
+    /*
+     * 乱序种子跟着答卷存：逐题回顾要按当年那套顺序排（选项顺序影响「你选的是 B」怎么解释）。
+     * 只在开了乱序时才存；没开乱序的卷子存一个种子毫无意义，还会让人误以为「这卷乱过」。
+     */
+    const shuffling = !!(anti.shuffleQuestions || anti.shuffleOptions)
+    const seed = shuffling ? String(body.seed || '').replace(/[^0-9a-zA-Z_-]/g, '').slice(0, 32) : ''
+    const result = run(`INSERT INTO submissions(form_id, data, score, passed, duration, user_id, ip, device, openid, wx_nickname, wx_avatar, public_id, seed, switch_count, flagged, created_at, updated_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       form.id, JSON.stringify(data), score, passed, Number(body.duration) || 0, user?.id || 0,
-      fp.ip, fp.device, body.openid || '', body.wxNickname || '', body.wxAvatar || '', publicId, ts, ts)
+      fp.ip, fp.device, body.openid || '', body.wxNickname || '', body.wxAvatar || '', publicId,
+      seed, switchCount, flagged, ts, ts)
     const id = Number(result.lastInsertRowid)
     // 附件是先上传后交卷的，交卷时把本次作答里引用到的文件认领到这份答卷上，
     // 否则「打包下载附件」会把它们漏掉。
@@ -221,7 +268,7 @@ export default function register(r) {
     const submission = get('SELECT * FROM submissions WHERE id = ?', id)
 
     const review = form.kind === 'exam' && form.settings?.showResult !== false
-      ? buildReview(form.schema, data, form.settings, {})
+      ? buildReview(form.schema, data, form.settings, {}, seed)
       : null
     // 条件跳转结束后，提交页要说清楚「为什么只有这几题」：
     // 只回一句「提交成功」，用户会以为剩下的题没显示是坏了
@@ -249,7 +296,11 @@ export default function register(r) {
       // 但名次本身透露分数（第 1 名配满分就是满分），所以「不公布成绩」时也不能给名次。
       rank: form.kind === 'exam' && form.settings?.showResult !== false && form.settings?.showRank !== false
         ? rankOf(form.id, id)
-        : null
+        : null,
+      // 交卷时把切屏次数回给本人：想让人当场知道自己被记下来了，比事后悄悄标记公平
+      switchCount,
+      flagged: !!flagged,
+      maxSwitch
     })
 
     // 异步通知，失败不影响提交
@@ -262,12 +313,22 @@ export default function register(r) {
   })
 
   /** 交卷后逐题回顾：只返回对错、正确答案与解析，不回传用户原始作答之外的信息 */
-  function buildReview(schema, data, settings = {}, manual = {}) {
+  function buildReview(schema, data, settings = {}, manual = {}, seed = '') {
     const items = []
     // 与校验、判分同一口径：被条件跳转跳过的题不进回顾——
     // 一份「答到第 2 题就结束」的卷子，回顾里不该出现后面 8 道没答的题然后判他全错
     const flow = buildFlow(schema, data)
-    for (const f of schema) {
+    /*
+     * 回顾按「当年那份卷子的顺序」排。
+     * 卷子开了乱序时，学生记得的是「第 5 题我选了 B」；如果回顾按题库原顺序列，
+     * 同一个第 5 题指的是另一道题，逐题对错就变成一次误导。选项同理：
+     * 「你选的是 B，正确答案是 C」只有在选项顺序一致时才成立。
+     */
+    const anti = settings?.antiCheat || {}
+    const ordered = seed
+      ? shuffleSchema(schema, seed, { questions: !!anti.shuffleQuestions, options: !!anti.shuffleOptions }).schema
+      : schema
+    for (const f of ordered) {
       if (DISPLAY_TYPES.has(f.type)) continue
       if (!flow.active.has(f.id)) continue
       const right = (f.answer || []).map(String)
@@ -327,7 +388,7 @@ export default function register(r) {
     const sameOpenid = row.openid && row.openid === url.searchParams.get('openid')
     if (!sameDevice && !sameUser && !sameOpenid) fail(403, '只能查询本设备提交过的答卷')
     const review = form?.kind === 'exam' && form.settings?.showResult !== false
-      ? buildReview(form.schema, JSON.parse(row.data), form.settings, manualScoresOf(row))
+      ? buildReview(form.schema, JSON.parse(row.data), form.settings, manualScoresOf(row), row.seed || '')
       : null
     sendJson(res, 200, {
       ok: true,
@@ -642,7 +703,7 @@ export default function register(r) {
      * 代价是拿不到 Content-Length（流式长度未知），所以不设它——让浏览器按 chunked 收。
      */
     const { schema, head } = submissionsHead(form)
-    const cursor = each(`SELECT id, public_id, data, score, passed, created_at, reviewed_at FROM submissions WHERE ${where.join(' AND ')} ORDER BY id DESC`, ...args)
+    const cursor = each(`SELECT id, public_id, data, score, passed, created_at, reviewed_at, switch_count, flagged FROM submissions WHERE ${where.join(' AND ')} ORDER BY id DESC`, ...args)
     const rows = {
       [Symbol.asyncIterator]() {
         let first = true

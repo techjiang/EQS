@@ -260,7 +260,18 @@ ensureColumns('questions', { props: "TEXT NOT NULL DEFAULT '{}'" })
 // 改密码之后旧会话必须失效：以前换了密码，别人手里那条 7 天有效的 Cookie 照用不误。
 ensureColumns('users', { pwd_changed_at: 'TEXT', position_id: 'INTEGER NOT NULL DEFAULT 0' })
 
+/*
+ * 考试防作弊三列。
+ *  seed        —— 本次作答用的乱序种子。乱序只有能重现才有意义：老师问「第 3 题」，
+ *                 而每个人卷子的第 3 题都不一样，没有种子就永远对不上。
+ *  switch_count—— 作答期间切走窗口的次数（前端 visibilitychange 计数，交卷时上报）。
+ *  flagged     —— 切屏次数超过阈值的卷子，给阅卷人一眼能看见的标记。
+ * 三列都可空/默认 0：老答卷没有这些信息，显示成「-」而不是 0 次。
+ */
 ensureColumns('submissions', {
+  seed: "TEXT DEFAULT ''",
+  switch_count: 'INTEGER',
+  flagged: 'INTEGER NOT NULL DEFAULT 0',
   manual_scores: "TEXT NOT NULL DEFAULT '{}'",
   reviewed_at: 'TEXT',
   reviewed_by: 'INTEGER NOT NULL DEFAULT 0',

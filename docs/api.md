@@ -63,7 +63,7 @@
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/api/public/forms/:id` | 读取已发布表单（不含答案） |
-| POST | `/api/public/forms/:id/submit` | 提交 `{data, password?, openid?, wxNickname?, wxAvatar?, duration?}` |
+| POST | `/api/public/forms/:id/submit` | 提交 `{data, password?, openid?, wxNickname?, wxAvatar?, duration?, seed?, switchCount?}` |
 | GET | `/api/public/forms/:id/query?submissionId=` | 按编号查询答卷（需开启 `allowQuery`，且只能查本设备 / 本账号 / 同 IP 提交的答卷），返回含 `score` / `passed` / `reviewed` / `review` |
 
 提交响应：
@@ -77,6 +77,46 @@
 `jump.stopped: true` 表示这份作答被**条件跳转**提前结束了，`jump.text` 是作者写的那句结束语
 （例如「本季度预算已用完，申请已记录」）。此时 `total` / `paperTotal` / `passLine` 只按
 **已答题**计算，逐题回顾里也不会出现被跳过的题。
+
+### 考试防作弊
+
+`settings.antiCheat`：
+
+| 字段 | 含义 |
+| --- | --- |
+| `shuffleQuestions` | 题目乱序。有任意一题带 `jump` 时自动降级为只乱选项——跳转语义是「命中即其后作废」，依赖题目先后 |
+| `shuffleOptions` | 选项乱序。`sort` / `matrix` / `cascader` / `carousel` 等题型不打乱，它们的顺序本身就是题目 |
+| `detectSwitch` | 记录切屏次数（浏览器 `visibilitychange`） |
+| `maxSwitch` | 达到或超过这个次数把答卷标记为异常；`0` = 只记录不标记 |
+| `autoSubmit` | 达到阈值时前端自动交卷 |
+
+`GET /api/public/forms/:id` 会在开启乱序时下发 `seed`，提交时原样带回、随答卷入库。
+种子是**可复现**的：同一 `seed` 用同一个函数重排，得到的就是当年发给这位考生的顺序，
+逐题回顾按它排（否则「你选的是 B」在回顾里指的是另一个选项）。
+
+`switchCount` 由浏览器上报，**只当线索不当判决**：改一个前端变量就能报 0。所以服务端只记录、
+超过阈值时置 `flagged=1` 给阅卷人看，不据此判零分——误判一个真被弹窗打断的考生，
+比放过一个切屏十次的人代价大。负数与超过 9999 的值会被夹到边界。
+
+提交响应额外带 `switchCount` / `flagged` / `maxSwitch`，当场告诉考生自己的卷子被记了几次。
+
+### 定时发布
+
+`settings.timeWindow = { start, end }`。`GET /api/public/forms/:id` 不再因为时间窗未开而 403，
+而是返回：
+
+```json
+{ "window": { "open": false, "notStarted": true, "opensAt": "2026-11-16T09:19", "closesAt": "" } }
+```
+
+页面据此把整页换成「问卷尚未开始 · 开放时间 …」。提交与匿名附件上传仍会被拒绝（403），
+但理由写清是「几点开放」或「已于几点截止」，而不是笼统的「未发布」。
+
+| 状态 | `window.open` | `notStarted` | `ended` |
+| --- | --- | --- | --- |
+| 无时间窗 | true | false | false |
+| 未到开始时间 | false | true | false |
+| 超过结束时间 | false | false | true |
 
 ### 条件逻辑
 
@@ -132,7 +172,7 @@
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/submissions?formId=&keyword=&page=&pageSize=&pending=1` | 列表；`pending=1` 只看考试类且未批阅的答卷 |
+| GET | `/api/submissions?formId=&keyword=&page=&pageSize=&pending=1` | 列表；`pending=1` 只看考试类且未批阅的答卷。每行带 `switch_count`（未记录时为 `null`，不是 0）与 `flagged` |
 | GET | `/api/submissions/:id` | 单份答卷详情（含 `manualScores`、批阅信息） |
 | PUT | `/api/submissions/:id` | 编辑答卷内容（保留已有主观题人工分） |
 | PUT | `/api/submissions/:id/review` | 主观题批阅，见下 |

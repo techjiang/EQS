@@ -23,6 +23,25 @@ export default {
     let startAt = Date.now()
     const fieldErrors = ref([])
     const remain = ref(0)
+    /*
+     * 切屏计数。
+     * 只有「页面真的被藏起来」才算一次：visibilitychange 是浏览器唯一可信的信号，
+     * window.blur 会在点浏览器地址栏、开输入法候选框时乱响，用它计数会冤枉一片人。
+     * 计数本身是证据不是判决——它由前端维护，改一个变量就能清零，所以服务端只记录、只标记。
+     */
+    const switchCount = ref(0)
+    const onVisibility = () => {
+      if (!form.value?.antiCheat?.detectSwitch) return
+      if (document.visibilityState === 'hidden' && !done.value) {
+        switchCount.value += 1
+        const max = Number(form.value.antiCheat.maxSwitch) || 0
+        if (max > 0 && switchCount.value >= max) {
+          err(`已切出 ${switchCount.value} 次，达到限制`)
+          if (form.value.antiCheat.autoSubmit) submit()
+        }
+      }
+    }
+    document.addEventListener('visibilitychange', onVisibility)
 
     const restartTimer = () => {
       if (timer) { clearInterval(timer); timer = null }
@@ -61,7 +80,10 @@ export default {
     }
     let timer = null
     onMounted(load)
-    onBeforeUnmount(() => { if (timer) clearInterval(timer) })
+    onBeforeUnmount(() => {
+      if (timer) clearInterval(timer)
+      document.removeEventListener('visibilitychange', onVisibility)
+    })
 
     const clock = computed(() => {
       const t = Math.max(0, remain.value)
@@ -81,6 +103,9 @@ export default {
           data: model.value,
           password: password.value,
           duration: Math.round((Date.now() - startAt) / 1000),
+          // seed 必须原样回传：服务端据此确认「判分与回顾用的是同一套选项顺序」
+          seed: form.value?.seed || '',
+          switchCount: switchCount.value,
           openid: wx.value?.openid || '',
           wxNickname: wx.value?.nickname || '',
           wxAvatar: wx.value?.avatar || ''
@@ -174,6 +199,26 @@ export default {
 
       if (needLogin) return gate
 
+      /*
+       * 定时发布：没到点 / 已过点时，整页换成说明，而不是让人填完才被告知。
+       * 文案要说清「什么时候能填」，只说「未开放」等于让人第二天再来试一遍。
+       */
+      const win = form.value.window || {}
+      if (win.open === false) {
+        const when = win.notStarted ? win.opensAt : win.closesAt
+        return h('div', { class: 'fill-page', style }, [
+          h('div', { class: 'fill-hero', style: [s.headerImage ? `background-image:linear-gradient(rgba(0,0,0,.35),rgba(0,0,0,.35)),url(${s.headerImage})` : '', 'background-size:cover;background-position:center'].join(';') },
+            h('div', {}, h('h1', {}, form.value.title))),
+          h('div', { class: 'fill-card' }, h('div', { class: 'center', style: 'padding:32px 12px' }, [
+            h('img', { src: '/assets/eqs-mark.svg', style: 'width:56px;opacity:.85' }),
+            h('h2', { style: 'margin:14px 0 6px;font-size:19px' }, win.notStarted ? '问卷尚未开始' : '问卷已结束'),
+            h('p', { class: 'small muted' }, win.notStarted
+              ? `开放时间：${String(when || '').replace('T', ' ')}`
+              : `已于 ${String(when || '').replace('T', ' ')} 截止，感谢关注`)
+          ]))
+        ])
+      }
+
       return h('div', { class: 'fill-page', style }, [
         h('div', {
           class: 'fill-hero',
@@ -221,6 +266,10 @@ export default {
                 ]))
               ]) : null,
               h('div', { class: 'small muted', style: 'margin-top:10px' }, `答卷编号 ${result.value?.publicId || result.value?.id}，可凭此编号查询`),
+              // 切屏次数当场回给本人：事后悄悄标记一张卷子，比当场说清更不体面
+              result.value?.switchCount > 0 ? h('div', {
+                class: 'small', style: 'margin-top:6px;color:' + (result.value.flagged ? 'var(--danger)' : 'var(--text-3)')
+              }, `本次作答期间检测到 ${result.value.switchCount} 次切出页面` + (result.value.flagged ? `（超过 ${result.value.maxSwitch} 次，已标记待人工核查）` : '')) : null,
               h('button', {
                 class: 'btn mt2',
                 onClick: () => {
@@ -228,11 +277,15 @@ export default {
                   result.value = null
                   model.value = defaultData(form.value.schema)
                   startAt = Date.now()
+                  switchCount.value = 0
                   restartTimer()
                 }
               }, '再填一份')
             ])
           : [
+              switchCount.value > 0 && !done.value ? h('div', {
+                class: 'small', style: `margin-bottom:10px;color:${form.value.antiCheat?.maxSwitch && switchCount.value >= form.value.antiCheat.maxSwitch ? 'var(--danger)' : 'var(--text-3)'}`
+              }, `已切出此页面 ${switchCount.value} 次` + (form.value.antiCheat?.maxSwitch ? `，上限 ${form.value.antiCheat.maxSwitch} 次` : '')) : null,
               remain.value > 0 && !done.value ? h('div', {
                 class: 'flex between',
                 style: `margin-bottom:16px;padding:9px 14px;border-radius:10px;font-size:13px;background:${remain.value <= 60 ? 'rgba(239,68,68,.1)' : 'var(--panel-2)'};color:${remain.value <= 60 ? 'var(--danger)' : 'var(--text-2)'}`

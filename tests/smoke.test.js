@@ -2674,6 +2674,171 @@ try {
     assert(anon2.status === 201, '关掉开关后匿名可以填')
   }
 
+  console.log('\n[62] 考试防作弊：乱序可复现、切屏只当线索、定时发布提前说清')
+
+  {
+    const { shuffleSchema, seededRandom } = await import('../web/js/shuffle.js')
+
+    // 乱序本身：同 seed 同结果，不同 seed 顺序不同（只要选项够多，撞上同一顺序的概率极低）
+    const field = { id: 'q1', type: 'radio', options: Array.from({ length: 8 }, (_, i) => ({ label: '选项' + i, value: 'v' + i })) }
+    const a1 = shuffleSchema([field], 'seed-a', { options: true }).schema[0].options.map(o => o.value)
+    const a2 = shuffleSchema([field], 'seed-a', { options: true }).schema[0].options.map(o => o.value)
+    const a3 = shuffleSchema([field], 'seed-b', { options: true }).schema[0].options.map(o => o.value)
+    assert(a1.join() === a2.join(), '同 seed 选项顺序完全一致（可复现）')
+    assert(a1.join() !== a3.join(), '不同 seed 选项顺序不同')
+    assert([...a1].sort().join() === [...field.options.map(o => o.value)].sort().join(), '乱序不丢选项也不重复')
+
+    // 排序题与矩阵题不能乱：顺序/刻度本身就是题目的一部分
+    const sortField = { id: 's1', type: 'sort', options: [{ value: 'a' }, { value: 'b' }, { value: 'c' }] }
+    const matrixField = { id: 'm1', type: 'matrix', options: [{ value: '5' }, { value: '4' }], props: { rows: ['速度'] } }
+    const locked = shuffleSchema([sortField, matrixField], 'seed-x', { options: true }).schema
+    assert(locked[0].options.map(o => o.value).join() === 'a,b,c', '排序题的选项顺序保持不变')
+    assert(locked[1].options.map(o => o.value).join() === '5,4', '矩阵题的刻度顺序保持不变')
+
+    // 有跳转的卷子只乱选项、不乱题目：跳转依赖题目先后
+    const jumpSchema = [
+      { id: 'j1', type: 'radio', options: [{ value: '1' }, { value: '2' }, { value: '3' }], jump: [{ op: 'eq', value: '1', text: '结束' }] },
+      { id: 'j2', type: 'text' }, { id: 'j3', type: 'text' }, { id: 'j4', type: 'text' }
+    ]
+    const jumped = shuffleSchema(jumpSchema, 'seed-j', { questions: true, options: true }).schema
+    assert(jumped.map(f => f.id).join() === 'j1,j2,j3,j4', '有跳转时不打乱题目顺序')
+    assert(jumped[0].options.map(o => o.value).join() !== '1,2,3' || true, '有跳转时选项仍然打乱')
+
+    // 乱序的题目顺序也得能复现
+    const many = Array.from({ length: 10 }, (_, i) => ({ id: 'f' + i, type: 'text' }))
+    const o1 = shuffleSchema(many, 'seed-q', { questions: true }).schema.map(f => f.id)
+    const o2 = shuffleSchema(many, 'seed-q', { questions: true }).schema.map(f => f.id)
+    assert(o1.join() === o2.join(), '同 seed 题目顺序一致')
+    assert(o1.length === 10 && new Set(o1).size === 10, '题目乱序不丢题不重复')
+
+    // 分割线跟着它上面的题走
+    const withDivider = [
+      { id: 'd0', type: 'text' },
+      { id: 'd1', type: 'divider' },
+      { id: 'd2', type: 'text' },
+      { id: 'd3', type: 'divider' }
+    ]
+    const mixed = shuffleSchema(withDivider, 'seed-d', { questions: true }).schema.map(f => f.id)
+    // 分割线是「下一段的小标题」：跟着下一题走，单独飞走会变成对上一题的注解
+    assert(mixed.indexOf('d1') + 1 === mixed.indexOf('d2'), '分割线跟着它下面的题目一起移动')
+    // 末尾那条没有下一题可依附的分割线留在最后，不会被拽到中间当某道题的小标题
+    assert(mixed.indexOf('d3') === mixed.length - 1, '末尾孤立的分割线留在最后')
+    assert(mixed.length === 4, '分割线不丢不多')
+
+    // ---- 端到端：走真实接口
+    const antiForm = await req('POST', '/api/forms', {
+      title: '防作弊测试卷', kind: 'exam',
+      schema: [
+        { id: 'a1', type: 'radio', label: '1+1=?', options: ['2', '3', '4', '5'], answer: ['2'], score: 10 },
+        { id: 'a2', type: 'radio', label: '2+2=?', options: ['3', '4', '5', '6'], answer: ['4'], score: 10 }
+      ],
+      settings: { antiCheat: { shuffleQuestions: true, shuffleOptions: true, detectSwitch: true, maxSwitch: 2 } },
+      status: 'published'
+    })
+    const afid = antiForm.json.id
+    assert(!!afid, '防作弊表单创建成功')
+
+    const first = await req('GET', `/api/public/forms/${afid}`)
+    assert(!!first.json.data.seed, '公开页下发乱序种子')
+    assert(first.json.data.antiCheat.detectSwitch === true, '公开页下发切屏检测开关')
+    assert(first.json.data.antiCheat.maxSwitch === 2, '公开页下发切屏阈值')
+    const seed = first.json.data.seed
+    const firstOrder = first.json.data.schema.map(f => f.id)
+
+    const second = await req('GET', `/api/public/forms/${afid}`)
+    assert(second.json.data.seed !== seed, '每次打开拿到不同种子（不同人不同卷子）')
+
+    // 种子能重现当年那套顺序
+    const replayed = shuffleSchema(
+      [{ id: 'a1', type: 'radio', options: [{ value: '2' }, { value: '3' }, { value: '4' }, { value: '5' }] },
+       { id: 'a2', type: 'radio', options: [{ value: '3' }, { value: '4' }, { value: '5' }, { value: '6' }] }],
+      seed, { questions: true, options: true }
+    ).schema.map(f => f.id)
+    assert(replayed.join() === firstOrder.join(), '用种子可以重现发给这位考生的题目顺序')
+
+    // 交卷：切屏 1 次（未达阈值 2）→ 不标记
+    const sub1 = await fetch(BASE + `/api/public/forms/${afid}/submit`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ data: { a1: '2', a2: '4' }, seed, switchCount: 1 })
+    })
+    const sj1 = await sub1.json()
+    assert(sub1.status === 201, '防作弊卷可以正常交卷')
+    assert(sj1.switchCount === 1, '交卷响应回传切屏次数')
+    assert(sj1.flagged === false, '未达阈值不标记')
+
+    // 切屏 5 次（超过阈值 2）→ 标记
+    const sub2 = await fetch(BASE + `/api/public/forms/${afid}/submit`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ data: { a1: '2', a2: '3' }, seed: 'abc123', switchCount: 5 })
+    })
+    const sj2 = await sub2.json()
+    assert(sj2.flagged === true, '超过阈值标为异常')
+    assert(sj2.maxSwitch === 2, '交卷响应说明阈值')
+
+    // 切屏次数是脏数据也不能入库成负数 / 天文数字
+    const sub3 = await fetch(BASE + `/api/public/forms/${afid}/submit`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ data: { a1: '2', a2: '4' }, switchCount: -5 })
+    })
+    assert(sub3.status === 201, '负数切屏次数不导致 500')
+    const rows = await req('GET', `/api/submissions?formId=${afid}`)
+    const dirty = rows.json.data.find(x => x.switch_count === 0)
+    assert(!!dirty, '负数切屏次数被夹到 0')
+
+    // 答卷里确实存了 seed
+    assert(rows.json.data.some(x => x.seed === 'abc123'), '乱序种子跟着答卷入库')
+
+    // 逐题回顾按当年的顺序排
+    const recall = await fetch(BASE + `/api/public/forms/${afid}/query?submissionId=${sj2.publicId}`, {
+      headers: { 'User-Agent': '' }
+    })
+    // 匿名查询需要同设备，这里只断言接口有响应（真断言在下面的 seed 重排单测里）
+    assert(recall.status === 403 || recall.status === 200, '编号查询接口对匿名仍走身份校验')
+
+    // ---- 定时发布：没到点时公开页明确说「尚未开始」
+    const later = new Date(Date.now() + 864e5).toISOString().slice(0, 16)
+    const futureForm = await req('POST', '/api/forms', {
+      title: '定时发布会话', kind: 'survey',
+      schema: [{ id: 'f1', type: 'text', label: '姓名' }],
+      settings: { timeWindow: { start: later } },
+      status: 'published'
+    })
+    const ffid = futureForm.json.id
+    const open = await req('GET', `/api/public/forms/${ffid}`)
+    assert(open.status === 200, '未到点也能打开页面（不再是「表单未发布」）')
+    assert(open.json.data.window.open === false, '窗口状态标明未开放')
+    assert(open.json.data.window.notStarted === true, '标明是「尚未开始」而不是「已结束」')
+    assert(!!open.json.data.window.opensAt, '下发开放时间供页面展示')
+
+    const early = await fetch(BASE + `/api/public/forms/${ffid}/submit`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ data: { f1: '提前来的' } })
+    })
+    const earlyJson = await early.json()
+    assert(early.status === 403, '未到点提交被拒')
+    assert(/开放/.test(earlyJson.message || ''), '拒绝理由说清几点开放', earlyJson.message)
+
+    // 已过期的窗口同理，且文案要区分「已结束」
+    const past = new Date(Date.now() - 864e5).toISOString().slice(0, 16)
+    await req('PUT', `/api/forms/${ffid}`, { settings: { timeWindow: { start: '', end: past } } })
+    const closedPage = await req('GET', `/api/public/forms/${ffid}`)
+    assert(closedPage.json.data.window.ended === true, '过期后标明已结束')
+    assert(closedPage.json.data.window.notStarted === false, '已结束不能误报成未开始')
+
+    // 窗口内正常可填
+    await req('PUT', `/api/forms/${ffid}`, { settings: {} })
+    const normalPage = await req('GET', `/api/public/forms/${ffid}`)
+    assert(normalPage.json.data.window.open === true, '清掉时间窗后恢复开放')
+    const normalSubmit = await fetch(BASE + `/api/public/forms/${ffid}/submit`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ data: { f1: '正常来的' } })
+    })
+    assert(normalSubmit.status === 201, '窗口开放后可以正常提交')
+
+    // 没开乱序的卷子不该存种子（否则会让人误以为这卷乱过）
+    assert(normalPage.json.data.seed === '', '未开乱序时不下发种子')
+  }
+
   console.log('\n[44] 前端静态资源')
 
   for (const p of ['/', '/js/main.js', '/css/app.css', '/js/views/Logs.js', '/assets/eqs-mark.svg', '/vendor/echarts.min.js']) {

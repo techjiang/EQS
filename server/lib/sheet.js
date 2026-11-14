@@ -259,13 +259,16 @@ export function submissionRow(form, schema, r) {
     ...schema.map(f => cell(r.data?.[f.id], f)),
     r.score ?? '',
     form.kind === 'exam' ? (r.passed === 1 ? '通过' : r.passed === 0 ? '未通过' : '') : '',
-    r.reviewed_at ? '已批阅' : (form.kind === 'exam' ? '待批阅' : '')
+    r.reviewed_at ? '已批阅' : (form.kind === 'exam' ? '待批阅' : ''),
+    // 切屏次数：老答卷没有这一列（null），导出时给空而不是 0 —— 「没记录」和「零次」不是一回事
+    r.switch_count === null || r.switch_count === undefined ? '' : r.switch_count,
+    r.flagged ? '异常' : ''
   ]
 }
 
 export function submissionsHead(form) {
   const schema = (form.schema || []).filter(f => !['divider', 'richtext', 'html', 'image'].includes(f.type))
-  return { schema, head: ['答卷编号', '提交时间', ...schema.map(f => f.label), '得分', '是否通过', '批阅状态'] }
+  return { schema, head: ['答卷编号', '提交时间', ...schema.map(f => f.label), '得分', '是否通过', '批阅状态', '切屏次数', '异常标记'] }
 }
 
 export function submissionsXlsx(form, rows) {

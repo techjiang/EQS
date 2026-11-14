@@ -4,7 +4,7 @@ import { get, all, run, now, DATA_DIR, db } from '../lib/db.js'
 import { readBody, sendJson, fail, send, clientIp } from '../lib/http.js'
 import { requireUser, requirePerm, currentUser, can } from '../lib/auth.js'
 import { upload, localPath, storageConfig, DRIVERS } from '../lib/storage.js'
-import { safeJson } from '../lib/forms.js'
+import { safeJson, formWindow } from '../lib/forms.js'
 import { buildZip, extractZip, writeZipStream } from '../lib/zip.js'
 import { formRole, formVisibleScope, requireFormRole } from '../lib/formMembers.js'
 
@@ -111,6 +111,10 @@ export default function register(r) {
       let fs2 = {}
       try { fs2 = JSON.parse(form.settings || '{}') } catch {}
       if (fs2.needLogin) fail(401, '该表单仅限登录用户填写，请先登录')
+      // 定时发布的表单在开放时间窗之外不该收文件：否则「尚未开始」的卷子能先把附件传上来，
+      // 而附件一旦落盘就占着磁盘，跟「这个问卷还没开放」是矛盾的
+      const win = formWindow(fs2)
+      if (!win.open) fail(403, win.notStarted ? '问卷尚未开始，暂不能上传附件' : '问卷已结束，不能上传附件')
     }
     const maxMb = 100
     if (data.length > maxMb * 1024 * 1024) fail(413, `文件超过 ${maxMb}MB`)

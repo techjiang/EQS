@@ -599,6 +599,28 @@ export function computeStats(form, submissions) {
   return acc.result()
 }
 
+/**
+ * 表单此刻能不能填：已发布 + 在开放时间窗内。
+ *
+ * 以前这条判据只写在「提交」那一处（而且是在 checkLimit 里，靠 settings.timeWindow 判断），
+ * 「打开发表单」这一处只看 status。后果是：定时发布的问卷，当天还没到点，
+ * 页面能正常打开、能认真填二十分钟，点提交才吃一句「问卷尚未开始」——填的那二十分钟白费。
+ * 现在打页面和提交都走这一个函数，前端还能拿到 inWindow/opensAt 提前把入口换掉。
+ */
+export function formWindow(settings = {}) {
+  const w = settings.timeWindow || {}
+  const nowMs = Date.now()
+  const startMs = w.start ? new Date(w.start).getTime() : 0
+  const endMs = w.end ? new Date(w.end).getTime() : 0
+  const notStarted = !!(startMs && nowMs < startMs)
+  const ended = !!(endMs && nowMs > endMs)
+  return {
+    open: !notStarted && !ended,
+    notStarted, ended,
+    opensAt: w.start || '', closesAt: w.end || ''
+  }
+}
+
 export function pickForm(id, { withDeleted = false } = {}) {
   const row = get(`SELECT * FROM forms WHERE id = ? ${withDeleted ? '' : 'AND deleted_at IS NULL'}`, Number(id))
   return parseForm(row)
