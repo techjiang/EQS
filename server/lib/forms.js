@@ -3,6 +3,8 @@ import { get, all, run, now } from './db.js'
 // 逻辑规则（显示 / 必填 / 计算 / 跳转 / 自动填入）与浏览器共用同一份实现。
 // 各写一遍的下场在判分上已经演过：三个入口三套口径，同一道题三种结论。
 import { buildFlow, resolveAnswers, renderText, evalFormula } from '../../web/js/flow.js'
+// 级联的父子关系同样只有一份：渲染、判分、统计、导出都按它算路径
+import { cascadeLabelPath, cascadeLabelTail, cascadeValuePath, normalizeCascade } from '../../web/js/cascade.js'
 
 export const FIELD_TYPES = [
   'text', 'textarea', 'number', 'date', 'datetime', 'time', 'select', 'radio', 'checkbox',
@@ -29,7 +31,14 @@ export function normalizeField(f, i = 0) {
     required: f.required === true || f.required === 'true' || f.required === 1,
     placeholder: f.placeholder || '',
     description: f.description || '',
-    options: Array.isArray(f.options) ? f.options.map(o => (typeof o === 'string' ? { label: o, value: o } : { label: String(o.label ?? ''), value: String(o.value ?? o.label ?? '') })) : [],
+    // parent 只有级联选择用得到（父项 value，顶层空），但它必须在这里保住：
+    // 之前这个映射把每个选项重建成「label + value」两个键，层级关系一进 normalizeField 就被抹平，
+    // 于是「级联」在存储层就已经是平的，渲染层再怎么改也级不起来。
+    options: Array.isArray(f.options) ? f.options.map(o => {
+      const base = typeof o === 'string' ? { label: o, value: o } : { label: String(o.label ?? ''), value: String(o.value ?? o.label ?? '') }
+      const parent = typeof o === 'object' && o && o.parent !== undefined && o.parent !== null ? String(o.parent) : ''
+      return parent ? { ...base, parent } : base
+    }) : [],
     defaultValue: f.defaultValue ?? '',
     score: Number(f.score) || 0,
     answer: Array.isArray(f.answer) ? f.answer : (f.answer ? [f.answer] : []),
@@ -44,6 +53,10 @@ export function normalizeField(f, i = 0) {
     // 自动填入：来源题有作答时，把值（可选经映射）填进空着的本题
     fill: f.fill && typeof f.fill === 'object' ? f.fill : null,
     props: typeof f.props === 'object' && f.props ? f.props : {}
+  }
+  if (type === 'cascader') {
+    // 脏数据兜底：parent 指向不存在的值、父子成环，都会让选项在页面上凭空消失或渲染死循环
+    out.options = normalizeCascade(out.options)
   }
   if (CHOICE.has(type) && out.options.length === 0 && type !== 'matrix') {
     out.options = [{ label: '选项 1', value: '选项 1' }, { label: '选项 2', value: '选项 2' }]
@@ -280,6 +293,9 @@ export function isAnswerCorrect(field, value) {
 export function answerText(field, value) {
   const type = field?.type
   if (value === undefined || value === null || value === '') return ''
+  // 级联存的是最末一级的值：「西湖区」三个字看不出它是哪个省的，
+  // 复核、阅卷、导出附件清单都需要「浙江省 / 杭州市 / 西湖区」这条完整路径
+  if (type === 'cascader') return cascadeLabelPath(field.options, value) || String(value)
   if (type === 'matrix') {
     const rows = Array.isArray(field.props?.rows) ? field.props.rows : []
     // 作答是 {行: 列}；标准答案是「每行各选哪一列」的数组，同样按行贴出去
@@ -435,6 +451,10 @@ export function createStatsAccumulator(form) {
         const counts = new Map()
         return { ...base, kind: 'matrix', counts, sum: 0, num: 0 }
       }
+      case 'cascader': {
+        // 按「最末一级」统计：级联的每一层都是筛选项，把省份和区县混在一张图里没法读
+        return { ...base, kind: 'cascade', counts: new Map(), labels: new Map(normalizeCascade(f.options).map(o => [o.value, o])) }
+      }
       case 'number': case 'slider': {
         return { ...base, kind: 'number', sum: 0, num: 0, max: 0, min: 0, seen: false }
       }
@@ -488,6 +508,12 @@ export function createStatsAccumulator(form) {
             for (const one of (Array.isArray(v) ? v : [v])) bump(cell.counts, String(one))
             cell.sum += Number(flat(v)) || 0
             cell.num++
+            break
+          }
+          case 'cascade': {
+            // 老数据可能是数组（有人自己存过路径），取最后一格；否则按单个值算
+            const leaf = cascadeValuePath(v).pop()
+            if (leaf !== undefined && leaf !== '') bump(cell.counts, leaf)
             break
           }
           case 'matrix': {
@@ -558,6 +584,28 @@ export function createStatsAccumulator(form) {
           if (['rate', 'nps', 'slider', 'number', 'switch'].includes(f.type)) {
             item.average = cell.num ? Math.round((cell.sum / cell.num) * 100) / 100 : 0
           }
+        } else if (cell.kind === 'cascade') {
+          // 只列「真被人选到过的末级项」：把 200 个区县全画成柱子等于没统计。
+          // 名字带完整路径，否则图表上会并排出现三个「其他」。
+          item.series = [...cell.counts.entries()]
+            .map(([value, n]) => ({
+              // 图上默认只写末级名（「西湖区」），完整路径放进 tooltip：
+              // 三级全铺在 x 轴上，即使斜着放也会被截掉前半截
+              name: cascadeLabelTail(f.options, value, 1) || value,
+              full: cascadeLabelPath(f.options, value) || value,
+              value: n,
+              key: value
+            }))
+          /*
+           * 末级名撞车时（两个省都有「朝阳区」）退回「市·区」：
+           * 图上两根同名柱子，谁也看不出差在哪。
+           */
+          const dup = new Set(item.series.map(x => x.name).filter((n, i, arr) => arr.indexOf(n) !== i))
+          for (const x of item.series) {
+            if (dup.has(x.name)) x.name = cascadeLabelTail(f.options, x.key, 2, '·') || x.name
+          }
+          item.series.sort((a, b) => b.value - a.value)
+          item.note = '按最末一级统计（悬停可看完整路径）'
         } else if (cell.kind === 'matrix') {
           item.series = f.options.map(o => ({ name: o.label, value: cell.counts.get(String(o.value)) || 0 }))
           item.note = '各评分列被选中的次数'

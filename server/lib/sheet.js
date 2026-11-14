@@ -1,5 +1,6 @@
 import { normalizeField, coerceAnswerToField } from './forms.js'
 import { buildXlsx, readXlsx } from './xlsx.js'
+import { cascadeLabelPath } from '../../web/js/cascade.js'
 
 /* 表格 ↔ 题目：Excel 导入导出。
  *
@@ -241,6 +242,12 @@ export function questionsXlsx(questions, sheetName = '题目') {
 export function submissionRow(form, schema, r) {
   const cell = (v, f) => {
     if (v === undefined || v === null || v === '') return ''
+    // 级联只存末级值：导出成「浙江省 / 杭州市 / 西湖区」，
+    // 否则一张表里全是「西湖区」，打开的人得自己回忆这是哪个省的
+    if (f.type === 'cascader') {
+      const leaf = Array.isArray(v) ? v[v.length - 1] : v
+      return cascadeLabelPath(f.options, leaf) || leaf
+    }
     if (Array.isArray(v)) {
       if (v.some(x => x && typeof x === 'object')) {
         const labels = Object.fromEntries((f.props?.fields || []).map(sf => [sf.id, sf.label]))

@@ -85,6 +85,17 @@ export function blankField(type) {
       { label: '选项 3', value: '选项 3' }
     ]
   }
+  // 级联给一个能直接看懂的三级例子：新建出来就是「省 / 市 / 区」，
+  // 而不是三个互不相干的「选项 1 2 3」——那样连层级该怎么配都看不出来
+  if (type === 'cascader') {
+    base.options = [
+      { label: '浙江省', value: '浙江省' },
+      { label: '杭州市', value: '杭州市', parent: '浙江省' },
+      { label: '西湖区', value: '西湖区', parent: '杭州市' },
+      { label: '江苏省', value: '江苏省' },
+      { label: '南京市', value: '南京市', parent: '江苏省' }
+    ]
+  }
   if (type === 'matrix') {
     base.props = { rows: ['行 1', '行 2', '行 3'] }
     base.options = [

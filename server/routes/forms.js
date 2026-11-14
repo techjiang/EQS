@@ -238,7 +238,9 @@ export default function register(r) {
       const removed = []
       for (const o of oldOpts) {
         const hit = byValue.get(String(o.value))
-        if (hit) kept.push({ label: hit.label, value: String(hit.value) })
+        // parent 必须跟着一起带：级联题从字典同步时把它丢了，选项就全塌成一级，
+        // 「省 / 市 / 区」三个下拉变成三个互不相干的下拉
+        if (hit) kept.push(hit.parent ? { label: hit.label, value: String(hit.value), parent: String(hit.parent) } : { label: hit.label, value: String(hit.value) })
         else removed.push(o.label)
       }
       const oldValues = new Set(oldOpts.map(o => String(o.value)))

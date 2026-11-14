@@ -2,6 +2,8 @@ import { h } from '/vendor/vue.esm.js'
 import { escapeHtml } from './ui.js'
 // 逻辑规则的唯一实现，服务端 import 的是同一个文件
 import { buildFlow, renderText, OP_LABELS, evalFormula, roundTo } from './flow.js'
+// 级联的层级计算也放在共享文件里：渲染、判分、统计、导出必须是同一套父子关系
+import { cascadeChildren, cascadePathOf, cascadeLabelPath, normalizeCascade } from './cascade.js'
 
 const findMeta = (type) => type
 
@@ -260,10 +262,49 @@ export function renderControl(field, model, opts = {}) {
         })
       ])
     }
-    case 'cascader':
-      return h('select', {
-        class: 'select', disabled: dis, value: val ?? '', onChange: e => set(e.target.value)
-      }, [h('option', { value: '' }, '请选择'), ...field.options.map(o => h('option', { value: o.value }, o.label))])
+    case 'cascader': {
+      /*
+       * 真的级联：按层级渲染 N 个下拉，第 N 个只列「上一个已选项的子项」。
+       * 以前这里和普通下拉完全一样，三个选项目的地 / 省份 / 城市并排放着，
+       * 「级联」两个字只存在于题型名称里。
+       *
+       * 作答仍然只存**最末一级的值**（不是整条路径）：这样一道老问卷的数据、
+       * 一个标准答案、一次判分比对都不用改口径，路径需要时按父子关系从值倒推出来。
+       */
+      const opts = normalizeCascade(field.options)
+      const path = cascadePathOf(opts, val)
+      const levels = []
+      let parent = ''
+      // 最多渲染到「当前已选路径的下一层」或选项树的最大深度，10 层是防止脏数据把页面拖死
+      for (let i = 0; i < 10; i++) {
+        const kids = cascadeChildren(opts, parent)
+        if (!kids.length) break
+        levels.push({ parent, kids, picked: path[i] || '' })
+        const picked = path[i]
+        if (!picked) break
+        parent = picked
+      }
+      if (!levels.length) return h('div', { class: 'hint' }, '这道题还没有设置级联选项')
+      return h('div', {}, [
+        h('div', { class: 'flex wrap', style: 'gap:8px;align-items:center' },
+          levels.map((lv, i) => h('select', {
+            key: 'lv' + i,
+            class: 'select',
+            style: 'flex:1;min-width:130px',
+            disabled: dis,
+            value: lv.picked,
+            onChange: e => {
+              // 改上层就把下层一起丢掉：留着「江苏省 / 杭州市」这种组合比空着更糟
+              set(e.target.value)
+            }
+          }, [
+            h('option', { value: '' }, i === 0 ? '请选择' : '请选择' + (i > 1 ? '下级' : '下级')),
+            ...lv.kids.map(o => h('option', { value: o.value }, o.label))
+          ]))),
+        // 选完把整条路径贴出来：三级下拉里只看最后一格，人容易忘了自己上面选的是哪个省
+        val ? h('div', { class: 'small muted', style: 'margin-top:6px' }, '已选：' + (cascadeLabelPath(opts, val) || String(val))) : null
+      ])
+    }
     case 'carousel': {
       return h('div', {}, [
         h('div', { style: 'display:flex;gap:8px;overflow-x:auto;padding-bottom:4px' },
@@ -472,6 +513,11 @@ function initSignature(canvas, onChange) {
 export function answerDisplay(field, value) {
   const type = field?.type
   if (value === undefined || value === null || value === '') return ''
+  // 级联只存末级值：表格里必须铺成完整路径，否则一列「西湖区」谁也认不出是哪儿
+  if (type === 'cascader') {
+    const path = cascadeLabelPath(field.options, Array.isArray(value) ? value[value.length - 1] : value)
+    return path || String(value)
+  }
   if (type === 'matrix') {
     const rows = Array.isArray(field?.props?.rows) ? field.props.rows : []
     if (Array.isArray(value)) return value.map((v, i) => (rows[i] ? `${rows[i]}：${v}` : String(v))).join(' · ')

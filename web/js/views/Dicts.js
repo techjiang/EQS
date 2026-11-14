@@ -66,15 +66,6 @@ export default {
       draft.value.splice(i, 1)
       touch()
     }
-    const move = (i, delta) => {
-      const j = i + delta
-      if (j < 0 || j >= draft.value.length) return
-      const [x] = draft.value.splice(i, 1)
-      draft.value.splice(j, 0, x)
-      draft.value.forEach((it, k) => it.sort = (k + 1) * 10)
-      touch()
-    }
-
     const saveItems = async () => {
       saving.value = true
       try {
@@ -83,7 +74,10 @@ export default {
         const r = await api.put(`/api/dicts/${encodeURIComponent(activeCode.value)}/items`, { items })
         draft.value = (r.data || []).map(i => ({ ...i }))
         dirty.value = false
-        ok(r.dropped ? `已保存，重复值的 ${r.dropped} 项被忽略` : '已保存')
+        const bits = []
+        if (r.dropped) bits.push(`重复值的 ${r.dropped} 项被忽略`)
+        if (r.notes?.length) bits.push(r.notes.slice(0, 2).join('；') + (r.notes.length > 2 ? ` 等 ${r.notes.length} 条` : ''))
+        ok(bits.length ? '已保存，' + bits.join('；') : '已保存')
         load()
       } catch (e) { err(e.message) } finally { saving.value = false }
     }
@@ -129,6 +123,90 @@ export default {
       } catch (e) { err(e.message) }
     }
 
+    /* ---------- Excel ----------
+     * 维护字典的人手上就是一张 Excel：只给「粘贴导入」等于让人先把表格复制成纯文本。
+     * 导出还有第二个用途——它就是模板，改完直接导回。
+     */
+    const exportXlsx = async () => {
+      try {
+        await api.download(`/api/dicts/${encodeURIComponent(activeCode.value)}/export.xlsx`, `${active.value?.name || '字典'}项.xlsx`)
+      } catch (e) { err(e.message) }
+    }
+    const importXlsx = async (file) => {
+      if (!file) return
+      try {
+        const r = await api.uploadFile(`/api/dicts/${encodeURIComponent(activeCode.value)}/import-xlsx`, file)
+        const bits = [`新增 ${r.added} 项`]
+        if (r.skipped) bits.push(`跳过已有 ${r.skipped} 项`)
+        if (r.notes?.length) bits.push(r.notes.slice(0, 2).join('；'))
+        if (r.unknownColumns?.length) bits.push(`未识别的列已忽略：${r.unknownColumns.join('、')}`)
+        ok(bits.join('，'))
+        loadDetail()
+        load()
+      } catch (e) { err(e.message) }
+    }
+
+    /**
+     * 选项表的行顺序 = 深度优先，缩进即层级。
+     * 平铺着显示「上级」一列只能看出谁挂在谁下面，看不出整棵树长什么样；
+     * 而级联要维护的恰恰是「这棵树长什么样」。
+     */
+    /**
+     * 按「深度优先」展平草稿，返回的是**原始对象**（不是副本）：
+     * 表格里改一个字段要直接改在草稿上，克隆一份再回写是两次出错的机会。
+     */
+    const flatDraft = () => {
+      const list = draft.value
+      const out = []
+      const used = new Set()
+      const walk = (parent, depth, guard) => {
+        if (guard > 20) return
+        for (const o of list) {
+          if ((o.parent || '') !== parent || used.has(o)) continue
+          used.add(o)
+          out.push({ item: o, depth })
+          walk(o.value || '', depth + 1, guard + 1)
+        }
+      }
+      walk('', 0, 0)
+      // 上级指向已删除项的孤儿、或重复 value 走不到的分支，一律提到顶级，选项一个都不能消失
+      for (const o of list) if (!used.has(o)) out.push({ item: o, depth: 0 })
+      return out
+    }
+    const descendantsOf = (value) => {
+      const out = new Set()
+      const walk = (v) => {
+        for (const o of draft.value) {
+          if (!v || (o.parent || '') !== v || out.has(o)) continue
+          out.add(o)
+          walk(o.value || '')
+        }
+      }
+      walk(value)
+      return out
+    }
+    /** 只和同级兄弟换位置：跨层级上移会把子项甩到别的父级下面，那不是「上移」 */
+    const moveSibling = (it, delta) => {
+      const parent = it.parent || ''
+      const sibs = draft.value.filter(o => (o.parent || '') === parent)
+      const at = sibs.indexOf(it)
+      const to = at + delta
+      if (at < 0 || to < 0 || to >= sibs.length) return
+      const a = draft.value.indexOf(sibs[at])
+      const b = draft.value.indexOf(sibs[to])
+      const [x] = draft.value.splice(a, 1)
+      draft.value.splice(b, 0, x)
+      draft.value.forEach((o, k) => o.sort = (k + 1) * 10)
+      touch()
+    }
+    const addChild = (parent) => {
+      const base = '新选项'
+      let n = draft.value.length + 1
+      while (draft.value.some(o => o.value === `${base} ${n}`)) n++
+      draft.value.push({ id: 0, label: `${base} ${n}`, value: `${base} ${n}`, parent: parent?.value || '', enabled: 1, sort: (draft.value.length + 1) * 10 })
+      touch()
+    }
+
     return () => h('div', {}, [
       h('div', { class: 'page-head' }, [
         h('div', {}, [
@@ -170,6 +248,14 @@ export default {
                   dirty.value ? h('span', { class: 'tag warn' }, '有未保存的修改') : null,
                   h('button', { class: 'btn sm', onClick: () => editingType.value = { ...active.value } }, '改名'),
                   h('button', { class: 'btn sm', onClick: () => importOpen.value = true }, '粘贴导入'),
+                  h('label', { class: 'btn sm', style: 'margin:0' }, [
+                    'Excel 导入',
+                    h('input', {
+                      type: 'file', accept: '.xlsx', class: 'hide',
+                      onChange: e => { const f = e.target.files?.[0]; e.target.value = ''; importXlsx(f) }
+                    })
+                  ]),
+                  h('button', { class: 'btn sm', onClick: exportXlsx }, '导出 Excel'),
                   h('button', { class: 'btn sm', onClick: addRow }, '+ 添加选项'),
                   h('button', { class: 'btn primary sm', disabled: saving.value, onClick: saveItems }, saving.value ? '保存中…' : '保存选项'),
                   h('button', { class: 'btn sm danger', onClick: removeType }, '删除')
@@ -186,28 +272,59 @@ export default {
               ]) : h('div', { class: 'dict-used' }, h('span', { class: 'small muted' }, '还没有表单绑定这套字典')),
 
               draft.value.length ? h('div', { style: 'overflow-x:auto' }, h('table', { class: 'table dict-table' }, [
-                h('thead', {}, h('tr', {}, ['#', '显示名称', '存储值', '启用', '排序', '操作'].map(t => h('th', {}, t)))),
-                h('tbody', {}, draft.value.map((it, i) => h('tr', {}, [
-                  h('td', { class: 'small muted' }, String(i + 1)),
-                  h('td', {}, h('input', {
-                    class: 'input sm', value: it.label, placeholder: '例如：本科',
-                    onInput: e => { it.label = e.target.value; if (!it.value || it.value === it.label) it.value = e.target.value; touch() }
-                  })),
-                  h('td', {}, h('input', {
-                    class: 'input sm mono', value: it.value, placeholder: '留空＝同名',
-                    onInput: e => { it.value = e.target.value; touch() }
-                  })),
-                  h('td', {}, h('div', {
-                    class: ['switch', it.enabled ? 'on' : ''],
-                    title: it.enabled ? '停用后不再下发给表单' : '启用',
-                    onClick: () => { it.enabled = it.enabled ? 0 : 1; touch() }
-                  })),
-                  h('td', { class: 'nowrap' }, h('div', { class: 'flex', style: 'gap:2px' }, [
-                    h('button', { class: 'btn ghost sm', onClick: () => move(i, -1) }, '↑'),
-                    h('button', { class: 'btn ghost sm', onClick: () => move(i, 1) }, '↓')
-                  ])),
-                  h('td', {}, h('button', { class: 'btn ghost sm danger', onClick: () => removeRow(i) }, '删除'))
-                ])))
+                h('thead', {}, h('tr', {}, ['#', '显示名称', '上级', '存储值', '启用', '排序', '操作'].map(t => h('th', {}, t)))),
+                h('tbody', {}, flatDraft().map((row, i) => {
+                  const it = row.item
+                  const banned = descendantsOf(it.value || '')
+                  if (it.value) banned.add(it.value)
+                  const candidates = flatDraft().map(r => r.item).filter(x => x.value && !banned.has(x.value))
+                  return h('tr', {}, [
+                    h('td', { class: 'small muted' }, String(i + 1)),
+                    // 缩进就是层级：平铺一张表看不出这棵树长什么样，而级联要维护的正是树的形状
+                    // flex 而不是「span + width:100% 的 input」：后者会把缩进符挤到下一行，
+                    // 一张表里每两行空一行，看着像数据缺了
+                    h('td', {}, h('div', {
+                      style: `padding-left:${Math.min(row.depth, 5) * 14}px;display:flex;align-items:center;gap:4px`
+                    }, [
+                      row.depth ? h('span', { class: 'small muted', style: 'flex:none' }, '└') : null,
+                      h('input', {
+                        class: 'input sm', value: it.label, placeholder: '例如：本科',
+                        style: 'flex:1;min-width:0',
+                        onInput: e => {
+                          const wasSame = !it.value || it.value === it.label
+                          it.label = e.target.value
+                          if (wasSame) it.value = e.target.value
+                          touch()
+                        }
+                      })
+                    ])),
+                    h('td', {}, h('select', {
+                      class: 'select', style: 'height:28px;font-size:12px;min-width:130px',
+                      value: it.parent || '',
+                      onChange: e => { it.parent = e.target.value; touch() }
+                    }, [
+                      h('option', { value: '' }, '顶级'),
+                      ...candidates.map(x => h('option', { value: x.value }, x.label || x.value))
+                    ])),
+                    h('td', {}, h('input', {
+                      class: 'input sm mono', value: it.value, placeholder: '留空＝同名',
+                      onInput: e => { it.value = e.target.value; touch() }
+                    })),
+                    h('td', {}, h('div', {
+                      class: ['switch', it.enabled ? 'on' : ''],
+                      title: it.enabled ? '停用后不再下发给表单' : '启用',
+                      onClick: () => { it.enabled = it.enabled ? 0 : 1; touch() }
+                    })),
+                    h('td', { class: 'nowrap' }, h('div', { class: 'flex', style: 'gap:2px' }, [
+                      h('button', { class: 'btn ghost sm', onClick: () => moveSibling(it, -1) }, '↑'),
+                      h('button', { class: 'btn ghost sm', onClick: () => moveSibling(it, 1) }, '↓')
+                    ])),
+                    h('td', {}, h('div', { class: 'flex', style: 'gap:2px' }, [
+                      h('button', { class: 'btn ghost sm', title: '在此项下加一个子项', onClick: () => addChild(it) }, '+'),
+                      h('button', { class: 'btn ghost sm danger', onClick: () => removeRow(draft.value.indexOf(it)) }, '删除')
+                    ]))
+                  ])
+                }))
               ])) : h('div', { class: 'card-b' }, h(Empty, { text: '这套字典还没有选项' }))
             ]) : null
           ]),
@@ -244,7 +361,7 @@ export default {
       importOpen.value ? Modal({
         title: '粘贴导入选项', modelValue: true, onClose: () => importOpen.value = false,
         children: [
-          h('div', { class: 'hint mb' }, '一行一项。只有名称就写名称；需要单独的存储值时写成「名称|值」（也认逗号和制表符分隔）。已有的值会自动跳过。'),
+          h('div', { class: 'hint mb' }, '一行一项。只有名称就写名称；需要单独的存储值时写成「名称|值」，级联再补一段上级「名称|值|上级的值」。已有的值会自动跳过。'),
           h('textarea', {
             class: 'textarea mono', style: 'min-height:220px',
             placeholder: '初中及以下\n高中 / 中专\n本科|bachelor\n硕士',

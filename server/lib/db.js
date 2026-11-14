@@ -281,6 +281,14 @@ ensureColumns('api_keys', { owner_id: 'INTEGER NOT NULL DEFAULT 0' })
  */
 ensureColumns('questions', { props: "TEXT NOT NULL DEFAULT '{}'" })
 
+/*
+ * 字典项也要能带层级。
+ * 级联选择（省 / 市 / 区）和字典本来是同一件事的两种说法：都是「一批固定选项」，
+ * 区别只是前者有父子关系。字典没有 parent，级联选项就只能一张表里手工敲一遍，
+ * 「学历」「行业」能集中维护、「行政区」却不能——这说不过去。
+ */
+ensureColumns('dict_items', { parent: "TEXT NOT NULL DEFAULT ''" })
+
 // 改密码之后旧会话必须失效：以前换了密码，别人手里那条 7 天有效的 Cookie 照用不误。
 ensureColumns('users', { pwd_changed_at: 'TEXT', position_id: 'INTEGER NOT NULL DEFAULT 0' })
 

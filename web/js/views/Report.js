@@ -53,7 +53,9 @@ export default {
         if (!el) continue
         const chart = window.echarts.init(el, null, { renderer: 'canvas' })
         charts.push(chart)
+        // 级联这类「完整路径很长」的题，图上用短名，悬停给全路径
         const names = q.series.map(s => s.name)
+        const fullNames = q.series.map(s => s.full || s.name)
         const values = q.series.map(s => s.value)
         const isPie = ['radio', 'select', 'carousel', 'checkbox'].includes(q.type) && q.series.length <= 8
         const hasData = q.series.some(s2 => Number(s2.value) > 0)
@@ -62,19 +64,28 @@ export default {
         const opt = type === 'pie'
           ? {
               color: PALETTE,
-              tooltip: { trigger: 'item', formatter: '{b}: {c} ({d}%)' },
+              tooltip: { trigger: 'item', formatter: (p) => `${p.name}: ${p.value} (${p.percent}%)` },
               legend: { bottom: 0, textStyle: { color: axisColor, fontSize: 11 } },
               series: [{
                 type: 'pie', radius: ['42%', '68%'], center: ['50%', '44%'],
-                data: q.series.filter(s2 => s2.value > 0).map(s2 => ({ name: s2.name, value: s2.value, itemStyle: { color: PALETTE[q.series.indexOf(s2) % PALETTE.length] } })),
+                data: q.series.filter(s2 => s2.value > 0).map(s2 => ({ name: s2.name, value: s2.value, full: s2.full || s2.name, itemStyle: { color: PALETTE[q.series.indexOf(s2) % PALETTE.length] } })),
                 label: { color: axisColor, fontSize: 11 }
               }]
             }
           : {
               color: [PALETTE[0]],
-              grid: { left: 12, right: 16, top: 24, bottom: 8, containLabel: true },
-              tooltip: { trigger: 'axis' },
-              xAxis: { type: 'category', data: names, axisLabel: { color: axisColor, fontSize: 11, interval: 0, rotate: names.join('').length > 24 ? 30 : 0 }, axisLine: { lineStyle: { color: splitColor } } },
+              grid: { left: 12, right: 20, top: 24, bottom: 8, containLabel: true },
+              tooltip: { trigger: 'axis', formatter: (ps) => ps.map(p => `${fullNames[p.dataIndex] ?? p.name}: ${p.value}`).join('<br/>') },
+              xAxis: {
+                type: 'category', data: names,
+                // 长标签（级联的「杭州市·西湖区」、选项很长的单选题）斜着放，
+                // 并给足底部留白：只改 rotate 的话首个标签会被裁掉左半截
+                axisLabel: {
+                  color: axisColor, fontSize: 11, interval: 0,
+                  rotate: names.some(n => String(n).length > 6) ? 38 : 0
+                },
+                axisLine: { lineStyle: { color: splitColor } }
+              },
               yAxis: { type: 'value', minInterval: 1, axisLabel: { color: axisColor, fontSize: 11 }, splitLine: { lineStyle: { color: splitColor } } },
               series: [{
                 type, data: values, smooth: true, barMaxWidth: 34,

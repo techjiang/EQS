@@ -6,6 +6,7 @@ import { ok, err, confirmBox, promptBox } from '../ui.js'
 import { FIELD_GROUPS, blankField, fieldMeta, hasOptions, defaultData, uid } from '../fields.js'
 import { renderControl, FormRenderer, fieldVisible } from '../renderer.js'
 import { OP_LABELS } from '../flow.js'
+import { cascadeFlat, cascadeChildren, cascadeDepth, pruneCascade } from '../cascade.js'
 import { state } from '../store.js'
 
 
@@ -299,11 +300,13 @@ export default {
       if (!f || !code) return
       try {
         const r = await api.get(`/api/public/dicts/${encodeURIComponent(code)}`)
-        const opts = r.data.options || []
+        // 剪掉「上级被停用 / 删掉」的子孙：它们在自己那棵树里已经没有落脚点，
+        // 硬提到顶级会让人看到「西湖区」和「浙江省」并排出现在第一个下拉里
+        const opts = f.type === 'cascader' ? pruneCascade(r.data.options || []) : (r.data.options || [])
         if (!opts.length) return err('这套字典里没有启用的选项')
         const old = new Set((f.answer || []).map(String))
         const keep = opts.filter(o => old.has(String(o.value))).map(o => String(o.value))
-        f.options = opts.map(o => ({ label: o.label, value: String(o.value) }))
+        f.options = opts.map(o => (o.parent ? { label: o.label, value: String(o.value), parent: String(o.parent) } : { label: o.label, value: String(o.value) }))
         // 标准答案只保留还存在的选项：字典里删掉的项留着，就是一道「谁答都错」的题
         f.answer = (f.answer || []).filter(a => opts.some(o => String(o.value) === String(a)))
         f.props = { ...(f.props || {}), dict: code }
@@ -334,6 +337,80 @@ export default {
     }
 
     /* ---------- 右侧检查器 ---------- */
+    /**
+     * 级联选择的选项编辑器。
+     *
+     * 选项仍是 {label, value, parent}，但在这里按「深度优先」顺序展示并缩进：
+     * 一行一个「父级下拉 + 名称」，父级下拉只列「不是自己、也不是自己子孙」的项——
+     * 让 A 挂到自己的孙子下面，是唯一能把这棵树变成环的操作。
+     */
+    const cascaderInspector = (f) => {
+      const flat = cascadeFlat(f.options)
+      const descendantsOf = (value) => {
+        const set = new Set()
+        const walk = (v) => {
+          for (const o of cascadeChildren(f.options, v)) {
+            if (set.has(o.value)) continue
+            set.add(o.value)
+            walk(o.value)
+          }
+        }
+        walk(value)
+        return set
+      }
+      const depth = cascadeDepth(f.options)
+      // flat 是副本，改值要落回 f.options 里的那个对象
+      const find = (item) => f.options.find(o => o.value === item.value && o.label === item.label)
+      const addChild = (item) => {
+        const base = '选项'
+        let n = f.options.length + 1
+        while (f.options.some(o => o.value === `${base} ${n}`)) n++
+        f.options.push({ label: `${base} ${n}`, value: `${base} ${n}`, parent: item ? item.value : '' })
+      }
+      return h('div', { class: 'field' }, [
+        h('label', { class: 'flex between' }, [
+          h('span', {}, `级联选项${depth ? `（${depth} 层）` : ''}`),
+          h('div', { class: 'flex', style: 'gap:4px' }, [
+            dicts.value.length ? h('select', {
+              class: 'select', style: 'height:26px;width:auto;font-size:12px;padding:0 6px',
+              value: '', onChange: e => { const c = e.target.value; e.target.value = ''; if (c) applyDict(c) }
+            }, [h('option', { value: '' }, '从字典取用…'), ...dicts.value.map(d => h('option', { value: d.code }, d.name))]) : null,
+            h('button', { class: 'btn ghost sm', onClick: () => addChild(null) }, '+ 顶级')
+          ])
+        ]),
+        f.props?.dict ? h('div', { class: 'dict-badge', style: 'margin-bottom:8px' }, [
+          h('span', { class: 'tag brand' }, '字典：' + (dicts.value.find(d => d.code === f.props.dict)?.name || f.props.dict)),
+          h('button', { class: 'btn ghost sm', onClick: () => syncDict(f) }, '同步'),
+          h('button', { class: 'btn ghost sm', onClick: () => unbindDict(f) }, '解除')
+        ]) : null,
+        h('div', { class: 'hint', style: 'margin-bottom:6px' }, '层级靠「上级」这一列决定；作答只存最末一级的值，报表与导出会自动展开成完整路径。'),
+        !flat.length ? h('div', { class: 'hint' }, '还没有选项，先加一个顶级选项') : null,
+        flat.map((item, i) => {
+          const cur = find(item) || item
+          const banned = descendantsOf(cur.value)
+          banned.add(cur.value)
+          const candidates = flat.filter(x => !banned.has(x.value))
+          return h('div', { class: 'opt-row', style: 'align-items:flex-start' }, [
+            h('div', { style: `width:${Math.min(item.depth, 4) * 12}px;flex:none;text-align:right;color:var(--text-3);font-size:11px;line-height:32px` }, item.depth ? '└' : ''),
+            h('div', { style: 'flex:1;min-width:0' }, [
+              h('input', {
+                class: 'input', value: cur.label, placeholder: '例如：浙江省',
+                onInput: e => { cur.label = e.target.value; cur.value = e.target.value }
+              }),
+              h('select', {
+                class: 'select', style: 'height:24px;font-size:11px;margin-top:3px;color:var(--text-3)',
+                value: cur.parent || '',
+                onChange: e => { cur.parent = e.target.value }
+              }, [h('option', { value: '' }, '顶级'), ...candidates.map(x => h('option', { value: x.value }, '上级：' + (x.label || x.value)))])
+            ]),
+            h('button', { class: 'btn ghost sm', title: '在此项下加子项', onClick: () => addChild(cur) }, '+'),
+            h('button', { onClick: () => { const at = f.options.indexOf(cur); if (at >= 0) f.options.splice(at, 1) } }, '×')
+          ])
+        }),
+        h('div', { class: 'hint', style: 'margin-top:4px' }, '删除一项时它的子项不会跟着消失，会退化成顶级选项——比一起删掉更不容易出事。')
+      ])
+    }
+
     const fieldInspector = () => {
       const f = active.value
       if (!f) return h('div', { class: 'muted small center', style: 'padding:30px 0' }, '选中左侧题目后可编辑属性')
@@ -347,7 +424,8 @@ export default {
         ])),
         row('提示文字', h('input', { class: 'input', value: f.placeholder, placeholder: '输入框占位符', onInput: e => f.placeholder = e.target.value })),
         row('说明', h('input', { class: 'input', value: f.description, placeholder: '题目下方的说明', onInput: e => f.description = e.target.value })),
-        hasOptions(f.type) && f.type !== 'matrix' ? h('div', { class: 'field' }, [
+        f.type === 'cascader' ? cascaderInspector(f) : null,
+        hasOptions(f.type) && f.type !== 'matrix' && f.type !== 'cascader' ? h('div', { class: 'field' }, [
           h('label', { class: 'flex between' }, [
             h('span', {}, '选项'),
             h('div', { class: 'flex', style: 'gap:4px' }, [

@@ -2972,6 +2972,220 @@ try {
     assert(anon.status === 401, '未登录不能读字典管理接口')
   }
 
+  console.log('\n[63] 级联选择：真的双向联动，不是三个平级下拉')
+  {
+    const { cascadeChildren, cascadePathOf, cascadeLabelPath, normalizeCascade, pruneCascade, cascadeDepth, cascadeFlat } = await import('../web/js/cascade.js')
+
+    const tree = [
+      { label: '浙江省', value: 'zj' },
+      { label: '杭州市', value: 'hz', parent: 'zj' },
+      { label: '西湖区', value: 'xh', parent: 'hz' },
+      { label: '江苏省', value: 'js' },
+      { label: '南京市', value: 'nj', parent: 'js' }
+    ]
+    assert(cascadeDepth(tree) === 3, '三级选项树算出 3 层', String(cascadeDepth(tree)))
+    assert(cascadeChildren(tree, '').length === 2, '顶级只列省，不把市和区漏到第一层')
+    assert(cascadeChildren(tree, 'zj').map(o => o.value).join() === 'hz', '选省后只列该省的市')
+    assert(cascadePathOf(tree, 'xh').join('/') === 'zj/hz/xh', '末级值能倒推出完整路径')
+    assert(cascadeLabelPath(tree, 'xh') === '浙江省 / 杭州市 / 西湖区', '路径渲染成可读文字')
+    // 老表单：三个平级选项、没有 parent，应当退化成一级下拉而不是崩掉
+    assert(cascadeDepth([{ label: 'a', value: 'a' }, { label: 'b', value: 'b' }]) === 1, '没有 parent 的老选项退化成一级')
+
+    // 脏数据：上级不存在 → 提成顶级，选项不能凭空消失
+    const orphan = normalizeCascade([{ label: '孤儿', value: 'x', parent: 'nope' }])
+    assert(orphan.length === 1 && orphan[0].parent === '', '上级不存在时选项仍在，退化成顶级')
+    // 脏数据：A 父 B、B 父 A → 断环，否则渲染时无限递归
+    const cyc = normalizeCascade([{ label: 'a', value: 'a', parent: 'b' }, { label: 'b', value: 'b', parent: 'a' }])
+    assert(cyc.some(o => o.parent === ''), '父子成环被断开')
+
+    // 从字典取用时：上级被停用，子孙跟着消失（提成顶级会让「西湖区」和「浙江省」并排出现）
+    const pruned = pruneCascade([
+      { label: '浙江省', value: 'zj' },
+      { label: '西湖区', value: 'xh', parent: 'hz' },
+      { label: '江苏省', value: 'js' }
+    ])
+    assert(!pruned.some(o => o.value === 'xh'), '上级被停用的子孙不进入选项树')
+    assert(pruned.some(o => o.value === 'zj') && pruned.some(o => o.value === 'js'), '其余选项保留')
+
+    // 设计器里的展平顺序：子项紧跟父项，缩进即层级
+    const flat = cascadeFlat(tree)
+    assert(flat.map(o => o.value).join() === 'zj,hz,xh,js,nj', '展平顺序是深度优先', flat.map(o => o.value).join())
+    assert(flat[2].depth === 2, '层级深度正确')
+
+    // ---- 落库：parent 必须挺过 normalizeField
+    const formRes = await req('POST', '/api/forms', {
+      title: '级联选择测试', kind: 'survey', status: 'published',
+      schema: [{
+        id: 'cas', type: 'cascader', label: '所在地区', required: true, options: tree
+      }]
+    })
+    assert(formRes.status === 201, '含级联题的表单创建成功')
+    const casForm = formRes.json.id
+    const back = await req('GET', `/api/forms/${casForm}`)
+    const casField = back.json.data.schema.find(f => f.id === 'cas')
+    assert(casField.options.filter(o => o.parent).length === 3, 'parent 存下来没被抹平', JSON.stringify(casField.options))
+    assert(casField.options.length === 5, '选项一个不少')
+
+    // 填写页下发的 schema 也要带 parent：不带的话页面只能画出一个平级下拉
+    const pub = await fetch(BASE + `/api/public/forms/${casForm}`)
+    const pubJson = await pub.json()
+    const pubCas = pubJson.data.schema.find(f => f.id === 'cas')
+    assert(pubCas.options.filter(o => o.parent).length === 3, '公开页拿到的选项带层级')
+
+    // 提交末级值 → 报表按末级统计，导出铺成完整路径
+    const sub = await fetch(BASE + `/api/public/forms/${casForm}/submit`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ data: { cas: 'xh' } })
+    })
+    assert(sub.status === 201 || sub.status === 200, '提交末级选项成功', String(sub.status))
+    const report = await req('GET', `/api/forms/${casForm}/report`)
+    const q = report.json.data.questions.find(x => x.id === 'cas')
+    assert(q && q.series.length === 1, '报表只统计被人选过的末级项', JSON.stringify(q?.series))
+    // 图上只写末级名（完整路径在 tooltip / full 字段里）：三级全铺在 x 轴上会被截掉
+    assert(q.series[0].name === '西湖区', '报表里图上用末级名', q?.series?.[0]?.name)
+    assert(q.series[0].full === '浙江省 / 杭州市 / 西湖区', '完整路径随题项一起给出（tooltip 用）', q?.series?.[0]?.full)
+    assert(q.series[0].value === 1, '计数正确')
+
+    const { answerText, isAnswerCorrect } = await import('../server/lib/forms.js')
+    const { submissionRow } = await import('../server/lib/sheet.js')
+    const field = { type: 'cascader', options: tree, answer: ['xh'] }
+    assert(answerText(field, 'xh') === '浙江省 / 杭州市 / 西湖区', '答卷详情里显示完整路径')
+    assert(isAnswerCorrect(field, 'xh') === true, '判分仍按末级值比对（口径没变）')
+    assert(isAnswerCorrect(field, 'hz') === false, '选了上一级不算对')
+    // 导出：一列「西湖区」在外人看来不知道是哪儿，必须铺成完整路径
+    const expRow = submissionRow({ kind: 'survey' }, [{ id: 'cas', type: 'cascader', label: '地区', options: tree }], {
+      id: 1, created_at: '2026-01-01T00:00:00Z', data: { cas: 'xh' }, score: null, passed: null
+    })
+    assert(expRow[2] === '浙江省 / 杭州市 / 西湖区', '导出的 Excel 里是完整路径', expRow[2])
+
+    // ---- 字典带层级：级联选项也能集中维护
+    const dict = await req('POST', '/api/dicts', {
+      name: '测试行政区', code: 'test_region',
+      items: [
+        { label: '浙江省', value: 'zj' },
+        { label: '杭州市', value: 'hz', parent: 'zj' },
+        { label: '西湖区', value: 'xh', parent: 'hz' }
+      ]
+    })
+    assert(dict.status === 201, '级联字典创建成功')
+    assert(dict.json.data.items.filter(i => i.parent).length === 2, '字典项的 parent 落库', JSON.stringify(dict.json.data.items))
+
+    const pubDict = await fetch(BASE + '/api/public/dicts/test_region')
+    const pubDictJson = await pubDict.json()
+    assert(pubDictJson.data.options.filter(o => o.parent).length === 2, '公开字典把 parent 一并下发（设计器取用要还原层级）')
+
+    // 上级写一个不存在的值 → 挡住，否则这项在级联里永远不出现
+    const badParent = await req('POST', '/api/dicts/test_region/items', { label: '无名', value: 'wm', parent: 'ghost' })
+    assert(badParent.status === 400, '上级不存在时拒绝新增', String(badParent.status))
+    const selfParent = await req('POST', '/api/dicts/test_region/items', { label: '自环', value: 'self', parent: 'self' })
+    assert(selfParent.status === 400, '自己当自己的上级被拒绝')
+
+    // 把自己的下级设成上级 = 造环
+    const loop = await req('PUT', '/api/dicts/test_region/items/' + dict.json.data.items.find(i => i.value === 'zj').id, { parent: 'xh' })
+    assert(loop.status === 400, '下级不能变成自己的上级', String(loop.status))
+
+    // 删中间一层：子项提成顶级而不是跟着消失
+    const hzId = dict.json.data.items.find(i => i.value === 'hz').id
+    const delMid = await req('DELETE', `/api/dicts/test_region/items/${hzId}`)
+    assert(delMid.status === 200 && delMid.json.orphans === 1, '删中间项回报被提级的子项数', JSON.stringify(delMid.json))
+    const afterDel = await req('GET', '/api/dicts/test_region')
+    const xhItem = afterDel.json.data.items.find(i => i.value === 'xh')
+    assert(xhItem && xhItem.parent === '', '子项提成顶级，选项没丢')
+
+    // 改名连带子项的 parent：改一个 value 把整棵子树弄丢，是最难解释的那种 bug
+    await req('PUT', '/api/dicts/test_region/items', {
+      items: [{ label: '江苏省', value: 'js' }, { label: '南京市', value: 'nj', parent: 'js' }]
+    })
+    const jsId = (await req('GET', '/api/dicts/test_region')).json.data.items.find(i => i.value === 'js').id
+    await req('PUT', `/api/dicts/test_region/items/${jsId}`, { value: 'jiangsu' })
+    const renamed = await req('GET', '/api/dicts/test_region')
+    const nj = renamed.json.data.items.find(i => i.value === 'nj')
+    assert(nj.parent === 'jiangsu', '改上级的值，子项的 parent 跟着改', nj.parent)
+
+    // 批量替换时上级写错：不报错，修正成顶级并回报，一条坏数据不该让 200 项都存不进去
+    const bulk = await req('PUT', '/api/dicts/test_region/items', {
+      items: [{ label: '浙江省', value: 'zj' }, { label: '孤儿', value: 'g', parent: 'nope' }]
+    })
+    assert(bulk.status === 200, '上级写错时批量保存仍成功')
+    assert(bulk.json.notes.length === 1 && bulk.json.data.find(i => i.value === 'g').parent === '', '坏上级被修正并回报', JSON.stringify(bulk.json.notes))
+
+    // ---- Excel 导入导出
+    const exp = await fetch(BASE + '/api/dicts/test_region/export.xlsx', { headers: { Cookie: cookie } })
+    assert(exp.status === 200, '导出字典 xlsx 成功')
+    const buf = Buffer.from(await exp.arrayBuffer())
+    assert(buf.slice(0, 2).toString() === 'PK', '导出的确实是 xlsx（zip 头）')
+    const { readXlsx } = await import('../server/lib/xlsx.js')
+    const rows = readXlsx(buf)
+    assert(rows[0].join() === '显示名称,存储值,上级,启用,排序', '表头可读，能直接当模板用', rows[0].join())
+    assert(rows.some(r => r[0] === '浙江省' && r[1] === 'zj'), '导出的表里有真实数据')
+
+    // 导回去：追加语义，已有的值跳过
+    const back2 = await fetch(BASE + '/api/dicts/test_region/import-xlsx', {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/octet-stream' },
+      body: buf
+    })
+    const backJson = await back2.json()
+    assert(back2.status === 200, '导回 xlsx 成功', JSON.stringify(backJson).slice(0, 120))
+    assert(backJson.added === 0 && backJson.skipped === 2, '导出再导回：一行都没重复写入', JSON.stringify({ added: backJson.added, skipped: backJson.skipped }))
+
+    // 换一张新表，带层级关系导进去
+    const { buildXlsx } = await import('../server/lib/xlsx.js')
+    const xbuf = buildXlsx('行政区', [
+      ['显示名称', '存储值', '上级', '启用', '排序'],
+      ['广东省', 'gd', '', '是', 10],
+      ['广州市', 'gz', 'gd', '是', 20],
+      ['天河区', 'th', 'gz', '是', 30],
+      ['已停用项', 'off', '', '否', 40],
+      ['孤儿', 'orph', 'ghost', '是', 50]
+    ])
+    const impX = await fetch(BASE + '/api/dicts/test_region/import-xlsx', {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/octet-stream' },
+      body: xbuf
+    })
+    const impXJson = await impX.json()
+    assert(impX.status === 200, 'Excel 导入成功')
+    assert(impXJson.added === 5, '五行全部入库', String(impXJson.added))
+    const imported = await req('GET', '/api/dicts/test_region')
+    const th = imported.json.data.items.find(i => i.value === 'th')
+    assert(th && th.parent === 'gz', '导入的层级关系正确', JSON.stringify(th))
+    const offItem = imported.json.data.items.find(i => i.value === 'off')
+    assert(offItem && offItem.enabled === 0, '「启用」列写「否」导入为停用')
+    const orph = imported.json.data.items.find(i => i.value === 'orph')
+    assert(orph && orph.parent === '', '导入时上级不存在的那项被修正为顶级')
+    assert(impXJson.notes.length >= 1, '修正动作有回报', JSON.stringify(impXJson.notes))
+
+    // 普通用户不能导 Excel（写操作）
+    const ck2 = await asUser('dictuser', 'dict-pass-123')
+    const denyImp = await fetch(BASE + '/api/dicts/test_region/import-xlsx', {
+      method: 'POST', headers: { Cookie: ck2, 'Content-Type': 'application/octet-stream' }, body: xbuf
+    })
+    assert(denyImp.status === 403, '普通用户不能导入字典 Excel', String(denyImp.status))
+
+    // 从字典取用到级联题：剪掉孤儿后是一棵完整的树
+    const boundForm = await req('POST', '/api/forms', {
+      title: '级联绑定字典', kind: 'survey',
+      schema: [{
+        id: 'c2', type: 'cascader', label: '地区', options: [], props: { dict: 'test_region' }
+      }]
+    })
+    const bid = boundForm.json.id
+    await req('PUT', `/api/forms/${bid}`, {
+      schema: [{
+        id: 'c2', type: 'cascader', label: '地区', props: { dict: 'test_region' },
+        options: [
+          { label: '广东省', value: 'gd' }, { label: '广州市', value: 'gz', parent: 'gd' }
+        ]
+      }]
+    })
+    await req('POST', `/api/forms/${bid}/sync-dict`, {})
+    const syncBack = await req('GET', `/api/forms/${bid}`)
+    const c2 = syncBack.json.data.schema.find(f => f.id === 'c2')
+    const gzAfter = c2.options.find(o => o.value === 'gz')
+    assert(gzAfter && gzAfter.parent === 'gd', '字典同步后层级仍在（不会塌成平铺）', JSON.stringify(gzAfter))
+  }
+
   console.log('\n[44] 前端静态资源')
 
   for (const p of ['/', '/js/main.js', '/css/app.css', '/js/views/Logs.js', '/js/views/Dicts.js', '/assets/eqs-mark.svg', '/vendor/echarts.min.js']) {

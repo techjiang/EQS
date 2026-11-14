@@ -31,9 +31,54 @@ export function listItems(code, { onlyEnabled = false } = {}) {
   return all(`SELECT * FROM dict_items WHERE type_code = ? ${onlyEnabled ? 'AND enabled = 1' : ''} ORDER BY sort, id`, code)
 }
 
-/** 字典项转成表单选项：value 空着就用 label，与设计器手写选项的行为保持一致 */
+/**
+ * 字典项转成表单选项：value 空着就用 label，与设计器手写选项的行为保持一致。
+ * 带 parent 的项原样带出去——级联选择从字典取用时要靠它还原层级，
+ * 少了这一个字段，取用的结果永远是「一堆平级选项」。
+ */
 export function itemsToOptions(items) {
-  return items.map(i => ({ label: i.label, value: String(i.value || i.label) }))
+  return items.map(i => {
+    const opt = { label: i.label, value: String(i.value || i.label) }
+    if (i.parent) opt.parent = String(i.parent)
+    return opt
+  })
+}
+
+/**
+ * 校验一批字典项的父子关系。
+ *
+ * 三种情况都必须在写库前挡住，否则级联选择里会直接看到后果：
+ *  - parent 指向本字典里不存在的值：这一项永远不出现在任何下拉里，等于被静默删了；
+ *  - A 的父是 B、B 的父是 A：渲染时无限循环；
+ *  - 自己当自己的父：同上，只是更容易被发现。
+ * 返回清洗后的列表和需要告诉用户的提示。
+ */
+export function sanitizeParents(items) {
+  const values = new Set(items.map(i => String(i.value)))
+  const notes = []
+  const byValue = new Map(items.map(i => [String(i.value), i]))
+  const cleaned = items.map(i => ({ ...i }))
+  for (const it of cleaned) {
+    if (!it.parent) continue
+    if (it.parent === it.value) { notes.push(`「${it.label}」不能以自己为上级`); it.parent = ''; continue }
+    if (!values.has(it.parent)) { notes.push(`「${it.label}」的上级已不存在，已改为顶级`); it.parent = '' }
+  }
+  // 逐条往上走，走回自己就是环
+  for (const it of cleaned) {
+    const seen = new Set([it.value])
+    let cur = it
+    let guard = 0
+    while (cur.parent && guard++ < 500) {
+      if (seen.has(cur.parent)) {
+        if (cur === it) notes.push(`「${it.label}」的上级关系成环，已改为顶级`)
+        it.parent = ''
+        break
+      }
+      seen.add(cur.parent)
+      cur = byValue.get(cur.parent) || { parent: '' }
+    }
+  }
+  return { items: cleaned, notes }
 }
 
 /**
