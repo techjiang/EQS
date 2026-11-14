@@ -5,7 +5,7 @@ import { ok, err, confirmBox, fmtDate, Empty, Modal, Pagination, escapeHtml } fr
 import { Icon } from '../icons.js'
 import { renderControl, answerDisplay } from '../renderer.js'
 import { buildFlow } from '../flow.js'
-import { batchPayload, nextIndex, reviewProgress, afterSave, elapsedSeconds, changeText, changeLine, humanSeconds, gapLevel } from '../review.js'
+import { batchPayload, nextIndex, reviewProgress, afterSave, elapsedSeconds, changeText, changeLine, humanSeconds, gapLevel, bandText } from '../review.js'
 
 export default {
   setup() {
@@ -632,6 +632,17 @@ export default {
                 h('td', { class: 'nowrap stick-score' }, r.score != null
                   ? h('span', {}, [
                       h('span', { class: ['tag', r.passed ? 'ok' : 'warn'] }, String(r.score)),
+                      /*
+                       * 分数区间挨着分数写。尺度对账已经把「谁偏松」摆出来了，
+                       * 但列表里那个 71 看着还是一个精确的数字——读者不知道该信几成。
+                       * 只有真的被两位老师给出过不同的分才有区间，没有就不占这一格。
+                       */
+                      r.band && r.band.spread > 0
+                        ? h('span', {
+                            class: 'tag', style: 'margin-left:4px',
+                            title: `有题目被两位老师给出不同分数，换个尺子总分会在 ${r.band.low} ~ ${r.band.high} 之间`
+                          }, `≈${r.band.low}~${r.band.high}`)
+                        : null,
                       // 「谁批的」比「批过了」更重要：一封卷子两道题分差得离谱时，
                       // 先要知道这是不是一个人给的
                       r.reviewed_at
@@ -672,6 +683,10 @@ export default {
           // 作答环境先摆出来：切屏次数、耗时、IP 是「这份卷子可不可信」的第一手线索
           h('div', { class: 'flex wrap small muted mb', style: 'gap:14px' }, [
             h('span', {}, `提交时间 ${fmtDate(detail.value.created_at)}`),
+            // 详情页要跟列表说同一句话：列表里写「71 ≈59~71」，这里只写 71，两处数字对不上最伤信任
+            detail.value.band && detail.value.band.spread > 0
+              ? h('span', {}, `得分 ${bandText(detail.value.band)}`)
+              : null,
             detail.value.duration ? h('span', {}, `耗时 ${Math.round(detail.value.duration / 60)} 分钟`) : null,
             detail.value.switch_count !== null && detail.value.switch_count !== undefined
               ? h('span', { style: detail.value.flagged ? 'color:var(--danger)' : '' }, `切屏 ${detail.value.switch_count} 次${detail.value.flagged ? '（异常）' : ''}`)
@@ -735,6 +750,21 @@ export default {
               h('b', { style: 'font-size:14px;line-height:1.5' }, it.label),
               h('span', { class: 'tag', style: 'white-space:nowrap;flex:none' }, `满分 ${it.score}`)
             ]),
+            /*
+             * 这题被别人给过别的分，就在这里说清楚。
+             * 不然老师只看到「当前 17 分」，回头在尺度页上发现同题有人给 5 分，
+             * 想改又不知道改多少——分叉的口径必须在给分的那一刻就摆在眼前。
+             */
+            (() => {
+              const row = review.value.band?.items?.find(x => x.id === it.id)
+              if (!row) return null
+              return h('div', { class: 'small', style: 'margin-top:6px;color:var(--text-2)' }, [
+                h('span', { class: 'tag warn' }, '尺子不一'),
+                h('span', { style: 'margin-left:6px' },
+                  row.by.map(p2 => `${p2.name || '未知账号'} ${p2.value} 分`).join(' · ') +
+                  `，换成另一位老师是 ${row.low} ~ ${row.high} 分`)
+              ])
+            })(),
             h('div', { class: 'small muted', style: 'margin:8px 0 4px' }, '作答'),
             h('div', { style: 'white-space:pre-wrap;word-break:break-word;margin-bottom:8px' },
               it.given == null || it.given === '' ? h('span', { class: 'muted' }, '（未作答）') : String(it.given)),
@@ -801,6 +831,17 @@ export default {
              */
             h('div', { class: 'small muted', style: 'margin-top:6px' },
               '同一个人给的分没被人改过就不会留痕，所以这里只统计「被后一位老师改过」的地方——它是下限，不是全部。'),
+            /*
+             * 把「18 处分歧」换算成成绩单上的话：几份卷子的总分因此带上了区间、最大浮动多少。
+             * 抽象的分歧数读者得自己换算成「所以呢」，而这两句是直接可读的结论。
+             */
+            calibration.value.bands?.submissions
+              ? h('div', { class: 'small', style: 'margin-top:8px;padding:8px 12px;background:var(--panel-2);border-radius:8px' }, [
+                  h('b', {}, `${calibration.value.bands.submissions} 份卷子`),
+                  `的成绩单因此带了区间，最大浮动 ${calibration.value.bands.maxSpread} 分——`,
+                  '答卷列表与导出里，这些卷子会写成「71 ≈59~71」，表示换另一位老师批会是这个范围。'
+                ])
+              : null,
             calibration.value.questions?.length ? h('div', { style: 'margin-top:12px' }, [
               ...calibration.value.questions.map(q => h('div', {
                 class: 'calib-row', style: 'padding:12px 14px;border:1px solid var(--line);border-radius:10px;margin-bottom:10px'
@@ -909,6 +950,16 @@ export default {
                 h('div', { style: 'font-size:13.5px;line-height:1.5' }, it.label),
                 h('span', { class: 'tag', style: 'flex:none' }, `满分 ${it.score}`)
               ]),
+              /*
+               * 这题别人给过别的分，就在敲键盘之前说清楚。
+               * 尺度页上说「李老师偏松 4.61 分」是回头看的结论；批到第 6 页时，
+               * 老师要的是「这一份、这一题，之前有人给了几」——不然第三个口径又是随手定的。
+               */
+              it.others?.length ? h('div', { class: 'small', style: 'margin-top:4px' }, [
+                h('span', { class: 'tag warn' }, '尺子不一'),
+                h('span', { style: 'margin-left:6px;color:var(--text-2)' },
+                  it.others.map(p2 => `${p2.name || '未知账号'} ${p2.value} 分`).join(' · '))
+              ]) : null,
               h('div', {
                 style: 'white-space:pre-wrap;word-break:break-word;margin:6px 0 8px;font-size:13px;color:var(--text-2)'
               }, it.given ? it.given : h('span', { class: 'muted' }, '（未作答）')),

@@ -233,7 +233,19 @@ export default {
                     style: 'font-variant-numeric:tabular-nums'
                   }, String(r.rank))),
                   h('td', {}, r.name || '匿名考生'),
-                  h('td', {}, h('b', {}, String(r.score))),
+                  h('td', {}, h('div', { class: 'flex', style: 'gap:5px;align-items:baseline' }, [
+                    h('b', {}, String(r.score)),
+                    /*
+                     * 区间挨着分数写，不是塞进 tooltip：名次是「按分数排的」，
+                     * 而分数可能来自不同的尺子——第 3 名 78、第 4 名 77，若区间分别是
+                     * 70~78 和 71~84，那 1 分之差什么也没说明。摆出区间就是在说这件事。
+                     */
+                    r.band && r.band.spread > 0
+                      ? h('span', {
+                          class: 'small muted', title: '这道卷子有题目被两位老师给出不同分数，换个尺子总分会在区间内变动'
+                        }, `≈ ${r.band.low} ~ ${r.band.high}`)
+                      : null
+                  ])),
                   // 待批阅的卷子可判分总分更低、及格线也低，所以「50 分通过、48 分未通过」不是判错
                   h('td', {}, h('div', { class: 'flex', style: 'gap:5px' }, [
                     h('span', { class: ['tag', r.passed ? 'ok' : 'danger'] }, r.passed ? '通过' : '未通过'),

@@ -34,6 +34,7 @@ import { notifySubmission, dispatchWebhooks } from '../lib/notify.js'
 import { formRole, submissionVisibleScope, requireFormRole } from '../lib/formMembers.js'
 import { rateLimit, publicLimit } from '../lib/guard.js'
 import { rankingTop, rankOf, publicRanking, distributionOf } from '../lib/ranking.js'
+import { bandsOf, crossedBySubmission, formBandReader } from '../lib/bands.js'
 import { submissionsXlsx, submissionsHead, submissionRow } from '../lib/sheet.js'
 import { writeXlsxStream } from '../lib/xlsx.js'
 import { signFileUrl, signFileUrls, signHtmlFiles, QUERY_FILE_TTL } from '../lib/fileAccess.js'
@@ -583,7 +584,22 @@ export default function register(r) {
       return { ...base2, pending: pendingLeft(formCache.get(row.form_id), row), reviewer }
     }
     const nameOf = reviewerNames(rows)
-    sendJson(res, 200, { ok: true, data: rows.map(withPending), total, page: p.page, pageSize: p.pageSize, totalPages: p.totalPages })
+    /*
+     * 分数区间整页一次算完。
+     * 「同一道题张老师给 5 分、李老师给 17 分」这件事，尺度对账已经能看出来，
+     * 但成绩单上照旧只有一个精确的 71——读者不知道该信几成。这里给每行带上区间，
+     * 留痕按这一页的 id 一次查完：一行一次就是 20 次索引扫描。
+     */
+    const rowsByForm = new Map()
+    for (const row of rows) {
+      if (row.form_kind !== 'exam' || !row.form_id) continue
+      if (!rowsByForm.has(row.form_id)) rowsByForm.set(row.form_id, [])
+      rowsByForm.get(row.form_id).push(row)
+    }
+    const bandsByForm = new Map()
+    for (const [fid, group] of rowsByForm) bandsByForm.set(fid, bandsOf(pickForm(fid), group))
+    const bandOf = (row) => (row.form_kind === 'exam' ? bandsByForm.get(row.form_id)?.get(Number(row.id)) || null : null)
+    sendJson(res, 200, { ok: true, data: rows.map(r => ({ ...withPending(r), band: bandOf(r) })), total, page: p.page, pageSize: p.pageSize, totalPages: p.totalPages })
   })
 
   r.get('/api/submissions/:id', async (req, res, { params }) => {
@@ -596,7 +612,9 @@ export default function register(r) {
     const reviewer = reviewerNames([row])(row.reviewed_by)
     // 批阅历史跟着详情一起给：批阅弹窗打开就要显示「上次谁批的、改了什么」，
     // 再单独发一次请求会让弹窗先空一下再补上，等于把两次渲染拼在人眼前
-    sendJson(res, 200, { ok: true, data: { ...withManual(row), reviewer, review_logs: reviewLogs(row.id, 20), form } })
+    // 分数区间同一口径算：详情页说「71 分」，弹窗里说「59 ~ 71」，两处数字对不上最伤信任
+    const band = form ? bandsOf(form, [row]).get(Number(row.id)) || null : null
+    sendJson(res, 200, { ok: true, data: { ...withManual(row), reviewer, band, review_logs: reviewLogs(row.id, 20), form } })
   })
 
   /** 一份答卷的批阅历史（按次倒序）：谁、什么时候、动了哪几题、从几分改到几分 */
@@ -802,10 +820,19 @@ export default function register(r) {
     }
     const page = queue.slice(offset, offset + limit)
     const nameOfReviewer = reviewerNames(page)
+    /*
+     * 别人对这题给过多少分。
+     *
+     * 「谁偏松」在尺度页上能看出来，但批到第 6 页时已经没人记得住那些名字——
+     * 而分叉的口径必须在给分的那一刻摆在眼前：这一份同题有人给 5、有人给 17，
+     * 我正在敲的这个数字落进去，就是第三种口径。
+     */
+    const crossed = crossedBySubmission(form, page)
     const data = page.map(row => {
       const answers = JSON.parse(row.data)
       const manual = manualScoresOf(row)
       const flow = buildFlow(form.schema, answers)
+      const cross = new Map((crossed.get(Number(row.id)) || []).map(x => [x.id, x]))
       const items = form.schema
         .filter(f => isSubjective(f) && flow.active.has(f.id))
         .map(f => ({
@@ -814,7 +841,10 @@ export default function register(r) {
           given: answerText(f, answers[f.id]) || '',
           givenRaw: answers[f.id] === undefined ? null : answers[f.id],
           analysis: f.analysis || '',
-          current: manual[f.id] === undefined ? null : manual[f.id]
+          current: manual[f.id] === undefined ? null : manual[f.id],
+          // 这道题被两个人给出过不同的分：把两个人各自的分一并递出去
+          // （刚被撤分的题也一样给——总分里没有它了，但口径分歧还在）
+          others: cross.get(f.id)?.by || null
         }))
       return {
         id: row.id, publicId: row.public_id, createdAt: row.created_at,
@@ -959,6 +989,16 @@ export default function register(r) {
     const url = new URL(req.url, 'http://x')
     const limit = Number(url.searchParams.get('limit')) || 20
     const top = rankingTop(form.id, limit, form)
+    /*
+     * 榜单上也要带区间：名次是「按分数排的」，而分数的尺子可能不齐——
+     * 第 3 名 78 分、第 4 名 77 分，如果两个人的区间分别是 70~78 和 71~84，
+     * 那个「1 分之差」其实什么也没说明。不给区间，名次就在暗示一个不存在的精确度。
+     */
+    const bands = bandsOf(form, top)
+    for (const r of top) {
+      r.band = bands.get(Number(r.id)) || null
+      delete r.manual_scores
+    }
     const total = get('SELECT COUNT(*) c FROM submissions WHERE form_id = ? AND deleted_at IS NULL AND score IS NOT NULL', form.id).c
     sendJson(res, 200, {
       ok: true,
@@ -1012,6 +1052,8 @@ export default function register(r) {
      * 导出沿用同一个 where（列名裸露、没有表别名），JOIN 之后 id / created_at 立刻变成歧义列，
      * 而要改的就是「按时间范围导出」这种最常用的语句。外层仍叫 submissions，where 一个字不用动。
      */
+    // 留痕一次读完按行取：导出是流式的，但批阅留痕不能跟着每行查一次
+    const bandOf = formBandReader(form)
     const cursor = each(`SELECT id, public_id, data, score, passed, created_at, reviewed_at, switch_count, flagged,
       (SELECT COALESCE(NULLIF(u.nickname, ''), u.username, '') FROM users u WHERE u.id = submissions.reviewed_by) AS reviewer_name
       FROM submissions WHERE ${where.join(' AND ')} ORDER BY id DESC`, ...args)
@@ -1024,7 +1066,7 @@ export default function register(r) {
             if (first) { first = false; return { done: false, value: head } }
             const r = it.next()
             if (r.done) return { done: true }
-            return { done: false, value: submissionRow(form, schema, { ...r.value, data: safeJson(r.value.data, {}) }) }
+            return { done: false, value: submissionRow(form, schema, { ...r.value, data: safeJson(r.value.data, {}), band: bandOf(r.value) }) }
           }
         }
       }

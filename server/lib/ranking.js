@@ -49,6 +49,9 @@ export function rankingTop(formId, limit = 20, form = null) {
       name: row.wx_nickname || row.nickname || (row.user_id ? row.username : '') || '',
       // 只对 N 行算，不扫全表；没有 form 对象时（调用方没传）就不查这一项
       pending: form ? pendingLeft(form, { data: row.data, manual_scores: row.manual_scores }) : 0,
+      // 逐题人工分只用来算分数区间，调用方算完要摘掉：
+      // 榜单是给「看名次」的人看的，不该顺手把每道题谁给了几分一起递出去
+      manual_scores: row.manual_scores,
       rank
     }
   })

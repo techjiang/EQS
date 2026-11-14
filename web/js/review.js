@@ -154,6 +154,40 @@ export function elapsedSeconds(from, to, max = 6 * 3600) {
 }
 
 /**
+ * 回放批阅留痕：每一格（答卷 × 题目）最后是谁给了几分。
+ *
+ * 尺度对账和分数区间是同一份回放的两个出口：一个回头看「两个人差多远」，
+ * 一个往前算「换成另一个人批，这份卷子会是几分」。写成两遍必然分叉——
+ * 一处把撤分当 0 分、另一处不当，整张成绩单就会自相矛盾。
+ */
+function replayCells(entries = []) {
+  const who = (e) => (Number(e.userId) > 0 ? `u${e.userId}` : `n${e.username || '?'}`)
+  // (答卷, 题目) → { id, label, by: Map(老师 → { name, value, at }), current }
+  const cells = new Map()
+  const teachers = new Map()
+  entries.forEach((e, i) => {
+    const key = who(e)
+    if (!teachers.has(key)) teachers.set(key, { name: e.username || '未知账号', gradings: 0 })
+    for (const c of e.changes || []) {
+      const ck = `${e.submissionId}::${c.id}`
+      if (!cells.has(ck)) cells.set(ck, { submissionId: Number(e.submissionId), id: c.id, label: c.label || c.id, by: new Map(), seq: -1, current: null })
+      const cell = cells.get(ck)
+      const value = c.to === undefined ? null : c.to
+      // 后写的覆盖先写的：留痕按时间排，「这名老师最后给了几分」才是他现在的口径
+      cell.by.set(key, { name: teachers.get(key).name, value, at: e.createdAt || '' })
+      /*
+       * 每格另外记一份「最后一次写入」。不能靠 by 的顺序取：
+       * 同一位老师改第二遍时 Map 里那一项还在原位，顺序是第一次出现的顺序——
+       * 拿它当时间序，会把「先批的人的分」当成现在的分。
+       */
+      if (i >= cell.seq) { cell.seq = i; cell.current = { name: teachers.get(key).name, value } }
+    }
+    if ((e.changes || []).length) teachers.get(key).gradings++
+  })
+  return { cells, teachers }
+}
+
+/**
  * 评分尺度：同一份卷子的同一道题，被两位老师分别给过分，差了多少。
  *
  * 留痕能追到「谁批的、改了什么」，但两个人对同一题给出 4 分和 18 分时，
@@ -174,22 +208,7 @@ export function elapsedSeconds(from, to, max = 6 * 3600) {
  * 把撤分当 0 算，一次误操作就会让整张尺子歪掉。
  */
 export function calibrate(entries, { maxOf = () => 0 } = {}) {
-  const who = (e) => (Number(e.userId) > 0 ? `u${e.userId}` : `n${e.username || '?'}`)
-  // (答卷, 题目) → { id, label, by: Map(老师 → { name, value, at }) }
-  const cells = new Map()
-  const teachers = new Map()
-  for (const e of entries || []) {
-    const key = who(e)
-    if (!teachers.has(key)) teachers.set(key, { name: e.username || '未知账号', gradings: 0 })
-    for (const c of e.changes || []) {
-      const ck = `${e.submissionId}::${c.id}`
-      if (!cells.has(ck)) cells.set(ck, { submissionId: Number(e.submissionId), id: c.id, label: c.label || c.id, by: new Map() })
-      const cell = cells.get(ck)
-      // 后写的覆盖先写的：留痕是按时间排的，「最后给了几分」才是这名老师现在的口径
-      cell.by.set(key, { name: teachers.get(key).name, value: c.to === undefined ? null : c.to, at: e.createdAt || '' })
-    }
-    if ((e.changes || []).length) teachers.get(key).gradings++
-  }
+  const { cells, teachers } = replayCells(entries)
 
   const questions = new Map()
   const pairs = new Map()
@@ -238,13 +257,38 @@ export function calibrate(entries, { maxOf = () => 0 } = {}) {
     }))
     .sort((a, b) => (b.worst?.gap || 0) - (a.worst?.gap || 0))
 
+  /*
+   * 这些分歧在成绩单上长什么样。
+   *
+   * 「18 处分歧」是个抽象数字，读者得自己换算成「所以呢」。这里直接算：
+   * 有几份卷子的总分因此带上了区间、最大浮动多少分——
+   * 浮动额就是各格 (最高分 − 最低分) 相加，与当前记着几分无关，
+   * 所以这里不需要读答卷，光靠留痕就对得上成绩单上那个区间。
+   */
+  let banded = 0
+  let maxSpread = 0
+  const spreadOf = new Map()
+  for (const cell of cells.values()) {
+    const c = crossInfo(cell)
+    if (!c) continue
+    // 这题现在没有分（还没批 / 被撤分），总分里本来就不含它，不该算进浮动——
+    // 与 scoreBand 同一条判据，否则这里报「3 份卷子带区间」、成绩单上却是 2 份
+    if (cell.current?.value === null || cell.current?.value === undefined) continue
+    spreadOf.set(cell.submissionId, (spreadOf.get(cell.submissionId) || 0) + (c.max - c.min))
+  }
+  for (const v of spreadOf.values()) {
+    banded++
+    maxSpread = Math.max(maxSpread, v)
+  }
+
   return {
     conflicts,
     questions: list,
     pairs: [...pairs.values()]
       .map(p => ({ ...p, avgGap: p.count ? Math.round((Math.abs(p.sum) / p.count) * 100) / 100 : 0, bias: p.count ? Math.round((p.sum / p.count) * 100) / 100 : 0 }))
       .sort((a, b) => b.count - a.count || b.maxGap - a.maxGap),
-    teachers: [...teachers.values()].sort((a, b) => b.gradings - a.gradings)
+    teachers: [...teachers.values()].sort((a, b) => b.gradings - a.gradings),
+    bands: { submissions: banded, maxSpread: Math.round(maxSpread * 100) / 100 }
   }
 }
 
@@ -261,4 +305,96 @@ export function gapLevel(gap, max) {
   if (r >= 0.3) return '明显'
   if (r >= 0.15) return '值得看一眼'
   return '轻微'
+}
+
+/**
+ * 哪些格子的尺子不齐：同一份卷子的同一道题，被两位以上老师给过不同的分。
+ *
+ * 这是「分数带区间」和「阅卷时提醒别人给过几分」共用的那一份判据。
+ * 写两遍就会分叉：一处把撤分当 0 分、一处不当，界面上的提醒和成绩单上的区间对不上，
+ * 而读者只会得出一个结论——这些数字都是猜的。
+ */
+export function crossedOf(entries) {
+  const out = new Map()   // submissionId → [ { id, label, min, max, by } ]
+  for (const cell of replayCells(entries).cells.values()) {
+    const c = crossInfo(cell)
+    if (!c) continue
+    if (!out.has(cell.submissionId)) out.set(cell.submissionId, [])
+    out.get(cell.submissionId).push(c)
+  }
+  return out
+}
+
+/** 这一格的尺子齐不齐。不齐就给出两端与每个人各自的分，齐（或只有一个人）就返回 null */
+function crossInfo(cell) {
+  // 撤分（to: null）是「这个人对这格没有分数」，不是 0 分：
+  // 一次误操作就能让成绩单上的区间凭空宽出一整题的分
+  const by = [...cell.by.values()].filter(v => v.value !== null && v.value !== undefined)
+    .map(v => ({ name: v.name, value: Number(v.value) }))
+  if (by.length < 2) return null
+  const values = by.map(v => v.value)
+  const min = Math.min(...values)
+  const max = Math.max(...values)
+  // 两个人都给 8 分不是「尺子不齐」：这题换谁批都一样，不该在成绩单上留一个区间
+  if (min === max) return null
+  return { id: cell.id, label: cell.label, min, max, by }
+}
+
+/**
+ * 成绩单上的尺子：把「同一道题两个人差多远」折成这份卷子的分数区间。
+ *
+ * 尺度对账能看出李老师偏松，但成绩单上只有一个孤零零的 71 分：
+ * 没人知道这个 71 是严格尺子给的还是宽松尺子给的。同一道题张老师给 5 分、
+ * 李老师给 17 分，那这份卷子的总分本来就该是「71 分，上下浮动一个区间」，
+ * 而不是一个精确到小数点后两位的数字。
+ *
+ * 区间的意思要说清楚：**它不是「这个分数有误差」，而是「换另一个人批会是几分」**。
+ * 所以只对「同一份卷子同一道题、被两位以上老师给过不同的分」的格子做折算，
+ * 其余格子照旧按现在的分算——没被第二个人批过的题，谁也不知道换个人会怎么给，
+ * 把它的分也算成一个区间就是在编数字。
+ *
+ * 还没批（或被撤分）的格子不参与：总分里本来就没有它的分，
+ * 拿区间去「预测」一个不存在的分，只会算出比满分还高的区间。
+ */
+export function scoreBand(entries, { maxOf = () => 0, score = null, manual = {} } = {}) {
+  const base = Number(score)
+  if (!Number.isFinite(base)) return null
+  const items = []
+  let low = base
+  let high = base
+  const round = v => Math.round(v * 100) / 100
+  for (const cell of [...crossedOf(entries).values()].flat()) {
+    const raw = manual?.[cell.id]
+    // 这题现在没有分（还没批 / 被撤分）：总分里本来就不含它，不该算进区间
+    if (raw === undefined || raw === null || raw === '') continue
+    const cur = Number(raw)
+    if (!Number.isFinite(cur)) continue
+    // 位移是相对「这题现在记着的分」算的：区间要套在真实成绩上，而不是另算一个总分
+    const floor = Math.min(cell.min, cur)
+    const ceil = Math.max(cell.max, cur)
+    low += floor - cur
+    high += ceil - cur
+    items.push({
+      id: cell.id, label: cell.label, max: Number(maxOf(cell.id)) || 0,
+      cur, low: floor, high: ceil, by: cell.by
+    })
+  }
+  if (!items.length) return null
+  return {
+    score: round(base),
+    // 下界不能是负分：一道题浮动 -18 分就能把总分压到 0 以下，而负分不是成绩
+    low: round(Math.max(low, 0)),
+    high: round(high),
+    spread: round(high - Math.max(low, 0)),
+    // 浮动最大的那题排前面：一眼要看到是哪道题把区间撑开的
+    items: items.sort((a, b) => (b.high - b.low) - (a.high - a.low))
+  }
+}
+
+/** 分数区间的一句话：71 分（68 ~ 75）；没有区间时只说分数 */
+export function bandText(band) {
+  if (!band) return ''
+  const n = v => String(Math.round(Number(v) * 100) / 100)
+  if (!(band.spread > 0)) return `${n(band.score)} 分`
+  return `${n(band.score)} 分（${n(band.low)} ~ ${n(band.high)}）`
 }

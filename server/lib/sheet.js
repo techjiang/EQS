@@ -259,13 +259,16 @@ export function submissionRow(form, schema, r) {
     r.flagged ? '异常' : '',
     // 批阅人：导出的表格常被转给不在这套系统里的人看，
     // 「已批阅」三个字不够用——问道「是谁批的」时得能在表里找到人
-    r.reviewer_name || ''
+    r.reviewer_name || '',
+    // 分数区间：只在这份卷子有「同一道题被两位老师给出不同分」时才填。
+    // 空白格不是「0 分」，是「换个尺子也不会变」——两者混成一个数字，表格就没人敢信了
+    r.band && r.band.spread > 0 ? `${r.band.low} ~ ${r.band.high}` : ''
   ]
 }
 
 export function submissionsHead(form) {
   const schema = (form.schema || []).filter(f => !['divider', 'richtext', 'html', 'image'].includes(f.type))
-  return { schema, head: ['答卷编号', '提交时间', ...schema.map(f => f.label), '得分', '是否通过', '批阅状态', '切屏次数', '异常标记', '批阅人'] }
+  return { schema, head: ['答卷编号', '提交时间', ...schema.map(f => f.label), '得分', '是否通过', '批阅状态', '切屏次数', '异常标记', '批阅人', '分数区间'] }
 }
 
 export function submissionsXlsx(form, rows) {

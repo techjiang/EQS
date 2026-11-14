@@ -4557,6 +4557,198 @@ try {
     cookie = holder
   }
 
+
+  console.log('\n[69] 成绩单上的尺子：分数带区间')
+  {
+    // ---- 纯函数：区间是「换个人批会是几分」，不是「这个分有误差」
+    {
+      const { scoreBand, bandText, calibrate } = await import('../web/js/review.js')
+      const mk = (sub, uid, name, changes) => ({ submissionId: sub, userId: uid, username: name, createdAt: 't', changes })
+
+      let b = scoreBand([
+        mk(1, 1, '张老师', [{ id: 'q1', label: '计划', from: null, to: 5 }]),
+        mk(1, 2, '李老师', [{ id: 'q1', label: '计划', from: 5, to: 17 }])
+      ], { maxOf: () => 20, score: 71, manual: { q1: 17 } })
+      assert(b && b.low === 59 && b.high === 71 && b.spread === 12, '同一题 5 分 vs 17 分：总分从 71 浮动到 59 ~ 71',
+        JSON.stringify(b))
+      assert(b.items.length === 1 && b.items[0].id === 'q1', '撑开区间的是哪道题要说出来', JSON.stringify(b.items))
+      assert(b.items[0].by.map(x => x.value).sort((x, y) => x - y).join(',') === '5,17',
+        '并排列出两个人各自的分（平均成 11 分就看不出是 5 和 17）', JSON.stringify(b.items[0].by))
+
+      // 两个人都给 17 分：没有区间。区间只表示「换个尺子会差多少」，不是「这个分不准」
+      b = scoreBand([
+        mk(1, 1, '张老师', [{ id: 'q1', from: null, to: 17 }]),
+        mk(1, 2, '李老师', [{ id: 'q1', from: 17, to: 17 }])
+      ], { maxOf: () => 20, score: 71, manual: { q1: 17 } })
+      assert(b === null, '两个人给一样的分 → 没有区间', JSON.stringify(b))
+
+      // 只有一个人批过的题不参与：谁也不知道换个人会怎么给，把它算成区间就是在编数字
+      b = scoreBand([
+        mk(1, 1, '张老师', [{ id: 'q1', from: null, to: 17 }])
+      ], { maxOf: () => 20, score: 71, manual: { q1: 17, q2: 10 } })
+      assert(b === null, '只有一个人批过的题不产生区间', JSON.stringify(b))
+
+      // 撤分（to: null）不参与：总分里本来就没有它的分，拿它算会得出比满分还高的区间
+      b = scoreBand([
+        mk(1, 1, '张老师', [{ id: 'q1', from: null, to: 5 }]),
+        mk(1, 2, '李老师', [{ id: 'q1', from: 5, to: 17 }]),
+        mk(1, 3, '王老师', [{ id: 'q1', from: 17, to: null }])
+      ], { maxOf: () => 20, score: 71, manual: { q1: 17 } })
+      assert(b && b.low === 59, '撤分的人不进区间的两端', JSON.stringify(b))
+
+      // 当前分比两个人的分都低：区间要往两头撑，而不是只往一个方向
+      b = scoreBand([
+        mk(1, 1, '张老师', [{ id: 'q1', from: null, to: 12 }]),
+        mk(1, 2, '李老师', [{ id: 'q1', from: 12, to: 16 }])
+      ], { maxOf: () => 20, score: 40, manual: { q1: 8 } })
+      // 当前 8 分、两个人给过 12 / 16：换个人批是 +4 或 +8，所以是这个范围；
+      // 当前分本身也在区间内（8 是下界），读者不会看到「71 分不在 71 的区间里」这种自相矛盾的账
+      assert(b && b.low === 40 && b.high === 48 && b.items[0].low === 8 && b.items[0].high === 16,
+        '当前分落在两人给的分数之外时，区间仍以它为端点', JSON.stringify(b))
+
+      // 下界不能是负分：一道题浮动 -18 分就能把总分压到 0 以下，而负分不是成绩
+      b = scoreBand([
+        mk(1, 1, '张老师', [{ id: 'q1', from: null, to: 0 }]),
+        mk(1, 2, '李老师', [{ id: 'q1', from: 0, to: 18 }])
+      ], { maxOf: () => 20, score: 6, manual: { q1: 18 } })
+      assert(b && b.low === 0, '区间下界封在 0 分，不出现负分', JSON.stringify(b))
+
+      // 没有成绩（还没判分）就没有区间
+      assert(scoreBand([], { score: null }) === null, '没有总分就没有区间')
+
+      // 一句话的写法
+      assert(bandText({ score: 71, low: 59, high: 71, spread: 12 }) === '71 分（59 ~ 71）', '区间的人话写法')
+      assert(bandText({ score: 71, low: 71, high: 71, spread: 0 }) === '71 分', '没有浮动时只说分数')
+
+      // 尺度对账顺带报「成绩单上长什么样」：几份卷子带区间、最大浮动多少
+      const cal = calibrate([
+        mk(1, 1, '张老师', [{ id: 'q1', label: 'A', from: null, to: 5 }]),
+        mk(1, 2, '李老师', [{ id: 'q1', label: 'A', from: 5, to: 17 }]),
+        mk(1, 2, '李老师', [{ id: 'q2', label: 'B', from: null, to: 3 }]),
+        mk(1, 1, '张老师', [{ id: 'q2', label: 'B', from: 3, to: 9 }]),
+        mk(2, 1, '张老师', [{ id: 'q1', label: 'A', from: null, to: 8 }])
+      ], { maxOf: () => 20 })
+      assert(cal.bands.submissions === 1, '只有 1 份卷子（#1）的分数会因为尺子不齐而浮动', JSON.stringify(cal.bands))
+      assert(cal.bands.maxSpread === 18, '浮动额是各题差距相加（12 + 6 = 18）', JSON.stringify(cal.bands))
+    }
+
+    // ---- 接口：列表、详情、导出、榜单、批量阅卷都带上区间
+    let r = await req('POST', '/api/forms', {
+      title: '成绩单区间卷', kind: 'exam',
+      schema: [
+        { id: 'b1', type: 'textarea', label: '简述取舍理由', answer: [], score: 20 },
+        { id: 'b2', type: 'textarea', label: '复盘教训', answer: [], score: 10 }
+      ],
+      settings: { passPercent: 60 }
+    })
+    const bid = r.json.id
+    await req('PUT', `/api/forms/${bid}`, { status: 'published' })
+    const bs = []
+    for (let i = 0; i < 2; i++) {
+      r = await req('POST', `/api/public/forms/${bid}/submit`, { data: { b1: `理由 ${i}`, b2: `教训 ${i}` } })
+      bs.push(r.json.id)
+    }
+    const adminB = cookie
+    await req('POST', '/api/auth/register', { username: 'band_b', password: 'bb-pass-123', nickname: '王老师' })
+    // 注册会把全局 cookie 换成新账号，这里要先切回管理员再加协作，
+    // 否则「拉人进协作者」这一步就成了新账号自己去拉自己（403 无权访问该表单）
+    cookie = adminB
+    const addB = await req('POST', `/api/forms/${bid}/members`, { username: 'band_b', role: 'editor' })
+    assert(addB.status === 201, '把第二位老师拉进这张卷子', JSON.stringify(addB.json))
+    const wang = await asUser('band_b', 'bb-pass-123')
+
+    // 管理员先批：b1 给 4 分、b2 给 2 分
+    cookie = adminB
+    r = await req('PUT', `/api/submissions/${bs[0]}/review`, { scores: { b1: 4, b2: 2 } })
+    assert(r.status === 200 && r.json.data.score === 6, '第一份卷子得 6 分', JSON.stringify(r.json.data?.score))
+
+    // 还没被第二个人改过：没有区间
+    r = await req('GET', `/api/submissions/${bs[0]}`)
+    assert(r.json.data.band === null, '只有一个人批过时没有区间', JSON.stringify(r.json.data?.band))
+
+    // 王老师对同一份同一题给出 16 分 / 9 分 → 总分 25，区间往回拉到 6 ~ 25
+    r = await call(wang, 'PUT', `/api/submissions/${bs[0]}/review`, { scores: { b1: 16, b2: 9 } })
+    assert(r.status === 200 && r.json.data.score === 25, '王老师改后总分 25', JSON.stringify(r.json.data?.score))
+    cookie = adminB
+    r = await req('GET', `/api/submissions/${bs[0]}`)
+    const dband = r.json.data.band
+    assert(dband && dband.low === 6 && dband.high === 25, '详情里给出区间 6 ~ 25（换个人批会差 19 分）', JSON.stringify(dband))
+    assert(dband.items.length === 2, '两题都被改过，各占一条', JSON.stringify(dband.items?.length))
+
+    // 列表里也带（列表是「扫一眼」的地方，不可能为了看区间逐份点开）
+    r = await req('GET', `/api/submissions?formId=${bid}&pageSize=20`)
+    const rowB = r.json.data.find(x => x.id === bs[0])
+    assert(rowB && rowB.band && rowB.band.high === 25, '答卷列表里带分数区间', JSON.stringify(rowB?.band))
+
+    // 导出：一列「分数区间」。表格常被转给系统外的人看，
+    // 「71 分」和「71 分（59~71）」在这种场合差别很大——后者才说明这分不是唯一答案
+    const { submissionsHead } = await import('../server/lib/sheet.js')
+    assert(submissionsHead({ kind: 'exam', schema: [] }).head.includes('分数区间'), '导出的列头里有「分数区间」')
+    const xlsx = await req('GET', `/api/forms/${bid}/submissions.xlsx`)
+    assert(xlsx.status === 200, '带区间的导出仍然可用')
+    const { submissionRow } = await import('../server/lib/sheet.js')
+    const expRow = submissionRow({ kind: 'exam', schema: [] }, [], {
+      id: bs[0], public_id: 'x', created_at: '2026-11-14T00:00:00Z', data: {}, score: 25, passed: 1,
+      band: { score: 25, low: 6, high: 25, spread: 19 }
+    })
+    assert(expRow[expRow.length - 1] === '6 ~ 25', '导出里写「6 ~ 25」', JSON.stringify(expRow[expRow.length - 1]))
+    const noBand = submissionRow({ kind: 'exam', schema: [] }, [], {
+      id: 2, public_id: 'y', created_at: '2026-11-14T00:00:00Z', data: {}, score: 20, passed: 1, band: null
+    })
+    assert(noBand[noBand.length - 1] === '', '没有区间的卷子留空格，不写 0 ——「不会变」和「0 分」不是一件事',
+      JSON.stringify(noBand[noBand.length - 1]))
+
+    // 榜单：名次是按分数排的，分数带区间时那个「只差 1 分」可能什么也没说明
+    r = await req('GET', `/api/forms/${bid}/ranking?limit=20`)
+    const topRow = r.json.data.top.find(x => x.id === bs[0])
+    assert(topRow && topRow.band && topRow.band.low === 6, '榜单上带分数区间', JSON.stringify(topRow?.band))
+    assert(topRow.manual_scores === undefined, '榜单不顺手把逐题人工分一起递出去', JSON.stringify(Object.keys(topRow)))
+
+    /*
+     * 批量阅卷里逐题给出「别人给过几分」：分叉的口径要在给分那一刻摆在眼前。
+     * 场景是真实的那种——一份卷子两题，b1 被两位老师先后改过（4 分 → 16 分），
+     * b2 还没人批。这份卷子会留在待批队列里（因为 b2），而 b1 那一段必须写着两个人的分：
+     * 不然第三个来批的人只看到「当前 16 分」，回头才知道有人给过 4 分。
+     */
+    r = await req('POST', `/api/public/forms/${bid}/submit`, { data: { b1: '第三人', b2: '第三人' } })
+    const third = r.json.id
+    r = await req('PUT', `/api/submissions/${third}/review`, { scores: { b1: 4 } })
+    r = await call(wang, 'PUT', `/api/submissions/${third}/review`, { scores: { b1: 16 } })
+    cookie = adminB
+    r = await req('GET', `/api/forms/${bid}/review-queue?limit=10&offset=0`)
+    const qrow = r.json.data.find(x => x.id === third)
+    assert(qrow, '还有题没批的卷子留在待批队列里', JSON.stringify(r.json.data?.map(x => x.id)))
+    const qb1 = qrow.items.find(i => i.id === 'b1')
+    assert(qb1.others && qb1.others.length === 2, '阅卷队列里逐题给出「别人给过几分」', JSON.stringify(qb1))
+    assert(qb1.others.map(x => x.value).sort((a, b) => a - b).join(',') === '4,16',
+      '两个人各自的分都在，不用前端再算一遍', JSON.stringify(qb1.others))
+    assert(qrow.items.find(i => i.id === 'b2').others === null, '没人改过的题不带这条提醒', JSON.stringify(qrow.items.find(i => i.id === 'b2')?.others))
+
+    // 尺度对账把分歧换算成成绩单上的一句话
+    r = await req('GET', `/api/forms/${bid}/review-calibration`)
+    assert(r.status === 200 && r.json.data.bands.submissions >= 1, '尺度对账报出「几份卷子的分数带区间」',
+      JSON.stringify(r.json.data?.bands))
+    assert(r.json.data.bands.maxSpread >= 19, '并报出最大浮动多少分', JSON.stringify(r.json.data?.bands))
+
+    // 问卷：人工分不存在，也就没有区间
+    r = await req('POST', '/api/forms', { title: '区间问卷', kind: 'survey', schema: [] })
+    const sform = r.json.id
+    r = await req('GET', `/api/submissions?formId=${sform}`)
+    assert(r.json.data.every(x => !x.band), '问卷答卷不带分数区间', JSON.stringify(r.json.data?.map(x => x.band)))
+
+    // 公开查询页不给考生看区间：一句「你的 71 分可能是 59 分」在真实学校里只会变成一次申诉，
+    // 而它本来是用来看「老师们的尺子齐不齐」的
+    const cur = await req('GET', `/api/forms/${bid}`)
+    await req('PUT', `/api/forms/${bid}`, { settings: { ...cur.json.data.settings, allowQuery: true } })
+    // 查询只认不可猜的答卷编号（public_id），不认自增 id——那是老数据的退路
+    const pub = await req('GET', `/api/submissions/${bs[0]}`)
+    r = await req('GET', `/api/public/forms/${bid}/query?submissionId=${pub.json.data.public_id}`)
+    assert(r.status === 200, '开放查询后考生能查自己的答卷', `${r.status} ${r.json?.message || ''}`)
+    assert(r.json.data.band === undefined, '公开查询不把区间给考生（这是给管理端看尺子的，不是给考生看的）',
+      JSON.stringify(Object.keys(r.json.data || {})))
+    cookie = adminB
+  }
+
   console.log('\n[44] 阅卷键盘：能提交什么、Enter 往哪走')
 
   {
