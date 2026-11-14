@@ -130,7 +130,13 @@ sudo nginx -s reload
 EQS 的所有状态都在 `data/` 目录里：`eqs.db`（数据库）和 `files/`（上传文件）。
 
 **方式一：后台导出**
-系统设置 → 系统与备份 → 导出备份，得到一个 ZIP 包；导入同一个 ZIP 即恢复，重启服务后生效。
+系统设置 → 系统与备份 → 导出备份，得到一个 ZIP 包；导入同一个 ZIP 当场生效（不用重启）。
+
+- 导出是**流式**的：边读边压边发，内存不随数据量涨。几个 G 的附件目录也一样能导
+- 包里带一份 `manifest.json`（版本、导出时间、各表行数、数据库 sha256），排查「这个包是什么时候的」不用解压猜
+- 导入前会校验包里的 `eqs.db`：文件头、`integrity_check`、核心表齐全，通不过就当场拦下，不会拿坏库顶替
+- 顶替前自动存一份快照（`data/.backups/`），页面下方「可回滚快照」一键撤回，回滚本身也能再撤回
+- 单次导入上限 8GB（请求体流式落盘，不受普通接口 64MB 的限制）
 
 **方式二：直接打包目录**
 
@@ -200,7 +206,10 @@ bash scripts/start.sh                        # 启动即完成迁移
 | `GET` | `/api/forms/:id/report` | 报表统计 |
 | `GET` | `/api/submissions?formId=1` | 答卷列表 |
 | `GET` | `/api/sync/export?formId=1&sinceId=0&limit=1000` | 增量数据同步（游标分页） |
-| `GET` | `/api/backup/export` | 备份导出 |
+| `GET` | `/api/backup/export` | 备份导出（流式 zip） |
+| `POST` | `/api/backup/import` | 备份导入（先校验、后顶替，自动存快照） |
+| `GET` | `/api/backup/snapshots` | 可回滚快照列表 |
+| `POST` | `/api/backup/rollback` | 回滚到指定快照（默认最近一份） |
 | `GET` | `/api/health` | 健康检查 |
 
 ## 技术栈

@@ -238,3 +238,85 @@ export async function writeZipStream(entries, out) {
   await send(end)
   return { entries: entries.length, bytes: offset }
 }
+
+/* ---------------- 随机访问式解包 ----------------
+ *
+ * 上面的 readZipEntries 要求整个 zip 在内存里。备份包动辄几百 MB 甚至几 GB，
+ * 而现在导入接口又必须先把包收下来才能校验——「文件多大就得吃多大内存」这条路走不通。
+ *
+ * 所以另开一条：先把 zip 落到磁盘，再从尾部读中央目录拿到各条目的偏移与压缩后大小，
+ * 需要哪个条目就按偏移 range 读哪一段。内存只跟单块大小有关。
+ */
+export function openZipFile(filePath) {
+  const fd = fs.openSync(filePath, 'r')
+  try {
+    const size = fs.fstatSync(fd).size
+    if (size < 22) return null
+    const tailLen = Math.min(size, 22 + 0xffff)
+    const tail = Buffer.alloc(tailLen)
+    fs.readSync(fd, tail, 0, tailLen, size - tailLen)
+    let eocd = -1
+    for (let i = tail.length - 22; i >= 0; i--) {
+      if (tail.readUInt32LE(i) === 0x06054b50) { eocd = i; break }
+    }
+    if (eocd < 0) return null
+    const count = tail.readUInt16LE(eocd + 10)
+    const cdSize = tail.readUInt32LE(eocd + 12)
+    const cdOffset = tail.readUInt32LE(eocd + 16)
+    if (cdOffset + cdSize > size) return null
+    const cd = Buffer.alloc(cdSize)
+    fs.readSync(fd, cd, 0, cdSize, cdOffset)
+    const entries = []
+    let at = 0
+    for (let i = 0; i < count; i++) {
+      if (at + 46 > cd.length || cd.readUInt32LE(at) !== 0x02014b50) break
+      const method = cd.readUInt16LE(at + 10)
+      const crc = cd.readUInt32LE(at + 16)
+      const compSize = cd.readUInt32LE(at + 20)
+      const uncompSize = cd.readUInt32LE(at + 24)
+      const nameLen = cd.readUInt16LE(at + 28)
+      const extraLen = cd.readUInt16LE(at + 30)
+      const commentLen = cd.readUInt16LE(at + 32)
+      const localOffset = cd.readUInt32LE(at + 42)
+      const name = cd.slice(at + 46, at + 46 + nameLen).toString('utf8')
+      at += 46 + nameLen + extraLen + commentLen
+      // zip64 的字段是 0xffffffff 占位，靠 extra 里的真实值；EQS 自己产不出这么大的单条目，直接跳过
+      if (compSize === 0xffffffff || localOffset === 0xffffffff) continue
+      entries.push({ name, method, crc, compSize, uncompSize, localOffset })
+    }
+    return { filePath, size, entries }
+  } finally {
+    fs.closeSync(fd)
+  }
+}
+
+/**
+ * 把 zip 里的单个条目解到指定文件。
+ * 压缩后大小取自中央目录——用流式写出的包在本地头里是 0（bit 3），只能信中央目录。
+ */
+export async function extractZipEntryToFile(zip, entry, destPath) {
+  const { pipeline } = await import('node:stream/promises')
+  const { Transform } = await import('node:stream')
+  const zlibmod = await import('node:zlib')
+  const fd = fs.openSync(zip.filePath, 'r')
+  let start = 0
+  try {
+    const lh = Buffer.alloc(30)
+    fs.readSync(fd, lh, 0, 30, entry.localOffset)
+    if (lh.readUInt32LE(0) !== 0x04034b50) throw new Error(`ZIP 条目损坏：${entry.name}`)
+    start = entry.localOffset + 30 + lh.readUInt16LE(26) + lh.readUInt16LE(28)
+  } finally {
+    fs.closeSync(fd)
+  }
+  if (start + entry.compSize > zip.size) throw new Error(`ZIP 条目越界：${entry.name}`)
+  let crc = 0xffffffff
+  let written = 0
+  const meter = new Transform({
+    transform(chunk, _enc, cb) { crc = crc32Update(crc, chunk); written += chunk.length; cb(null, chunk) }
+  })
+  const src = fs.createReadStream(zip.filePath, { start, end: start + entry.compSize - 1 })
+  await pipeline(src, ...(entry.method === 8 ? [zlibmod.createInflateRaw()] : []), meter, fs.createWriteStream(destPath))
+  if (entry.uncompSize && written !== entry.uncompSize) throw new Error(`ZIP 条目长度不符：${entry.name}`)
+  if (((crc ^ 0xffffffff) >>> 0) !== entry.crc) throw new Error(`ZIP 条目校验失败：${entry.name}`)
+  return { bytes: written }
+}

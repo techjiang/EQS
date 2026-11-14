@@ -550,20 +550,31 @@ try {
   {
     // WAL 模式下新数据先落 eqs.db-wal，eqs.db 主文件可能还是空的。
     // 之前导出不做 checkpoint，备份包里的 eqs.db 是个没有表的空壳——「备份成功，恢复全空」。
+    // 现在导出走流式（deflate + 数据描述符），所以解析要读中央目录，不能只看本地头。
+    const { readZipEntries } = await import('../server/lib/zip.js')
     const bak = await fetch(BASE + '/api/backup/export', { headers: { Cookie: cookie } })
     const buf = Buffer.from(await bak.arrayBuffer())
-    const entries = []
-    let off = 0
-    while (off < buf.length - 4) {
-      if (buf.readUInt32LE(off) !== 0x04034b50) break
-      const size = buf.readUInt32LE(off + 18)
-      const nl = buf.readUInt16LE(off + 26)
-      const el = buf.readUInt16LE(off + 28)
-      entries.push({ name: buf.slice(off + 30, off + 30 + nl).toString('utf8'), data: buf.slice(off + 30 + nl + el, off + 30 + nl + el + size) })
-      off = off + 30 + nl + el + size
-    }
+    assert(bak.ok, '备份导出返回 200', String(bak.status))
+    // 流式导出没有 Content-Length（边压边发），不能靠它判断包大小
+    assert(!bak.headers.get('content-length'), '流式导出不报 Content-Length（内存可控优先于进度条）')
+    const entries = readZipEntries(buf) || []
+    assert(entries.length >= 2, '备份包结构可读', String(entries.length))
+
+    const manifestEntry = entries.find(e => e.name === 'eqs-data/manifest.json')
+    assert(!!manifestEntry, '备份包里有 manifest.json')
+    const manifest = JSON.parse(manifestEntry.data.toString('utf8'))
+    assert(manifest.app === 'EQS' && manifest.format >= 2, 'manifest 标明来源与格式版本', JSON.stringify([manifest.app, manifest.format]))
+    assert(manifest.counts?.submissions >= 1, 'manifest 里带各表行数', JSON.stringify(manifest.counts))
+
     const dbEntry = entries.find(e => e.name === 'eqs-data/eqs.db')
     assert(!!dbEntry && dbEntry.data.length > 8192, '备份包里有非空的 eqs.db', `size=${dbEntry?.data.length}`)
+    // 主库只该出现一次：既要单独快照、又要普通遍历时，包里会出现两条 eqs-data/eqs.db，
+    // 导入端读到哪一份全看运气
+    assert(entries.filter(e => e.name === 'eqs-data/eqs.db').length === 1, 'eqs.db 在包里只有一条')
+    const crypto = await import('node:crypto')
+    const sha = crypto.createHash('sha256').update(dbEntry.data).digest('hex')
+    assert(sha === manifest.db.sha256, 'manifest 里的 sha256 与包内数据库一致')
+
     const restored = path.join(DATA_DIR, 'restored-check.db')
     fs.writeFileSync(restored, dbEntry.data)
     const { DatabaseSync } = await import('node:sqlite')
@@ -573,6 +584,102 @@ try {
     rdb.close()
     assert(userCount >= 1, '从备份的 eqs.db 能读出用户表', String(userCount))
     assert(formCount >= 1, '从备份的 eqs.db 能读出表单表', String(formCount))
+  }
+
+  console.log('\n[20b] 备份：流式导出、导入校验、可回滚')
+  {
+    const { readZipEntries, buildZip } = await import('../server/lib/zip.js')
+    const crypto2 = await import('node:crypto')
+
+    // 1) 导入前自动快照：导入是可撤销的，前提是「撤销」这一刻已经被存下来
+    let r = await req('POST', '/api/forms', { title: '只在快照里存在的表单', kind: 'survey' })
+    const snapMark = r.json.id
+    const zip = Buffer.from(await (await fetch(BASE + '/api/backup/export', { headers: { Cookie: cookie } })).arrayBuffer())
+    await req('DELETE', `/api/forms/${snapMark}`)
+    let imp = await (async () => {
+      const fd = new FormData()
+      fd.append('file', new Blob([zip]), 'backup.zip')
+      const res = await fetch(BASE + '/api/backup/import', { method: 'POST', headers: { Cookie: cookie }, body: fd })
+      return { status: res.status, json: await res.json() }
+    })()
+    assert(imp.json.ok, '导入返回成功', JSON.stringify(imp.json))
+    assert(typeof imp.json.snapshot === 'string' && imp.json.snapshot.startsWith('pre-import-'), '导入前自动存了快照', String(imp.json.snapshot))
+    r = await req('GET', `/api/forms/${snapMark}`)
+    assert(r.status === 200 && !r.json.data?.deleted_at, '导入后表单立刻回到未删除状态')
+
+    r = await req('GET', '/api/backup/snapshots')
+    assert(Array.isArray(r.json.data) && r.json.data.some(s => s.name === imp.json.snapshot), '快照列表能查到刚存的那份')
+
+    // 2) 回滚：把「导入」这件事撤回去；回滚本身也会先存一份
+    await req('DELETE', `/api/forms/${snapMark}`)
+    r = await req('POST', '/api/backup/rollback', { name: imp.json.snapshot })
+    assert(r.json.ok && r.json.restored === imp.json.snapshot, '回滚返回恢复的那份快照', JSON.stringify(r.json))
+    assert(typeof r.json.safety === 'string' && r.json.safety.startsWith('pre-rollback-'), '回滚前把当前状态另存了一份', String(r.json.safety))
+    /*
+     * 快照是「导入前」那一刻拍的，而那之前测试刚把表单删掉进回收站，
+     * 所以回滚后的正确结果是：回到「已删除」——回滚到的是快照，不是导入后的状态。
+     * 这一条实际上验的是同一件事的两面：回滚真的动了库。
+     */
+    r = await req('GET', `/api/forms/${snapMark}`)
+    assert(r.status === 200 && !!r.json.data?.deleted_at, '回滚后回到快照那一刻的状态（表单仍是删除态）', `status=${r.status} deleted=${r.json.data?.deleted_at}`)
+    // 再导入一次，确认「回滚 → 再导入」这条路走得通（会话、连接都没被打死）
+    imp = await (async () => {
+      const fd = new FormData()
+      fd.append('file', new Blob([zip]), 'backup.zip')
+      const res = await fetch(BASE + '/api/backup/import', { method: 'POST', headers: { Cookie: cookie }, body: fd })
+      return { status: res.status, json: await res.json() }
+    })()
+    assert(imp.json.ok, '回滚之后还能再导入一次', JSON.stringify(imp.json))
+    r = await req('GET', `/api/forms/${snapMark}`)
+    assert(r.status === 200 && !r.json.data?.deleted_at, '再次导入后表单又回到未删除')
+
+    // 3) 坏包必须被拦在「顶替」之前。旧实现直接换库，之后每个请求都回 statement has been finalized
+    const badZip = (() => {
+      return buildZip([{ name: 'eqs-data/eqs.db', data: Buffer.from('this is definitely not a sqlite file at all') }])
+    })()
+    let bad = await (async () => {
+      const fd = new FormData()
+      fd.append('file', new Blob([badZip]), 'bad.zip')
+      const res = await fetch(BASE + '/api/backup/import', { method: 'POST', headers: { Cookie: cookie }, body: fd })
+      return { status: res.status, json: await res.json() }
+    })()
+    assert(bad.status === 400 && /SQLite/.test(bad.json.message), '内容不是数据库的包被当场拒绝', `${bad.status} ${bad.json.message}`)
+    r = await req('GET', '/api/health')
+    assert(r.status === 200 && r.json.ok, '被拒绝之后服务仍然健康（钱没花在恢复现场上）')
+    r = await req('GET', '/api/forms?pageSize=1')
+    assert(r.status === 200 && r.json.ok, '被拒绝之后数据库连接仍然可用')
+
+    // 4) 包结构不对（没有 eqs-data/eqs.db）也要说清楚原因，而不是 500
+    const noDb = await (async () => {
+      return buildZip([{ name: 'readme.txt', data: Buffer.from('hello') }])
+    })()
+    let miss = await (async () => {
+      const fd = new FormData()
+      fd.append('file', new Blob([noDb]), 'x.zip')
+      const res = await fetch(BASE + '/api/backup/import', { method: 'POST', headers: { Cookie: cookie }, body: fd })
+      return { status: res.status, json: await res.json() }
+    })()
+    assert(miss.status === 400 && /eqs-data\/eqs\.db/.test(miss.json.message), '不是 EQS 备份的包给出明确原因', `${miss.status} ${miss.json.message}`)
+
+    // 5) 超过 64MB 的备份包：旧实现 readBody 上限就在这里，等于「自己导出的备份自己导不回来」
+    const big = crypto2.randomBytes(70 * 1024 * 1024)
+    const bigZip = await (async () => {
+      const { buildZip } = await import('../server/lib/zip.js')
+      const dbEntry = (readZipEntries(zip) || []).find(e => e.name === 'eqs-data/eqs.db')
+      // 随机字节压不动，包体积确实大过 64MB
+      return buildZip([{ name: 'eqs-data/eqs.db', data: dbEntry.data }, { name: 'eqs-data/files/big.bin', data: big }])
+    })()
+    assert(bigZip.length > 64 * 1024 * 1024, '构造出的备份包确实超过旧上限', (bigZip.length / 1048576).toFixed(1) + 'MB')
+    let bigImp = await (async () => {
+      const fd = new FormData()
+      fd.append('file', new Blob([bigZip]), 'big.zip')
+      const res = await fetch(BASE + '/api/backup/import', { method: 'POST', headers: { Cookie: cookie }, body: fd })
+      return { status: res.status, json: await res.json() }
+    })()
+    assert(bigImp.json.ok, '超过 64MB 的备份包能导入（旧实现这里 413）', `${bigImp.status} ${bigImp.json.message}`)
+    assert(bigImp.json.filesMerged >= 1, '大包里的附件被流式解出来', String(bigImp.json.filesMerged))
+    assert(fs.existsSync(path.join(DATA_DIR, 'files', 'big.bin')), '附件真的落到了磁盘上')
+
   }
 
   console.log('\n[21] 备份导入当场生效')

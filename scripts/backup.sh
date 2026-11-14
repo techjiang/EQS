@@ -29,5 +29,7 @@ if [ ! -f "$STAGE/data/eqs.db" ]; then
   exit 1
 fi
 if [ -d data/files ]; then cp -a data/files "$STAGE/data/files"; fi
+# data/.backups/ 是后台「导入 / 回滚」自动留下的快照，属于上一次的备份，
+# 打了包会一层套一层（5 份快照 × 每个几百 MB），所以上面只拷 eqs.db 与 files/
 tar -czf "$OUT" -C "$STAGE" data
 echo "✅ 已备份到 $OUT（$(du -h "$OUT" | cut -f1)）"

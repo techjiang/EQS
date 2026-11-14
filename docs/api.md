@@ -258,8 +258,10 @@ POST /api/banks/paper
 | DELETE | `/api/logs?days=90` | 清理 `days` 天前的日志（最少 7 天，不提供一键清空） |
 | GET | `/api/i18n/:lang`、PUT | 多语言资源 |
 | GET | `/api/sync/export?formId=1&sinceId=0&limit=1000` | 增量数据同步（游标分页） |
-| GET | `/api/backup/export` | 备份导出 |
-| POST | `/api/backup/import` | 备份导入 |
+| GET | `/api/backup/export` | 备份导出（流式 zip，含 `manifest.json`） |
+| POST | `/api/backup/import` | 备份导入（multipart，字段 `file`；先校验后顶替，自动快照） |
+| GET | `/api/backup/snapshots` | 可回滚快照列表 |
+| POST | `/api/backup/rollback` | 回滚，body `{ name? }` 省略则回滚到最近一份 |
 | GET | `/api/system/info` | 系统信息 |
 | GET | `/api/health` | 健康检查 |
 

@@ -105,21 +105,54 @@ export default {
       try { await api.put(`/api/i18n/${lang.value}`, i18nData.value); ok('语言资源已保存') } catch (e) { err(e.message) }
     }
 
-    const backup = () => api.download('/api/backup/export', `eqs-backup-${Date.now()}.zip`).catch(e => err(e.message))
+    /* ---------- 备份与迁移 ---------- */
+    const backups = ref([])
+    const importing = ref(false)
+    const backingUp = ref(false)
+    const rollingBack = ref(false)
+
+    const loadSnapshots = async () => {
+      try {
+        const r = await api.get('/api/backup/snapshots')
+        backups.value = r.data || []
+      } catch { backups.value = [] }
+    }
+    onMounted(loadSnapshots)
+
+    const backup = async () => {
+      backingUp.value = true
+      try {
+        // 备份越大越久：服务端现在是边压边发，浏览器这边等首字节的时间也变长，
+        // 按钮不给反馈的话用户会以为没点上，连点五次就是五份备份同时在跑
+        await api.download('/api/backup/export', `eqs-backup-${Date.now()}.zip`)
+        ok('备份已导出')
+      } catch (e) { err(e.message) } finally { backingUp.value = false }
+    }
 
     const restore = async (file) => {
       if (!file) return
-      if (!await confirmBox('导入备份会立即覆盖当前全部数据，且无法撤销。确认继续？')) return
+      if (!await confirmBox('导入备份会用备份里的数据顶替当前数据库（附件按合并处理）。导入前系统会自动存一份快照，可在下方「回滚」撤回。确认继续？')) return
+      importing.value = true
       try {
         const fd = new FormData()
         fd.append('file', file)
         const res = await fetch('/api/backup/import', { method: 'POST', body: fd, credentials: 'same-origin' })
         const j = await res.json()
         if (!j.ok) throw new Error(j.message)
-        ok(j.message + (j.note ? `；${j.note}` : ''))
+        ok(j.message + (j.snapshot ? `；已存快照 ${j.snapshot}，可随时回滚` : ''))
         // 数据库整个被替换了：当前页面里的表单列表、统计数字全是旧库的，必须重新拉一遍
-        await load()
-      } catch (e) { err(e.message) }
+        await Promise.all([load(), loadSnapshots()])
+      } catch (e) { err(e.message) } finally { importing.value = false }
+    }
+
+    const rollback = async (name) => {
+      if (!await confirmBox(`回滚到 ${name}？当前数据会先被另存一份，回滚本身也能再撤回。`)) return
+      rollingBack.value = true
+      try {
+        const r = await api.post('/api/backup/rollback', { name })
+        ok(`${r.message}；当前状态已存为 ${r.safety}`)
+        await Promise.all([load(), loadSnapshots()])
+      } catch (e) { err(e.message) } finally { rollingBack.value = false }
     }
 
     const field = (label, node, hint) => h('div', { class: 'field' }, [h('label', {}, label), node, hint ? h('div', { class: 'hint' }, hint) : null])
@@ -351,16 +384,43 @@ export default {
             h('div', { class: 'card pad' }, [
               h('b', {}, '备份与迁移'),
               h('p', { class: 'small muted', style: 'margin:6px 0 12px' },
-                '导出的压缩包包含数据库与全部上传文件。导入会立即覆盖当前数据并生效，导入前建议先导出一次。'),
+                '导出的压缩包包含数据库（一致快照）与全部上传文件，流式打包，数据再大也不会把服务端内存吃满。导入会校验备份里的数据库，通不过就当场拦下，不会拿坏库顶替；顶替前自动存一份快照，随时能回滚。'),
               h('div', { class: 'flex wrap' }, [
-                h('button', { class: 'btn primary', onClick: backup }, '导出备份'),
-                h('label', { class: 'btn' }, ['导入备份', h('input', {
-                  type: 'file', accept: '.zip', class: 'hide',
-                  onChange: e => { restore(e.target.files?.[0]); e.target.value = '' }
-                })])
+                h('button', { class: 'btn primary', disabled: backingUp.value, onClick: backup }, backingUp.value ? '打包中…' : '导出备份'),
+                h('label', { class: 'btn', style: importing.value ? 'opacity:.6;pointer-events:none' : '' }, [
+                  importing.value ? '导入中…' : '导入备份',
+                  h('input', {
+                    type: 'file', accept: '.zip', class: 'hide',
+                    onChange: e => { restore(e.target.files?.[0]); e.target.value = '' }
+                  })
+                ])
               ]),
               h('div', { class: 'small muted', style: 'margin-top:12px' },
-                '命令行也可以直接备份：bash scripts/backup.sh（服务运行中同样安全，会先做事一致快照）。')
+                '命令行也可以直接备份：bash scripts/backup.sh（服务运行中同样安全，会先做事一致快照）。'),
+              h('div', { style: 'margin-top:18px' }, [
+                // 390px 上「可回滚快照」和那行说明挤在一行时标题会被拆成两行，
+                // 看着像排版坏了——窄屏就让它自然换行
+                h('div', { class: 'flex between', style: 'margin-bottom:8px;flex-wrap:wrap;gap:2px 10px' }, [
+                  h('b', { class: 'small', style: 'white-space:nowrap' }, '可回滚快照'),
+                  h('span', { class: 'small muted' }, '最多保留最近 5 份（导入 / 回滚前自动创建）')
+                ]),
+                backups.value.length
+                  ? h('div', {}, backups.value.map((s, i) => h('div', {
+                      class: 'flex between',
+                      style: `gap:10px;padding:9px 0;flex-wrap:wrap;${i ? 'border-top:1px dashed var(--line)' : ''}`
+                    }, [
+                      h('div', { style: 'min-width:0' }, [
+                        h('div', { style: 'font-size:12.5px;word-break:break-all' }, s.name),
+                        h('div', { class: 'small muted' },
+                          `${fmtSize(s.bytes)} · ${fmtDate(s.createdAt)} · ${({ import: '导入前', rollback: '回滚前', manual: '手动' })[s.kind] || s.kind}`)
+                      ]),
+                      h('button', {
+                        class: 'btn sm', style: 'flex:none', disabled: rollingBack.value,
+                        onClick: () => rollback(s.name)
+                      }, i === 0 ? '回滚到这份' : '回滚')
+                    ])))
+                  : h('div', { class: 'small muted' }, '还没有快照。第一次导入备份时会自动创建。')
+              ])
             ])
           ])
         }

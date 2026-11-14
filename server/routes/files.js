@@ -5,7 +5,7 @@ import { readBody, sendJson, fail, send, clientIp } from '../lib/http.js'
 import { requireUser, requirePerm, currentUser, can } from '../lib/auth.js'
 import { upload, localPath, storageConfig, DRIVERS } from '../lib/storage.js'
 import { safeJson } from '../lib/forms.js'
-import { buildZip, extractZip } from '../lib/zip.js'
+import { buildZip, extractZip, writeZipStream } from '../lib/zip.js'
 
 /** multipart/form-data 解析（够用即可） */
 /**
@@ -167,7 +167,13 @@ export default function register(r) {
     sendJson(res, 200, { ok: true })
   })
 
-  /** 打包下载某表单所有附件（zip，store 模式无需依赖） */
+  /**
+   * 打包下载某表单所有附件。
+   *
+   * 以前是「每个文件 readFileSync → 塞进 entries → buildZip 拼成一个 Buffer」：
+   * 100 个 10MB 的附件就是 1GB 常驻内存，和导出 Excel 当年那个坑是同一个。
+   * 现在文件按路径流式压进去，内存只跟单块有关。
+   */
   r.get('/api/forms/:id/attachments.zip', async (req, res, { params }) => {
     const user = requirePerm(req, 'data:read')
     const form = get('SELECT id, title, created_by FROM forms WHERE id = ?', Number(params.id))
@@ -175,8 +181,8 @@ export default function register(r) {
     if (!can(user, '*') && form.created_by !== user.id) fail(403, '无权导出该表单的附件')
     const rows = all(`SELECT fl.* FROM files fl JOIN submissions s ON s.id = fl.submission_id
       WHERE s.form_id = ? AND s.deleted_at IS NULL AND fl.driver = 'local'`, Number(params.id))
-    // 文件可能已经从磁盘上被删或在别处丢失，一个 readFileSync 抛异常就会让整包下载 500——
-    // 用户看到的是「打包附件坏了」，而不是「其中 1 个文件丢了」。这里跳过并在响应头里报数。
+    // 文件可能已经从磁盘上被删或在别处丢失，跳过后在响应头里报数——
+    // 直接让整包 500 的话，用户看到的是「打包附件坏了」，而不是「其中 1 个文件丢了」
     const entries = []
     let missing = 0
     for (const f of rows) {
@@ -191,45 +197,21 @@ export default function register(r) {
         name = dot > 0 ? `${baseName.slice(0, dot)}(${n})${baseName.slice(dot)}` : `${baseName}(${n})`
         n++
       }
-      entries.push({ name, data: fs.readFileSync(local) })
+      entries.push({ name, file: local, compress: /^text\/|json|xml|csv/i.test(f.mime || '') })
     }
-    const zip = buildZip(entries)
     const stamp = new Date()
-    const pad = n => String(n).padStart(2, '0')
-    const name = `attachments-${form.title || params.id}-${stamp.getFullYear()}${pad(stamp.getMonth() + 1)}${pad(stamp.getDate())}.zip`
+    const pad2 = n => String(n).padStart(2, '0')
+    const name = `attachments-${form.title || params.id}-${stamp.getFullYear()}${pad2(stamp.getMonth() + 1)}${pad2(stamp.getDate())}.zip`
     res.writeHead(200, {
       'Content-Type': 'application/zip',
       // 中文表单名要按 RFC 5987 编码，否则浏览器下载下来是一串乱码文件名
       'Content-Disposition': `attachment; filename="attachments-${params.id}.zip"; filename*=UTF-8''${encodeURIComponent(name)}`,
-      'Content-Length': zip.length,
       'X-EQS-Files': String(entries.length),
       'X-EQS-Missing': String(missing)
     })
-    res.end(zip)
+    // 空包也得给一个合法的 zip：以前 entries 为空时 buildZip 仍然产出结构完整的空包
+    await writeZipStream(entries, res)
+    res.end()
   })
 }
 
-/**
- * 备份/迁移：导出整个数据目录为 zip
- * WAL 模式下新数据先落在 eqs.db-wal，eqs.db 主文件可能还是空的。
- * 不先 checkpoint 就打包，得到的 eqs.db 是个没有表的空壳——「备份成功，恢复全空」。
- */
-export function exportBackup() {
-  try {
-    db.exec('PRAGMA wal_checkpoint(TRUNCATE)')
-  } catch (e) {
-    console.error('[EQS] 备份前 checkpoint 失败', e.message)
-  }
-  const entries = []
-  const walk = (dir, prefix = '') => {
-    for (const name of fs.readdirSync(dir)) {
-      const full = path.join(dir, name)
-      const rel = prefix ? `${prefix}/${name}` : name
-      const st = fs.statSync(full)
-      if (st.isDirectory()) walk(full, rel)
-      else if (!name.endsWith('-wal') && !name.endsWith('-shm')) entries.push({ name: `eqs-data/${rel}`, data: fs.readFileSync(full) })
-    }
-  }
-  walk(DATA_DIR)
-  return buildZip(entries)
-}

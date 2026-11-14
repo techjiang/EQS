@@ -5,7 +5,12 @@ import crypto from 'node:crypto'
 import { get, all, run, now, setting, setSetting, DATA_DIR, log, db, switchDb } from '../lib/db.js'
 import { readBody, sendJson, fail, readJson, clientIp } from '../lib/http.js'
 import { requireUser, can, createSession, sessionCookie } from '../lib/auth.js'
-import { exportBackup, parseMultipart, extractZip } from './files.js'
+import {
+  exportBackupStream, saveRequestToFile, extractMultipartFile, restoreFiles,
+  createPreImportSnapshot, listSnapshots, rollbackToSnapshot, validateDatabase,
+  sqliteReady, stampNow
+} from '../lib/backup.js'
+import { openZipFile as openZipPath, extractZipEntryToFile } from '../lib/zip.js'
 import { smtpSend, wxAccessToken } from '../lib/notify.js'
 import { generateForm } from '../lib/ai.js'
 
@@ -16,67 +21,121 @@ export default function register(r) {
     sendJson(res, ok ? 200 : 503, { ok, uptime: Math.floor(process.uptime()), version: '1.0.0' })
   })
 
-  /** 备份导出 */
+  /**
+   * 备份导出（流式）。
+   *
+   * 旧实现把整个 data 目录 readFileSync 进内存再拼成一个 Buffer：107MB 的库导出时
+   * 响应 138MB，进程 RSS 从 90MB 涨到 365MB。真实站点 data/files 常有几个 G，
+   * 这条路走得通只是因为没人拿大盘子备过份——一备就是 OOM。
+   * 现在边读边压边发，内存只跟单块有关。
+   */
   r.get('/api/backup/export', async (req, res) => {
     const me = requireUser(req)
     if (!can(me, '*')) fail(403, '权限不足')
-    const zip = exportBackup()
+    const name = `eqs-backup-${stampNow()}.zip`
     res.writeHead(200, {
       'Content-Type': 'application/zip',
-      'Content-Disposition': `attachment; filename="eqs-backup-${Date.now()}.zip"`,
-      'Content-Length': zip.length
+      'Content-Disposition': `attachment; filename="${name}"`,
+      // 走 chunked：总量要等压完才知道，硬报 Content-Length 就得先全压进内存
+      'Cache-Control': 'no-store'
     })
-    res.end(zip)
+    let stat = null
+    try {
+      stat = await exportBackupStream(res)
+    } catch (e) {
+      // 头已经发出去了，改不了状态码，只能把日志写清楚
+      console.error('[EQS] 备份导出失败', e)
+    }
+    // 流写完必须显式 end()：不 end 的话浏览器能收到几乎全部字节却永远等不到结束
+    res.end()
+    if (stat) log(me, '导出备份', `${stat.entries} 个条目 / ${(stat.bytes / 1048576).toFixed(1)}MB`)
+  })
+
+  /** 可回滚的快照列表 */
+  r.get('/api/backup/snapshots', async (req, res) => {
+    const me = requireUser(req)
+    if (!can(me, '*')) fail(403, '权限不足')
+    sendJson(res, 200, { ok: true, data: listSnapshots() })
+  })
+
+  /** 回滚到上一次导入之前（或指定快照） */
+  r.post('/api/backup/rollback', async (req, res) => {
+    const me = requireUser(req)
+    if (!can(me, '*')) fail(403, '权限不足')
+    const body = await readJson(req).catch(() => ({}))
+    await sqliteReady()
+    // 回滚本身也可撤销：先把当前状态存一份，再顶替
+    const r2 = rollbackToSnapshot(body.name)
+    log(me, '回滚备份', `恢复到 ${r2.restored}（当前状态已存为 ${r2.safety}）`)
+    sendJson(res, 200, { ok: true, ...r2, message: `已回滚到 ${r2.restored}` })
   })
 
   /**
-   * 迁移导入：上传备份 zip，直接顶替当前数据库。
-   * 不能只写一个待生效的文件等重启：面板已经显示「导入成功」，用户看到的却是空站。
-   * 「导入成功」必须当场是真的，所以这里直接切连接（switchDb）。
+   * 迁移导入。
+   *
+   * 旧实现三段都不成立，而且是同一个原因的三种表现：
+   *   1. `readBody(req)` 上限 64MB —— 138MB 的备份包直接 413「请求体过大」，
+   *      **自己导出的备份，自己导不回来**；
+   *   2. 内存版解包，包多大就吃多大；
+   *   3. 顶替前零校验。塞一个内容不是 SQLite 的 eqs.db 进去，库被换了，
+   *      此后每个请求都回 `statement has been finalized`，只能手工救。
+   *
+   * 现在：请求体流式落盘 → 按 boundary 抠出 zip → 从中央目录按区间解出 eqs.db →
+   * 先验（文件头、integrity_check、核心表）→ 成功才顶替，且顶替前自动存一份快照。
+   * 「导入成功」当场是真的，撤回去也有路。
    */
   r.post('/api/backup/import', async (req, res) => {
     const me = requireUser(req)
     if (!can(me, '*')) fail(403, '权限不足')
     const ct = String(req.headers['content-type'] || '')
-    const buf = await readBody(req)
     if (!ct.includes('multipart/form-data')) fail(400, '请上传 zip 备份文件')
     const boundary = /boundary=(?:"([^"]+)"|([^;]+))/.exec(ct)
     if (!boundary) fail(400, '缺少 boundary')
-    const parts = parseMultipart(buf, boundary[1] || boundary[2])
-    const file = parts.find(p => p.filename)
-    if (!file) fail(400, '未找到备份文件')
-    // 解包目录放在数据目录之外：放在 DATA_DIR 里时，exportBackup 会把上一次解包的残留也打进去
-    const restoreDir = fs.mkdtempSync(path.join(os.tmpdir(), 'eqs-restore-'))
+    const work = fs.mkdtempSync(path.join(os.tmpdir(), 'eqs-restore-'))
     try {
-      const unzipped = extractZip(file.data, restoreDir)
-      if (unzipped && unzipped.ok === false) fail(400, unzipped.reason || '备份文件无法解包')
-      const root = findEqsData(restoreDir)
-      if (!root) fail(400, '备份文件结构不正确')
-      const incoming = path.join(os.tmpdir(), `eqs-incoming-${Date.now()}.db`)
-      fs.writeFileSync(incoming, fs.readFileSync(path.join(root, 'eqs.db')))
-      // 切换连接：switchDb 内部 checkpoint → close → 覆盖 eqs.db → 重新打开（WAL 残留在里面清掉）
+      const rawPath = path.join(work, 'body.bin')
+      await saveRequestToFile(req, rawPath)
+      const zipPath = path.join(work, 'backup.zip')
+      await extractMultipartFile(rawPath, boundary[1] || boundary[2], zipPath)
+      fs.rmSync(rawPath, { force: true })
+      await sqliteReady()
+
+      const zip = openZipPath(zipPath)
+      if (!zip) fail(400, '无法读取压缩包目录，请用 EQS 导出的备份文件')
+      const dbEntry = zip.entries.find(e => e.name === 'eqs-data/eqs.db')
+      if (!dbEntry) fail(400, '备份包里没有 eqs-data/eqs.db，不是 EQS 的备份文件')
+
+      // 清单是「这个包是什么」的自述，有就读、没有也接受（兼容老备份）
+      let manifest = null
+      const mEntry = zip.entries.find(e => e.name === 'eqs-data/manifest.json')
+      if (mEntry) {
+        const mPath = path.join(work, 'manifest.json')
+        await extractZipEntryToFile(zip, mEntry, mPath)
+        try { manifest = JSON.parse(fs.readFileSync(mPath, 'utf8')) } catch {}
+      }
+
+      const incoming = path.join(work, 'eqs.db')
+      await extractZipEntryToFile(zip, dbEntry, incoming)
+      const check = validateDatabase(incoming)
+      if (!check.ok) fail(400, check.reason)
+
+      // 先快照、后顶替：导入是可撤销的，前提是「撤销」这一刻已经被存下来
+      const snap = createPreImportSnapshot('pre-import')
       switchDb(incoming)
-      fs.rmSync(incoming, { force: true })
-      /*
-       * 合并而不是覆盖：旧备份里没有 files 目录时，之前这里一个都不动，
-       * 于是「恢复了一个不含附件的旧备份」→ 数据库回到旧状态，附件还是新的，两边对不上；
-       * 反过来若备份里带了 files，cpSync 又只覆盖不删除。两种情况都会留下孤儿文件或者丢附件。
-       * 文件按「日期/随机名」存放，同名就是同一个文件，不覆盖才怪——所以这里只补不删，并在结束时报数。
-       */
-      const backupFiles = path.join(root, 'files')
-      fs.mkdirSync(path.join(DATA_DIR, 'files'), { recursive: true })
-      const added = fs.existsSync(backupFiles)
-        ? fs.cpSync(backupFiles, path.join(DATA_DIR, 'files'), { recursive: true, force: false, errorOnExist: false }) ?? countFiles(backupFiles)
-        : 0
-      log(me, '导入备份', `已生效，附件合并 ${added || 0} 项`)
+      const merged = await restoreFiles(zip)
+
+      log(me, '导入备份', `已生效，附件补入 ${merged.added} 项，快照 ${snap.name}`)
       sendJson(res, 200, {
         ok: true, restartRequired: false,
         message: '备份已导入并生效',
-        filesMerged: added || 0,
-        note: '附件按合并处理：备份里没有的文件会保留，不会被删除'
+        filesMerged: merged.added,
+        filesSkipped: merged.skipped,
+        snapshot: snap.name,
+        manifest: manifest ? { version: manifest.version, createdAt: manifest.createdAt, counts: manifest.counts } : null,
+        note: '附件按合并处理：备份里没有的文件会保留，不会被删除；如需撤回请点「回滚到导入前」'
       })
     } finally {
-      fs.rmSync(restoreDir, { recursive: true, force: true })
+      fs.rmSync(work, { recursive: true, force: true })
     }
   })
 
@@ -92,12 +151,25 @@ export default function register(r) {
       files: get('SELECT COUNT(*) c FROM files').c
     }
     const size = (p) => { try { return fs.statSync(p).size } catch { return 0 } }
+    /*
+     * 数据库大小不能只看 eqs.db 主文件：WAL 模式下新数据先在 eqs.db-wal 里，
+     * 主文件可能只有几十 KB，设置页就显示「数据库大小 4.0 KB」——一个装了 47 份答卷的站点
+     * 看起来像个空库。按 SQLite 自己的页数算才是真实占用量。
+     */
+    let dbSize = 0
+    try {
+      const pc = get('PRAGMA page_count')?.page_count || 0
+      const ps = get('PRAGMA page_size')?.page_size || 0
+      dbSize = pc * ps
+      if (!dbSize) dbSize = size(path.join(DATA_DIR, 'eqs.db')) + size(path.join(DATA_DIR, 'eqs.db-wal'))
+    } catch { dbSize = size(path.join(DATA_DIR, 'eqs.db')) }
+    const walSize = size(path.join(DATA_DIR, 'eqs.db-wal'))
     sendJson(res, 200, {
       ok: true,
       data: {
         version: '1.0.0', node: process.version, uptime: Math.floor(process.uptime()),
         platform: `${process.platform} ${process.arch}`,
-        dataDir: DATA_DIR, dbSize: size(path.join(DATA_DIR, 'eqs.db')),
+        dataDir: DATA_DIR, dbSize, walSize,
         fileCount: counts.files, counts
       }
     })
@@ -270,34 +342,3 @@ async function upsertOAuthUser({ username, email, nickname, avatar }) {
 }
 
 const hashPasswordless = () => 'oauth$' + crypto.randomBytes(16).toString('hex')
-
-function countFiles(dir) {
-  let n = 0
-  const stack = [dir]
-  while (stack.length) {
-    const d = stack.pop()
-    let entries = []
-    try { entries = fs.readdirSync(d, { withFileTypes: true }) } catch { continue }
-    for (const e of entries) {
-      if (e.isDirectory()) stack.push(path.join(d, e.name))
-      else n++
-    }
-  }
-  return n
-}
-
-function findEqsData(dir) {
-  const stack = [dir]
-  while (stack.length) {
-    const d = stack.pop()
-    for (const name of fs.readdirSync(d)) {
-      const full = path.join(d, name)
-      if (!fs.statSync(full).isDirectory()) continue
-      if (name === 'eqs-data') {
-        if (fs.existsSync(path.join(full, 'eqs.db'))) return full
-      }
-      stack.push(full)
-    }
-  }
-  return null
-}
