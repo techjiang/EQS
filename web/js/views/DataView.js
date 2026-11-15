@@ -5,7 +5,7 @@ import { ok, err, confirmBox, fmtDate, Empty, Modal, Pagination, escapeHtml } fr
 import { Icon } from '../icons.js'
 import { renderControl, answerDisplay } from '../renderer.js'
 import { buildFlow } from '../flow.js'
-import { selfQuestion, batchPayload, nextIndex, reviewProgress, afterSave, elapsedSeconds, changeText, changeLine, humanSeconds, gapLevel, bandText, biasText, regradeText, standingText, URGENCY_LABEL, verdictText } from '../review.js'
+import { selfQuestion, batchPayload, nextIndex, reviewProgress, afterSave, elapsedSeconds, changeText, changeLine, humanSeconds, gapLevel, bandText, biasText, regradeText, standingText, URGENCY_LABEL, verdictText, reviewFatigue } from '../review.js'
 
 export default {
   setup() {
@@ -267,6 +267,9 @@ export default {
           // 我自己的尺子：单份批阅也要知道自己在戴什么颜色的眼镜，
           // 不然只有走批量阅卷的人才看得见这条提示
           self: sub.self || null,
+          // 我批这一份时那一轮整体怎么样：批到第 8 份才开始松的人，
+          // 单份批阅同样是唯一入口，弹窗里不给就永远看不到自己这一轮松了没有
+          fatigue: sub.fatigue || null,
           items: subjective.map(q => ({
             id: q.id, label: q.label, score: Number(q.score) || 0,
             given: data[q.id], analysis: q.analysis || '',
@@ -517,7 +520,9 @@ export default {
         // 整队里几份批完会改结论：按整队算，不按这一页——否则每翻一页这句话都变一次
         summary: r.summary || null, order: r.order || batchOrder.value,
         // 我自己的尺子：批之前先看清自己的口径
-        self: r.self || null
+        self: r.self || null,
+        // 我刚才那一轮批得怎么样：批到第 8 份开始松的人，打开下一批时该看得见
+        fatigue: r.fatigue || null
       }
       // 保存之后队列清空是正常结果，不该再弹一句「没有待批阅」——那句提示是说给「点进来才发现空」的人
       /*
@@ -676,6 +681,30 @@ export default {
             ? '· 意思是「同一格上别人也给过分」的处数还不够'
             : '· 口径与评分尺度页同一条：逐格比同题其他人的均值，撤分不算分')
         : null
+    ])
+  }
+
+  /**
+   * 我刚才那一轮批得怎么样。
+   *
+   * 「我的尺子」那条是平均值：连着批 40 份，前 10 份认真、后 30 份照着印象给，
+   * 平均下来只偏一点，而真正松掉的是后面那 30 份。这条横幅只比头尾几份——
+   * 要看的不是「我整体偏不偏」，是「我这轮越批越松了没有」。
+   *
+   * 颜色只在「快起来的同时口径也跟着动了」时才染：批得快且给得稳是好事，
+   * 给好事染上警告色，这条提示很快就会变成噪声，连真的那条一起被无视。
+   */
+  const fatigueBanner = (fatigue) => {
+    if (!fatigue) return null
+    // 三档：警告（快 + 口径动了）/ 正常（快而稳、前后一致）/ 无颜色（没有结论）。
+    // 「口径看不出」不能染绿——绿色也是一种结论，会把「没证据」读成「查过了，没问题」
+    const tone = fatigue.alarming ? 'alarm' : fatigue.tone === 'ok' ? 'flat' : ''
+    return h('div', { class: ['self-bias', 'fatigue', tone] }, [
+      h('span', { class: 'small', style: 'font-weight:600' }, '这轮批卷'),
+      // 判语放在最前面：一句「越批越快，分越来越松」比三行数字更快被读走
+      h('span', { class: 'small', style: 'font-weight:600' }, fatigue.verdict),
+      h('span', { class: 'small' }, fatigue.text),
+      fatigue.note ? h('span', { class: 'small muted' }, `· ${fatigue.note}`) : null
     ])
   }
 
@@ -919,6 +948,7 @@ export default {
             h('button', { class: 'btn sm', style: 'margin-left:auto', onClick: () => { reviewInputs()[0]?.focus(); reviewInputs()[0]?.select?.() } }, '从第一题开始')
           ]),
           selfBanner(review.value.self),
+          fatigueBanner(review.value.fatigue),
           review.value.items.length > 1 ? h('div', { class: 'flex between mb' }, [
             h('span', { class: 'small muted' }, `共 ${review.value.items.length} 道主观题，未填的按 0 分算`),
             h('button', { class: 'btn sm', onClick: fillZero }, '未填的按 0 分')
@@ -1199,6 +1229,39 @@ export default {
                 ])
               : null),
             /*
+             * 批卷疲劳：越批越快、分越给越松。
+             *
+             * 上面「尺子随时间的走向」按天/周切，看的是「被谈过之后有没有收」；
+             * 这一块按**一轮连续批阅**切（相邻两条留痕间隔不超过 30 分钟），看的是
+             * 「一页十份批到第 8 份时手还在不在」。两件事不是一回事：一个人天天认真但每轮
+             * 后半段都松，走向那条线是平的。
+             */
+            calibration.value.fatigue?.sessions?.length ? h('div', { style: 'margin-top:18px' }, [
+              h('div', { class: 'small', style: 'font-weight:600;margin-bottom:4px' }, '批卷疲劳：一轮之内，越批越快、分越给越松'),
+              h('div', { class: 'small muted', style: 'margin-bottom:10px' },
+                `相邻两条留痕间隔不超过 ${calibration.value.fatigue.gapMinutes} 分钟算同一轮，只比头尾各 ${calibration.value.fatigue.half} 份。`
+                + '速度是事实，但不是指控——后面的答案可能更短、题更简单；真正的证据是「快起来的同时口径有没有跟着动」。'),
+              ...calibration.value.fatigue.sessions.slice(0, 6).map(s2 => h('div', { class: 'drift-row' }, [
+                h('div', { class: 'flex between wrap', style: 'gap:8px;align-items:baseline' }, [
+                  h('div', { class: 'flex wrap', style: 'gap:8px;align-items:baseline;min-width:0' }, [
+                    h('b', { class: 'small' }, s2.name),
+                    h('span', { class: 'small muted' }, fmtDate(s2.startAt)),
+                    // 「跨 0 分钟」是句废话：批量阅卷一次提交，八条留痕本来就挤在同一分钟里
+                    h('span', { class: 'small muted' }, s2.spanMinutes >= 1 ? `${s2.items} 份 · 跨 ${s2.spanMinutes} 分钟` : `${s2.items} 份`)
+                  ]),
+                  // 只有「快起来 + 口径动了」才染色：批得快又给得稳是好事，
+                  // 给好事染上警告色，这条提示很快就变成没人读的噪声
+                  h('span', { class: ['tag', s2.tone === 'warn' ? 'warn' : s2.tone === 'ok' ? 'ok' : ''] }, s2.verdict)
+                ]),
+                h('div', { class: 'small', style: 'margin-top:2px;color:var(--text-2)' }, s2.text),
+                s2.note ? h('div', { class: 'small muted', style: 'margin-top:2px' }, s2.note) : null
+              ])),
+              calibration.value.fatigue.sessions.length > 6
+                ? h('div', { class: 'small muted', style: 'margin-top:4px' },
+                    `另有 ${calibration.value.fatigue.sessions.length - 6} 轮未展开（最近的在上面）`)
+                : null
+            ]) : null,
+            /*
              * 换一把尺子重批全场。
              *
              * 上面几块都是「回头看」：谁偏松几分、谁的尺子收紧了、哪一份的分数浮动多大。
@@ -1367,6 +1430,7 @@ export default {
             }, '从第一题开始')
           ]) : null,
           selfBanner(batch.value.self),
+          fatigueBanner(batch.value.fatigue),
           ...batch.value.items.map((x, xi) => h('div', {
             style: 'padding:14px;border:1px solid var(--line);border-radius:10px;margin-bottom:12px'
           }, [

@@ -491,6 +491,219 @@ export function questionBiasText(p) {
 }
 
 /**
+ * 批卷疲劳：同一次连续批阅里，越批越快、分也越给越松。
+ *
+ * 上一轮给的是一人称的尺子——「你比同题其他人平均高 5.3 分」。但那是**平均**：
+ * 一个人连着批 40 份，前 10 份认真、后 30 份照着印象给，平均下来只偏一点，
+ * 而真正松掉的是后面那 30 份。系统里一直看得见「他偏松」，看不见「他批到第 8 份之后开始松」。
+ *
+ * 两条线分开算，因为它们的分量不同：
+ *
+ *  ① **速度**：每份的耗时。这一条不需要别人参与，是纯事实。但快本身不是指控——
+ *     后面的答案可能更短、题更简单，或者他本来就更熟练。速度只是把「后面那几份值不值得
+ *     回头看一眼」摆出来的背景。
+ *  ② **口径**：同格对比下，我的分比别人高多少（与 selfBias 同一个减法，考生水平被抵消），
+ *     再看这个偏移在一轮批阅里从前面走到后面是放宽还是收紧。**这一条才可能说明问题**，
+ *     但它要求「同一格上还有别人给过分」——一个人批完一整场就没有任何东西可比，
+ *     那时只能承认：看不出松紧，不是没有松紧。
+ *
+ * 口径与边界，逐条：
+ *  - **一轮批阅 = 同一位老师、相邻两条留痕间隔不超过 30 分钟。** 疲劳是一页之内、一晚之内的事；
+ *    昨天批一批、今天批一批，那中间是状态差异，由 `reviewDrift` 的时间维度管。
+ *  - **只比头尾两段（默认各 3 份）**，且一轮至少 6 份才判。取整场平均会把疲劳自己平均掉，
+ *    那正是这件事一直看不见的原因。
+ *  - **当时的分，按当时的别人算。** 回放时在每条留痕落下之前取一次同格其他人的均值作基准——
+ *    疲劳问的是「我敲这一笔时别人在这格是多少」，后面别人怎么改，不改变当时那件事。
+ *  - **撤分不算分**（与 crossInfo / reviewDrift / selfBias 同一条判据），也不参与耗时——
+ *    撤分不是「批了一份卷子」。
+ *  - **seconds = 0 是「没记到」，不是「0 秒批完」。** 把它算进均值，后半程会凭空快成 0。
+ *  - **不到 1 分的变化不判**：0.6 分的起伏在阅卷里就是运气，说成「放宽」会让人白开一次会。
+ *  - **快而口径没动，就说「口径没动」。** 这句话必须单独存在：批得快且给得稳是好事，
+ *    要是它也写成一句提醒，这条提示很快会变成噪声，连真的那条一起被无视。
+ *
+ * 返回 `sessions`（按最近在前）与 `mine`（当前登录账号刚才那一轮，没有就是 null）。
+ * 只算自己的那部分由 `userId` 决定：这条提示是让正在给分的人回头看自己这一轮，
+ * 不是给同事之间互相点评提供素材。尺度页那边有权限门槛，管的是另一件事。
+ */
+export function reviewFatigue(entries = [], { userId = 0, gapMinutes = 30, half = 3, minItems = 6, minSamples = 2 } = {}) {
+  const state = new Map()      // 格子 → Map(老师 → { name, value })
+  const who = e => (Number(e.userId) > 0 ? `u${Number(e.userId)}` : `n${e.username || '?'}`)
+  const marks = entries.map(e => {
+    const me = who(e)
+    let sum = 0
+    let n = 0
+    for (const c of e.changes || []) {
+      const ck = `${e.submissionId}::${c.id}`
+      const cell = state.get(ck) || new Map()
+      // 基准取「这一刻」别人的分：后面别人怎么改，不改变我敲下这一笔时同格的状况
+      const others = [...cell.entries()].filter(([k, v]) => k !== me && v.value !== null && v.value !== undefined)
+      const value = c.to === undefined ? null : c.to
+      if (value !== null && others.length) {
+        sum += Number(value) - others.reduce((a, [, v]) => a + Number(v.value), 0) / others.length
+        n++
+      }
+      cell.set(me, { name: e.username || '', value })
+      state.set(ck, cell)
+    }
+    return { entry: e, key: me, diff: n ? { sum, n } : null }
+  })
+
+  // 一位老师 → his 全部留痕。时间序由调用方保证（SQL 按 id 升序）
+  const groups = new Map()
+  for (const m of marks) {
+    if (Number(userId) > 0 && m.key !== `u${Number(userId)}`) continue
+    if (!groups.has(m.key)) groups.set(m.key, { key: m.key, name: m.entry.username || '未知账号', list: [] })
+    groups.get(m.key).list.push(m)
+  }
+
+  const sessions = []
+  for (const g of groups.values()) {
+    let cur = []
+    const flush = () => {
+      if (cur.length) sessions.push(sessionOf(g, cur, { half, minItems, minSamples }))
+      cur = []
+    }
+    for (const m of g.list) {
+      const prev = cur[cur.length - 1]
+      // 超过 30 分钟就是另一轮了：中间可能去喝了杯水，也可能换了一天
+      if (prev && minutesBetween(prev.entry.createdAt, m.entry.createdAt) > gapMinutes) flush()
+      cur.push(m)
+    }
+    flush()
+  }
+  // 最近的排前面：界面要问的永远是「刚才这一轮怎么样」
+  sessions.sort((a, b) => String(b.endAt).localeCompare(String(a.endAt)))
+  return { sessions, mine: sessions.find(s => s.key === (Number(userId) > 0 ? `u${Number(userId)}` : '')) || null, half, minItems, gapMinutes }
+}
+
+function minutesBetween(a, b) {
+  const x = new Date(a).getTime()
+  const y = new Date(b).getTime()
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return 0
+  return Math.max((y - x) / 60000, 0)
+}
+
+/** 一轮批阅：头尾两段的耗时均值与同格偏移均值，各自算，不互相顶替 */
+function sessionOf(group, list, { half, minItems, minSamples }) {
+  const head = list.slice(0, half)
+  const tail = list.slice(-half)
+  const sFirst = speedOf(head)
+  const sLast = speedOf(tail)
+  const speed = sFirst && sLast
+    ? { first: sFirst, last: sLast, ratio: Math.round((sLast / sFirst) * 100) / 100 }
+    : null
+  const bFirst = biasOf(head)
+  const bLast = biasOf(tail)
+  // 两段都得有足够的「同格对比」处数，才谈得上「从几分走到几分」
+  const comparable = !!bFirst && !!bLast && bFirst.samples >= minSamples && bLast.samples >= minSamples
+  const bias = comparable
+    ? {
+        first: bFirst.bias, last: bLast.bias,
+        delta: round1(bLast.bias - bFirst.bias),
+        samples: { first: bFirst.samples, last: bLast.samples }
+      }
+    : null
+  const startAt = list[0].entry.createdAt || ''
+  const endAt = list[list.length - 1].entry.createdAt || ''
+  const enough = list.length >= minItems
+  const { verdict, alarming, tone } = fatigueVerdict(speed, bias)
+  const base = { items: list.length, spanMinutes: Math.round(minutesBetween(startAt, endAt)), speed, bias, half, enough }
+  return {
+    key: group.key,
+    name: group.name,
+    startAt, endAt,
+    // 这一轮里批过哪几份卷子：单份批阅要问的是「我批这一份时，那一轮整体怎么样」，
+    // 而不是「我最近一轮怎么样」——那是别的卷子的事
+    ids: [...new Set(list.map(x => Number(x.entry.submissionId)).filter(Boolean))],
+    ...base,
+    // 样本不足时不下结论，也就没有颜色：一页批了 4 份就说「你疲劳了」，那只是运气
+    verdict: enough ? verdict : '样本不足',
+    alarming: enough && alarming,
+    // 染色的三档：警告（快 + 口径动了）/ 正常（快而稳、前后一致）/ 无（没有结论）
+    tone: enough ? tone : '',
+    text: fatigueText(base),
+    note: fatigueNote({ speed, bias, enough })
+  }
+}
+
+/** 一段留痕的每份耗时均值。seconds = 0 是「没记到」，不参与平均 */
+function speedOf(list) {
+  const secs = list.map(x => Number(x.entry.seconds) || 0).filter(s => s > 0)
+  if (!secs.length) return 0
+  return Math.round(secs.reduce((a, b) => a + b, 0) / secs.length)
+}
+
+/** 一段留痕的同格偏移均值（正数 = 这一段里我比同格其他人给得高） */
+function biasOf(list) {
+  const pts = list.map(x => x.diff).filter(Boolean)
+  if (!pts.length) return null
+  return { bias: round1(pts.reduce((a, p) => a + p.sum / p.n, 0) / pts.length), samples: pts.length }
+}
+
+/**
+ * 一轮批阅的判语。
+ *
+ * 「越批越快」和「分越来越松」是两句不同的话，混成一句会同时冤枉两种人：
+ * 熟练的人快了但给得稳，硬说他疲劳，下次他连速度这条也不看了；
+ * 而真正松掉的人如果速度没变（慢慢批、随手给），混在速度里就永远看不见。
+ */
+function fatigueVerdict(speed, bias) {
+  // 后半程每份耗时掉到一半以下才算「越来越快」：0.9 → 0.75 是打字熟了，不是放下心来了
+  const faster = !!speed && speed.ratio <= 0.5
+  const looser = !!bias && bias.delta >= 1
+  const tighter = !!bias && bias.delta <= -1
+  if (faster && looser) return { verdict: '越批越快，分越来越松', alarming: true, tone: 'warn' }
+  if (faster && tighter) return { verdict: '越批越快，分越来越紧', alarming: true, tone: 'warn' }
+  /*
+   * 「口径没动」和「口径看不出」是两句话：前者有对比、比出来一样，后者根本没有可比的分。
+   * 混成一句，一个人批完一整场也会被告知「你口径没动」——那是编出来的安慰。
+   *
+   * 染色也跟着分三档，而不是「不报警就绿」：
+   * 「口径没动」是结论（绿），「口径看不出」是没有结论——它不该有任何颜色。
+   * 绿色也是一种结论：给「没证据」染上绿色，读的人会把它记成「查过了，没问题」。
+   */
+  if (faster) return { verdict: bias ? '越批越快，口径没动' : '越批越快，口径看不出', alarming: false, tone: bias ? 'ok' : '' }
+  if (looser) return { verdict: '速度没变，分越来越松', alarming: true, tone: 'warn' }
+  if (tighter) return { verdict: '速度没变，分越来越紧', alarming: true, tone: 'warn' }
+  if (!speed && !bias) return { verdict: '样本不足', alarming: false, tone: '' }
+  return { verdict: bias ? '前后一致' : '口径看不出', alarming: false, tone: bias ? 'ok' : '' }
+}
+
+function fatigueText({ items, spanMinutes, speed, bias, half, enough }) {
+  if (!enough) return `这轮只批了 ${items} 份，还看不出前后差别（头尾各 ${half} 份，至少 ${half * 2} 份才比得了）`
+  // 「跨 0 分钟」是句废话：批量阅卷一次提交，八条留痕本来就挤在同一分钟里
+  const parts = [`这轮 ${items} 份${spanMinutes >= 1 ? `、跨 ${humanMinutes(spanMinutes)}` : ''}`]
+  if (speed) parts.push(`前 ${half} 份每份 ${humanSeconds(speed.first)}，后 ${half} 份 ${humanSeconds(speed.last)}`)
+  if (bias) {
+    // delta = 0 时说「收紧 0 分」是废话：这一句只在真的动了半格以上时才补方向
+    const dir = Math.abs(bias.delta) < 1 ? '没动' : (bias.delta > 0 ? `放宽 ${bias.delta} 分` : `收紧 ${Math.abs(bias.delta)} 分`)
+    parts.push(`同题对比 ${biasText(bias.first)} → ${biasText(bias.last)} 分（${dir}）`)
+  }
+  return parts.join('；')
+}
+
+/**
+ * 这条判语还缺什么证据。界面把它跟在后面，读者才知道那句「看不出」是哪种看不出：
+ * 这一轮太短，还是这一轮的分根本没有第二个人碰过。
+ */
+function fatigueNote({ speed, bias, enough }) {
+  if (!enough) return ''
+  const miss = []
+  if (!speed) miss.push('没记到每份的耗时')
+  // 这句要说清「为什么看不出」：一个人批完一整场，绝对分的涨跌什么也说明不了
+  if (!bias) miss.push('头尾两段都没有能与别人对比的分，这轮的口径看不出松紧——一个人批完一整场时，本来就没有可比的东西')
+  return miss.join('；')
+}
+
+function humanMinutes(min) {
+  const m = Math.max(Math.round(Number(min) || 0), 0)
+  if (m < 60) return `${m} 分钟`
+  const h = Math.floor(m / 60)
+  const rm = m % 60
+  return rm ? `${h} 小时 ${rm} 分` : `${h} 小时`
+}
+
+/**
  * 评分尺度：同一份卷子的同一道题，被两位老师分别给过分，差了多少。
  *
  * 留痕能追到「谁批的、改了什么」，但两个人对同一题给出 4 分和 18 分时，

@@ -5895,6 +5895,199 @@ try {
       '结案不改写历史：我在这格给过的分照旧算进我的偏移', JSON.stringify(r.json.self))
   }
 
+  console.log('\n[76] 批卷疲劳：同一轮里越批越快、分越给越松')
+  {
+    // ---- 纯函数：一轮之内头尾两段的耗时与口径
+    {
+      const { reviewFatigue } = await import('../web/js/review.js')
+      const mk = (sub, uid, name, changes, at, seconds = 0) => ({ submissionId: sub, userId: uid, username: name, createdAt: at, seconds, changes })
+      const at = m => `2026-11-14T10:${String(m).padStart(2, '0')}:00Z`
+      const mine = (sub, value, m, seconds) => mk(sub, 1, '我', [{ id: 'q1', label: '简述', from: null, to: value }], at(m), seconds)
+      const other = (sub, value, m) => mk(sub, 2, '张老师', [{ id: 'q1', label: '简述', from: null, to: value }], `2026-11-14T09:${String(m).padStart(2, '0')}:00Z`, 60)
+
+      /*
+       * 张老师先把 8 格都批成 10 分，我接着连着批这 8 份：
+       * 前 3 份每份 80 秒给 14 分，后 5 份每份 25 秒给 19 分。
+       * 这个形状正是「越批越快、分也越给越松」——而它在「平均偏高 4.5 分」里看不出来。
+       */
+      const logs = []
+      for (let i = 1; i <= 8; i++) logs.push(other(i, 10, i))
+      const secs = [80, 80, 80, 25, 25, 25, 25, 25]
+      for (let i = 1; i <= 8; i++) logs.push(mine(i, i <= 3 ? 14 : 19, (i - 1) * 3, secs[i - 1]))
+      let f = reviewFatigue(logs, { userId: 1 })
+      const s1 = f.mine
+      assert(s1 && s1.items === 8 && s1.speed.first === 80 && s1.speed.last === 25,
+        '头尾两段的每份耗时都算出来了（前 3 份 80 秒、后 3 份 25 秒）', JSON.stringify(s1?.speed))
+      assert(s1.bias && s1.bias.first === 4 && s1.bias.last === 9 && s1.bias.delta === 5,
+        '口径也是头尾分开比：+4 → +9 分，放宽 5 分（考生水平在减法里被抵消）', JSON.stringify(s1.bias))
+      assert(s1.verdict === '越批越快，分越来越松' && s1.alarming === true,
+        '快起来的同时分也松了 → 这才是要染色的那一种', s1.verdict)
+      assert(/放宽 5 分/.test(s1.text) && /25 秒/.test(s1.text), '那句话要把两段的耗时与口径都写出来', s1.text)
+
+      /*
+       * 快，但口径没动。批得快又给得稳是好事，绝不能染成警告——
+       * 给好事挂上警告色，这条提示很快就会变成没人读的噪声，连真的那条一起被无视。
+       */
+      const steady = []
+      for (let i = 1; i <= 8; i++) steady.push(other(i, 10, i))
+      for (let i = 1; i <= 8; i++) steady.push(mine(i, 10, (i - 1) * 3, secs[i - 1]))
+      const f2 = reviewFatigue(steady, { userId: 1 }).mine
+      assert(f2.verdict === '越批越快，口径没动' && f2.alarming === false && f2.tone === 'ok',
+        '快而口径没动 → 「口径没动」，是结论所以给绿，不是警告', f2.verdict)
+      assert(/（没动）/.test(f2.text), '偏移前后一样时不写「放宽 0 分」这种废话', f2.text)
+      assert(f2.speed.ratio <= 0.5, '判「越来越快」的门槛是耗时掉到一半以下', String(f2.speed?.ratio))
+
+      /*
+       * 一个人批完一整场：没有任何可比的分。绝对分涨跌什么也说明不了——
+       * 后面那几份考生可能就是答得更差。这时候只能承认「口径看不出」，
+       * 不能写成「口径没动」：那是一句编出来的安慰。
+       */
+      const alone = []
+      for (let i = 1; i <= 8; i++) alone.push(mine(i, 10 + i, (i - 1) * 3, secs[i - 1]))
+      const f3 = reviewFatigue(alone, { userId: 1 }).mine
+      assert(f3.bias === null && f3.verdict === '越批越快，口径看不出' && f3.alarming === false,
+        '没有第二个人批过同一格 → 口径看不出，不说「没动」', f3.verdict)
+      /*
+       * 没有结论就不该有颜色。绿色也是一种结论：给「没证据」染上绿色，
+       * 读的人会把它记成「查过了，没问题」。
+       */
+      assert(f3.tone === '', '「口径看不出」不染色（绿色会把「没证据」读成「查过了」）', JSON.stringify(f3.tone))
+      assert(/看不出松紧/.test(f3.note) && /一个人批完一整场/.test(f3.note),
+        '「看不出」也要说清是哪种看不出', f3.note)
+
+      // 一轮不到 6 份：一页批了 4 份就说他疲劳，那只是运气
+      const short = []
+      for (let i = 1; i <= 4; i++) short.push(other(i, 10, i))
+      for (let i = 1; i <= 4; i++) short.push(mine(i, 18, (i - 1), 20))
+      const f4 = reviewFatigue(short, { userId: 1 }).mine
+      assert(f4.verdict === '样本不足' && f4.alarming === false && /还看不出前后差别/.test(f4.text),
+        '一轮不足 6 份不下结论', f4.verdict + ' / ' + f4.text)
+
+      /*
+       * 一轮的边界是 30 分钟：中间隔了 40 分钟，那是另一轮了。
+       * 疲劳是一页之内、一晚之内的事；昨天批一批今天批一批，那是状态差异，归「尺子随时间的走向」管。
+       */
+      const split = []
+      for (let i = 1; i <= 8; i++) split.push(other(i, 10, i))
+      // 第 4 份 10:03、第 5 份 10:50：中间空了 47 分钟，那是另一轮
+      for (let i = 1; i <= 8; i++) {
+        split.push(mine(i, i <= 4 ? 12 : 18, i <= 4 ? i - 1 : 50 + (i - 5), 20))
+      }
+      const sess = reviewFatigue(split, { userId: 1 }).sessions
+      assert(sess.length === 2, '相邻两条留痕隔了 40 分钟 → 切成两轮', String(sess.length))
+
+      /*
+       * seconds = 0 是「没记到」，不是「0 秒批完」。
+       * 把它当 0 算进去，后半程会凭空快成 0 秒，凭空得出一个「越批越快」。
+       */
+      const noSecs = []
+      for (let i = 1; i <= 8; i++) noSecs.push(other(i, 10, i))
+      for (let i = 1; i <= 8; i++) noSecs.push(mine(i, 10, i, 0))
+      const f5 = reviewFatigue(noSecs, { userId: 1 }).mine
+      assert(f5.speed === null && /没记到每份的耗时/.test(f5.note),
+        '耗时全是 0 时不当成「0 秒批完」，只说没记到', JSON.stringify({ speed: f5.speed, note: f5.note }))
+
+      // 撤分不算分：与 crossInfo / reviewDrift / selfBias 同一条判据
+      const revoked = [
+        mk(1, 2, '张老师', [{ id: 'q1', label: '简述', from: null, to: 12 }], '2026-11-14T09:00:00Z', 60),
+        mk(1, 1, '我', [{ id: 'q1', label: '简述', from: null, to: 18 }], at(0), 60),
+        mk(1, 1, '我', [{ id: 'q1', label: '简述', from: 18, to: null }], at(1), 60)
+      ]
+      const f6 = reviewFatigue(revoked, { userId: 1 }).mine
+      assert(!f6?.bias || f6.bias.samples.first === 0, '撤分之后这格不再算进口径（撤分不是「我给 0 分」）', JSON.stringify(f6?.bias))
+
+      // 变化不到 1 分不判：0.5 分的起伏在阅卷里就是运气
+      const tiny = []
+      for (let i = 1; i <= 8; i++) tiny.push(other(i, 10, i))
+      for (let i = 1; i <= 8; i++) tiny.push(mine(i, i <= 3 ? 10.5 : 11, i - 1, 60))
+      const f7 = reviewFatigue(tiny, { userId: 1 }).mine
+      assert(f7.verdict === '前后一致', '不到 1 分的起伏不判松紧', f7.verdict + ' / ' + f7.text)
+      assert(f7.tone === 'ok', '前后一致是结论，给绿', JSON.stringify(f7.tone))
+
+      // 只算自己的那部分：这是让人回头看自己这一轮，不是给同事之间互相点评的素材
+      const both = reviewFatigue(logs)
+      assert(both.sessions.some(x => x.key === 'u2') && reviewFatigue(logs, { userId: 1 }).sessions.every(x => x.key === 'u1'),
+        '不传 userId 时按人分开算；传了就只算我自己', JSON.stringify(both.sessions.map(x => x.key)))
+    }
+
+    // ---- 接口：批完一轮之后，下一批打开就该看得见上一轮是怎么下来的
+    cookie = await asUser('admin', 'test-pass-123')
+    let r = await req('POST', '/api/forms', {
+      title: '批卷疲劳卷', kind: 'exam',
+      schema: [
+        { id: 'f1', type: 'textarea', label: '分析一次分布式锁失效', answer: [], score: 20 },
+        // 第二道主观题一直不批：答卷才会留在阅卷队列里
+        { id: 'f2', type: 'textarea', label: '举一个幂等设计的例子', answer: [], score: 10 }
+      ],
+      settings: { passPercent: 60 }
+    })
+    const fid = r.json.id
+    await req('PUT', `/api/forms/${fid}`, { status: 'published' })
+    const subs = []
+    for (let i = 0; i < 8; i++) {
+      subs.push((await req('POST', `/api/public/forms/${fid}/submit`, { data: { f1: `第 ${i + 1} 份答案` } })).json.id)
+    }
+
+    // 张老师先把 8 格的 f1 都批成 10 分：有了「同格其他人的分」，口径才谈得上松紧
+    const fadmin = cookie
+    await req('POST', '/api/auth/register', { username: 'fatigue_b', password: 'fb-pass-123', nickname: '张老师' })
+    // 注册接口自己会带一个会话回来，不换回来后面每一条都在以张老师的身份发
+    cookie = fadmin
+    await req('POST', `/api/forms/${fid}/members`, { username: 'fatigue_b', role: 'editor' })
+    const fb = await asUser('fatigue_b', 'fb-pass-123')
+    for (const id of subs) {
+      await call(fb, 'PUT', `/api/submissions/${id}/review`, { scores: { f1: 10 }, seconds: 90 })
+    }
+
+    /*
+     * 我接着连着批这 8 份：前 3 份每份 120 秒给 12 分，后 5 份每份 20 秒给 18 分。
+     * 一次批量保存 → 八条留痕挤在同一分钟里 → 天然是同一轮。
+     */
+    const items = subs.map((id, i) => ({ id, scores: { f1: i < 3 ? 12 : 18 }, seconds: i < 3 ? 120 : 20 }))
+    r = await req('PUT', '/api/submissions/review-batch', { items })
+    assert(r.status === 200 && r.json.saved === 8, '八份一次批完', JSON.stringify(r.json))
+
+    r = await req('GET', `/api/forms/${fid}/review-queue`)
+    const fq = r.json.fatigue
+    assert(fq && fq.items === 8, '队列带着我刚才那一轮：只算我那 8 条，不含张老师的 8 条', JSON.stringify(fq?.items))
+    assert(fq.speed?.first === 120 && fq.speed?.last === 20, '两段的耗时是 120 秒与 20 秒', JSON.stringify(fq?.speed))
+    assert(fq.bias?.first === 2 && fq.bias?.last === 8 && fq.bias.delta === 6,
+      '口径从 +2 走到 +8：同题其他人给 10 分，我从 12 给到 18', JSON.stringify(fq?.bias))
+    assert(fq.verdict === '越批越快，分越来越松' && fq.alarming === true,
+      '这一轮被判成「越批越快、分越来越松」', fq.verdict)
+    assert(!JSON.stringify(fq).includes('张老师'), '不下发别人的名字（这条提示只关于我自己）', JSON.stringify(fq))
+
+    /*
+     * 单份批阅也带同一份：批量阅卷和单份批阅是两个入口，
+     * 只在批量那边显示，用单份批的人就成了唯一不知道自己这一轮松了的人。
+     */
+    r = await req('GET', `/api/submissions/${subs[7]}`)
+    assert(r.json.data.fatigue?.verdict === '越批越快，分越来越松',
+      '单份批阅的详情里也带着「我批这一份时那一轮怎么样」', JSON.stringify(r.json.data.fatigue?.verdict))
+    assert(r.json.data.fatigue.ids.includes(subs[7]), '认得出这一轮里批过这一份', JSON.stringify(r.json.data.fatigue.ids))
+
+    // 尺度页按轮列出：谁在哪一轮里松了，教研组回头看得见
+    r = await req('GET', `/api/forms/${fid}/review-calibration`)
+    assert(r.status === 200 && r.json.data.fatigue?.sessions?.length >= 2,
+      '尺度页按轮列出所有会话（我和张老师各一轮）', String(r.json.data.fatigue?.sessions?.length))
+    const mineSession = r.json.data.fatigue.sessions.find(x => x.alarming)
+    assert(mineSession && mineSession.speed.first === 120 && mineSession.bias.delta === 6,
+      '那一轮在尺度页上也是同一个形状：120 秒 → 20 秒，+2 → +8', JSON.stringify(mineSession && { s: mineSession.speed, b: mineSession.bias }))
+    /*
+     * 张老师那 8 条：一个人批完一整场，没有任何可比的分。
+     * 那里必须说「口径看不出」，不能说「口径没动」——后者是一句编出来的结论。
+     */
+    const his = r.json.data.fatigue.sessions.find(x => x.name === '张老师')
+    assert(his && his.bias === null && /看不出/.test(his.verdict),
+      '一个人批完一整场 → 「口径看不出」，不硬给一个结论', JSON.stringify(his && { b: his.bias, v: his.verdict }))
+
+    // 换成张老师问：他看到的只有自己那一轮
+    r = await call(fb, 'GET', `/api/forms/${fid}/review-queue`)
+    assert(r.json.fatigue?.items === 8 && r.json.fatigue.name === '张老师',
+      '换成张老师问，看到的是他自己那 8 条', JSON.stringify({ n: r.json.fatigue?.items, who: r.json.fatigue?.name }))
+    assert(r.json.fatigue.bias === null, '他没有可比的分，就不给一个数字', JSON.stringify(r.json.fatigue?.bias))
+  }
+
   console.log('\n[45] 前端静态资源')
 
   for (const p of ['/', '/js/main.js', '/css/app.css', '/js/views/Logs.js', '/js/views/Dicts.js', '/js/review.js', '/assets/eqs-mark.svg', '/vendor/echarts.min.js']) {

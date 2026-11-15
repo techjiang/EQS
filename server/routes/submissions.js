@@ -39,7 +39,7 @@ import { submissionsXlsx, submissionsHead, submissionRow } from '../lib/sheet.js
 import { writeXlsxStream } from '../lib/xlsx.js'
 import { signFileUrl, signFileUrls, signHtmlFiles, QUERY_FILE_TTL } from '../lib/fileAccess.js'
 // 份数/分数的留痕口径只有一份：前端也是这套（web/js/review.js），两边说的必须是同一件事
-import { scoreChanges, changeText, calibrate, gapLevel, reviewDrift, driftText, regradeRuler, regradeText, standingText, queueUrgency, orderQueue, queueSummary, selfBias, selfQuestion } from '../../web/js/review.js'
+import { scoreChanges, changeText, calibrate, gapLevel, reviewDrift, driftText, reviewFatigue, regradeRuler, regradeText, standingText, queueUrgency, orderQueue, queueSummary, selfBias, selfQuestion } from '../../web/js/review.js'
 
 function fingerprint(req, extra = {}) {
   return {
@@ -624,8 +624,24 @@ export default function register(r) {
      * 而「你比同题其他人高 6 分」这件事在哪个入口给分都该看得见——
      * 只在批量那边显示，用单份批的人就成了唯一不知道自己在戴什么眼镜的人。
      */
-    const self = form && form.kind === 'exam' ? selfBias(formReviewEntries(form), { userId: user.id }) : null
-    sendJson(res, 200, { ok: true, data: { ...withManual(row), reviewer, band, verdicts, self, review_logs: reviewLogs(row.id, 20), form } })
+    /*
+     * 留痕只读一次：我这把尺子、我刚才那一轮批得怎么样，用的是同一批行。
+     * 两条 SQL 各读一遍的话，一处改了过滤条件另一处不知道，两句结论就会互相打脸。
+     */
+    const entries = form && form.kind === 'exam' ? formReviewEntries(form) : []
+    const self = form && form.kind === 'exam' ? selfBias(entries, { userId: user.id }) : null
+    /*
+     * 疲劳要问的是「我批这一份时，那一轮整体怎么样」，不是「我最近一轮怎么样」——
+     * 后者可能是别的卷子的事。所以先找包含这一份的那一轮，找不到才退回最近一轮。
+     */
+    const fatigue = entries.length
+      ? (() => {
+          const all = reviewFatigue(entries, { userId: user.id })
+          const hit = all.sessions.find(s => s.ids.includes(Number(row.id)))
+          return hit || all.mine
+        })()
+      : null
+    sendJson(res, 200, { ok: true, data: { ...withManual(row), reviewer, band, verdicts, self, fatigue, review_logs: reviewLogs(row.id, 20), form } })
   })
 
   /** 一份答卷的批阅历史（按次倒序）：谁、什么时候、动了哪几题、从几分改到几分 */
@@ -935,6 +951,15 @@ export default function register(r) {
      * 不是给同事之间互相点评提供素材（那是尺度页做的事，它有权限门槛）。
      */
     const self = selfBias(entries, { userId: user.id })
+    /*
+     * 我刚才那一轮批得怎么样。
+     *
+     * 「我比同题其他人平均高 5.3 分」是平均值：一个人连着批 40 份，前 10 份认真、
+     * 后 30 份照着印象给，平均下来只偏一点，而真正松掉的是后面那 30 份。
+     * 这里给的是同一位老师、同一轮连续批阅里，头几份与最后几份的耗时和口径——
+     * 重点不是「快」，是「快起来的同时口径有没有跟着动」。
+     */
+    const fatigue = reviewFatigue(entries, { userId: user.id }).mine
     // 按 id 排的那一档保留成可选：老师想按交卷顺序从头扫一遍时还在
     const order = url.searchParams.get('order') === 'id' ? 'id' : 'priority'
     const ordered = orderQueue(queue, { mode: order })
@@ -1005,7 +1030,9 @@ export default function register(r) {
       ok: true, data, total: queue.length, need, done: Math.max(need - queue.length, 0), scanned,
       offset, limit, order, summary,
       // 我自己的尺子：批的人先看清自己戴着什么颜色的眼镜，再下手给分
-      self
+      self,
+      // 我刚才那一轮是不是越批越快、分越给越松
+      fatigue
     })
   })
 
@@ -1035,11 +1062,13 @@ export default function register(r) {
      * 而 review_logs.changes 是 JSON，SQL 里拆不开——一次考试几千条而已，读回来再算。
      * 按 id 正序：后写的覆盖先写的，跟写入端的时间顺序一致。
      */
-    const rows = all(`SELECT id, submission_id, user_id, username, changes, created_at FROM review_logs
+    const rows = all(`SELECT id, submission_id, user_id, username, seconds, changes, created_at FROM review_logs
       WHERE form_id = ?${since ? ' AND created_at >= ?' : ''} ORDER BY id ASC`,
       ...(since ? [form.id, since] : [form.id]))
     const entries = rows.map(r => ({
       submissionId: r.submission_id, userId: r.user_id, username: r.username || '',
+      // 耗时是「批卷疲劳」唯一的来源：少这一列，尺度页上那张表就永远是「没记到每份的耗时」
+      seconds: Number(r.seconds) || 0,
       createdAt: r.created_at, changes: safeJson(r.changes, [])
     }))
     // 满分从当前 schema 取：尺度说的「差了几分」必须跟题目现在的分值对得上
@@ -1056,6 +1085,14 @@ export default function register(r) {
      */
     const drift = reviewDrift(entries)
     for (const t of drift.teachers) t.text = driftText(t)
+    /*
+     * 批卷疲劳：同一位老师、同一轮连续批阅里，越批越快、分越给越松。
+     *
+     * 「谁偏松 4.6 分」是所有制摞在一起的平均值，于是「前 10 份认真、后 30 份照着印象给」
+     * 会被平均成「只偏一点」。这里按轮切：相邻两条留痕间隔不超过 30 分钟算同一轮，
+     * 只比头尾各 3 份。速度是事实但不是指控——真正的证据是「快起来的同时口径有没有跟着动」。
+     */
+    const fatigue = reviewFatigue(entries)
     /*
      * 换一把尺子重批全场：按某位的尺子，谁会被推出及格线。
      *
@@ -1110,6 +1147,7 @@ export default function register(r) {
          * 「两人给分一致」在库里其实是看不见的——能说的只有「没找到改过分的地方」。
          */
         drift,
+        fatigue,
         regrade,
         /*
          * 三种「没有悬着的分歧」要说成三句话，混成一句会把「都定完了」说成「一处都没有」：

@@ -116,9 +116,11 @@ export function crossedBySubmission(form, rows) {
  */
 export function formReviewEntries(form) {
   if (!form) return []
-  return all('SELECT submission_id, user_id, username, changes, created_at FROM review_logs WHERE form_id = ? ORDER BY id ASC', form.id)
+  return all('SELECT submission_id, user_id, username, seconds, changes, created_at FROM review_logs WHERE form_id = ? ORDER BY id ASC', form.id)
     .map(r => ({
       submissionId: r.submission_id, userId: r.user_id, username: r.username || '',
+      // 耗时是「批卷疲劳」那条线的唯一数据来源：一份卷子批了多久，只有这里记着
+      seconds: Number(r.seconds) || 0,
       createdAt: r.created_at, changes: safeJson(r.changes, [])
     }))
 }

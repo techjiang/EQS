@@ -130,6 +130,10 @@ p{margin:0}
 .self-bias.high{border-left-color:var(--warn);background:rgba(245,158,11,.07)}
 .self-bias.low{border-left-color:var(--brand);background:rgba(91,124,250,.07)}
 .self-bias.flat{border-left-color:var(--ok);background:rgba(16,185,129,.07)}
+/* 批卷疲劳那条横幅：只有「快起来的同时分也松了」才染警告色。
+   快而口径没动是正确的行为，染上颜色等于把好事写成一条提醒，这条提示很快就会没人读 */
+.self-bias.fatigue{border-left-style:dashed}
+.self-bias.alarm{border-left-style:solid;border-left-color:var(--warn);background:rgba(245,158,11,.07)}
 .self-bias b{font-weight:650}
 
 .stat{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:18px;position:relative;overflow:hidden}
