@@ -20,6 +20,25 @@ import { scoreBand, crossedOf } from '../../web/js/review.js'
 
 const cols = rows => rows.map(() => '?').join(',')
 
+/**
+ * 这张卷子上的结案记录。
+ *
+ * 结案不定分数、只记「这一格按几分算、谁拍的板」——所以它必须参与**所有**
+ * 把分歧折算成区间的地方，否则成绩单上照样挂着一个收不住的范围，
+ * 而尺度页上写着「已定案」，两处对不上。
+ *
+ * 一次读全表：一张卷子的结案记录是「有分歧的格子数」这个量级，
+ * 比答卷少一到两个数量级，按页/按行查反而更贵。
+ */
+export function verdictsOf(form) {
+  if (!form) return []
+  return all('SELECT id, submission_id, question_id, value, username, note, created_at FROM review_verdicts WHERE form_id = ? ORDER BY id ASC', form.id)
+    .map(v => ({
+      id: v.id, submissionId: v.submission_id, questionId: v.question_id,
+      value: v.value, username: v.username || '', note: v.note || '', createdAt: v.created_at
+    }))
+}
+
 /** 留痕按答卷分组：entries 的字段名与 web/js/review.js 的回放口径对齐 */
 function groupLogs(rows) {
   const map = new Map()
@@ -47,11 +66,14 @@ export function bandsOf(form, rows) {
   const ids = [...new Set(rows.map(r => Number(r.id)).filter(Boolean))]
   if (!ids.length) return out
   const maxOf = maxOfFn(form)
+  const verdicts = verdictsOf(form)
   const grouped = groupLogs(all(
     `SELECT submission_id, user_id, username, changes, created_at FROM review_logs
       WHERE submission_id IN (${cols(ids)}) ORDER BY id ASC`, ...ids))
   for (const row of rows) {
-    const band = scoreBand(grouped.get(Number(row.id)) || [], { maxOf, score: row.score, manual: manualScoresOf(row) })
+    // 结案过的格子不再撑开区间：有人拍过板的分歧不该继续留在成绩单上
+    const mine = verdicts.filter(v => Number(v.submissionId) === Number(row.id))
+    const band = scoreBand(grouped.get(Number(row.id)) || [], { maxOf, score: row.score, manual: manualScoresOf(row), verdicts: mine })
     if (band) out.set(Number(row.id), band)
   }
   return out
@@ -70,11 +92,16 @@ export function crossedBySubmission(form, rows) {
   const ids = [...new Set(rows.map(r => Number(r.id)).filter(Boolean))]
   if (!ids.length) return out
   const maxOf = maxOfFn(form)
+  const verdicts = verdictsOf(form)
   const grouped = groupLogs(all(
     `SELECT submission_id, user_id, username, changes, created_at FROM review_logs
       WHERE submission_id IN (${cols(ids)}) ORDER BY id ASC`, ...ids))
   for (const [sid, entries] of grouped) {
-    const list = [...crossedOf(entries).values()].flat().map(c => ({ ...c, max: maxOf(c.id) }))
+    // 这里用 only: 'all'：批阅人要知道的不只是「有人给了别的分」，
+    // 还有「这题已经定案按 18 分算了」——不然他会以为自己是第一个要拍板的人
+    const mine = verdicts.filter(v => Number(v.submissionId) === Number(sid))
+    const list = [...crossedOf(entries, { verdicts: mine, only: 'all' }).values()].flat()
+      .map(c => ({ ...c, max: maxOf(c.id) }))
     if (list.length) out.set(sid, list)
   }
   return out
@@ -93,10 +120,14 @@ export function crossedBySubmission(form, rows) {
 export function crossedCountByForm(form) {
   const out = new Map()
   if (!form || form.kind !== 'exam') return out
+  const verdicts = verdictsOf(form)
   const grouped = groupLogs(all(
     'SELECT submission_id, user_id, username, changes, created_at FROM review_logs WHERE form_id = ? ORDER BY id ASC', form.id))
   for (const [sid, entries] of grouped) {
-    const n = [...crossedOf(entries).values()].flat().length
+    // 只数还悬着的：已经定案的口径不需要「等下一个批的人定」，
+    // 把它算进去，队列会一直挂着一个永远消不掉的标签
+    const mine = verdicts.filter(v => Number(v.submissionId) === Number(sid))
+    const n = [...crossedOf(entries, { verdicts: mine }).values()].flat().length
     if (n) out.set(sid, n)
   }
   return out
@@ -112,7 +143,18 @@ export function crossedCountByForm(form) {
 export function formBandReader(form) {
   if (!form || form.kind !== 'exam') return () => null
   const maxOf = maxOfFn(form)
+  const verdicts = verdictsOf(form)
+  const bySubmission = new Map()
+  for (const v of verdicts) {
+    const k = Number(v.submissionId)
+    if (!bySubmission.has(k)) bySubmission.set(k, [])
+    bySubmission.get(k).push(v)
+  }
   const grouped = groupLogs(all(
     'SELECT submission_id, user_id, username, changes, created_at FROM review_logs WHERE form_id = ? ORDER BY id ASC', form.id))
-  return (row) => scoreBand(grouped.get(Number(row.id)) || [], { maxOf, score: row.score, manual: manualScoresOf(row) })
+  // 导出与列表、榜单同一口径：带区间的结论必须处处一致，否则 Excel 里是 71≈59~71、
+  // 页面上是 71，对着同一份数据给人看，两边都不可信
+  return (row) => scoreBand(grouped.get(Number(row.id)) || [], {
+    maxOf, score: row.score, manual: manualScoresOf(row), verdicts: bySubmission.get(Number(row.id)) || []
+  })
 }

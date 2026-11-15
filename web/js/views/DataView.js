@@ -5,7 +5,7 @@ import { ok, err, confirmBox, fmtDate, Empty, Modal, Pagination, escapeHtml } fr
 import { Icon } from '../icons.js'
 import { renderControl, answerDisplay } from '../renderer.js'
 import { buildFlow } from '../flow.js'
-import { batchPayload, nextIndex, reviewProgress, afterSave, elapsedSeconds, changeText, changeLine, humanSeconds, gapLevel, bandText, biasText, regradeText, standingText, URGENCY_LABEL } from '../review.js'
+import { batchPayload, nextIndex, reviewProgress, afterSave, elapsedSeconds, changeText, changeLine, humanSeconds, gapLevel, bandText, biasText, regradeText, standingText, URGENCY_LABEL, verdictText } from '../review.js'
 
 export default {
   setup() {
@@ -261,9 +261,13 @@ export default {
           // 这一次从什么时候开始下手：留痕里的「耗时」不该从弹窗打开算起
           startedAt: 0,
           scores: { ...(sub.manual_scores || {}) },
+          // 这一格定过案没有：弹窗打开就要说清「按 18 分算，李老师定的」，
+          // 不然下一个人会给一个第三种口径，而这件事在尺度页上要等到下次开会才被看见
+          verdicts: sub.verdicts || [],
           items: subjective.map(q => ({
             id: q.id, label: q.label, score: Number(q.score) || 0,
-            given: data[q.id], analysis: q.analysis || ''
+            given: data[q.id], analysis: q.analysis || '',
+            verdict: (sub.verdicts || []).find(v => v.questionId === q.id) || null
           }))
         }
       } catch (e) { err(e.message) }
@@ -420,6 +424,35 @@ export default {
         + '算下来一分也不会变——要么批过的地方跟现在的分本来就一致，要么偏移被题目的上下界剪掉了。'
     }
 
+    /**
+     * 一处分歧定案：这一格以后按几分算。
+     *
+     * 系统里一直没有「到此为止」这个动作——两位老师批过的格子会永久留在回放里，
+     * 于是成绩单上的区间永远收不住。唯一能让它有结论的老办法是第三个人再给一次分，
+     * 而那只是把「两个人的分歧」变成「三个人的分歧」。
+     *
+     * 这里定案会把分数落成结论值（照旧留痕，谁改的、从几分改到几分），
+     * 并记一条「这处分歧已拍板」。撤回结案也走这个入口：分歧重新待处理。
+     */
+    const verdictBusy = ref('')
+    const settle = async (formId2, submissionId, questionId, value, label) => {
+      const key = `${submissionId}::${questionId}`
+      if (verdictBusy.value) return
+      verdictBusy.value = key
+      try {
+        await api.post(`/api/submissions/${submissionId}/review-verdict`, {
+          questionId, value,
+          note: value === null ? '撤回分歧结案' : '分歧结案'
+        })
+        ok(value === null
+          ? `已撤回「${String(label).slice(0, 14)}」的结案，这处分歧重新待处理`
+          : `已定案：「${String(label).slice(0, 14)}」按 ${value} 分算，这格不再撑开区间`)
+        // 重新拉一次：分歧清单、成绩单、队列摘要三处都要跟着变，改一处显示只会让它们互相矛盾
+        await openCalibration()
+        load()
+      } catch (e) { err(e.message) } finally { verdictBusy.value = '' }
+    }
+
     const calibration = ref(null)
     const openCalibration = async () => {
       if (!form.value) return err('请先在左上角选择一个具体表单')
@@ -427,7 +460,9 @@ export default {
       try {
         calibration.value = { title: form.value.title, loading: true }
         const r = await api.get(`/api/forms/${formId.value}/review-calibration`)
-        calibration.value = { title: form.value.title, loading: false, ...r.data }
+        // formId 一起存下来：定案时要按这张卷子的成员权限过一遍，不能靠「当前选中的表单」——
+        // 弹窗开着的时候左上角还可能被切走
+        calibration.value = { title: form.value.title, formId: formId.value, loading: false, ...r.data }
       } catch (e) {
         calibration.value = null
         err(e.message)
@@ -870,6 +905,22 @@ export default {
                   `，换成另一位老师是 ${row.low} ~ ${row.high} 分`)
               ])
             })(),
+            /*
+             * 这格有人拍过板：结论摆在给分框上面，不是埋在尺度页里。
+             * 批阅人此刻要决定的是「改成几分」，而「之前定过 15 分、现在被改成 6 分」
+             * 恰恰是他最该知道的一件事——两者不一致时，他改成多少都是在推翻一个已经签过字的结论。
+             */
+            it.verdict ? h('div', { class: 'small', style: 'margin-top:6px' }, [
+              h('span', { class: ['tag', Number(it.verdict.value) === Number(review.value.scores[it.id]) ? 'ok' : 'warn'] },
+                '已定案'),
+              h('span', { style: 'margin-left:6px;color:var(--text-2)' },
+                `按 ${it.verdict.value} 分算${it.verdict.username ? `，${it.verdict.username} 定` : ''}`
+                + (review.value.scores[it.id] === undefined
+                  ? '，但这一格现在没有分'
+                  : Number(review.value.scores[it.id]) === Number(it.verdict.value)
+                    ? ''
+                    : `，现在改成 ${review.value.scores[it.id]} 分——保存后会推翻这个结论`))
+            ]) : null,
             h('div', { class: 'small muted', style: 'margin:8px 0 4px' }, '作答'),
             h('div', { style: 'white-space:pre-wrap;word-break:break-word;margin-bottom:8px' },
               it.given == null || it.given === '' ? h('span', { class: 'muted' }, '（未作答）') : String(it.given)),
@@ -937,6 +988,24 @@ export default {
             h('div', { class: 'small muted', style: 'margin-top:6px' },
               '同一个人给的分没被人改过就不会留痕，所以这里只统计「被后一位老师改过」的地方——它是下限，不是全部。'),
             /*
+             * 定案了多少、还有多少悬着。三句话要分开：定完的 / 定过又被打回去的 / 从没定过的。
+             * 混成一句「已处理 6 处」，读者就不知道剩下 2 处是新冒出来的还是旧账又翻上来了。
+             */
+            calibration.value.settledCells || calibration.value.stale
+              ? h('div', { class: 'small', style: 'margin-top:6px' }, [
+                  calibration.value.settledCells
+                    ? h('span', {}, [h('b', {}, `${calibration.value.settledCells} 处`), '已经拍过板，成绩单上不再带区间'])
+                    : null,
+                  calibration.value.settledCells && calibration.value.stale ? h('span', { class: 'muted' }, ' · ') : null,
+                  calibration.value.stale
+                    ? h('span', { style: 'color:var(--danger)' }, [
+                        h('b', {}, `${calibration.value.stale} 处`),
+                        '定过案但成绩单对不上（有人后来改了分），重新回到待处理'
+                      ])
+                    : null
+                ])
+              : null,
+            /*
              * 把「18 处分歧」换算成成绩单上的话：几份卷子的总分因此带上了区间、最大浮动多少。
              * 抽象的分歧数读者得自己换算成「所以呢」，而这两句是直接可读的结论。
              */
@@ -966,13 +1035,49 @@ export default {
                 ...q.cells.slice(0, 4).map(c => h('div', {
                   class: 'small', style: 'margin-top:6px;color:var(--text-2)'
                 }, [
-                  h('span', { class: 'mono muted', style: 'margin-right:6px' }, `#${c.submissionId}`),
-                  ...c.by.map((p2, i) => h('span', {}, [
-                    i ? h('span', { class: 'muted', style: 'margin:0 5px' }, 'vs') : null,
-                    h('b', {}, p2.name || '未知账号'),
-                    h('span', {}, ` ${p2.value} 分`)
-                  ])),
-                  h('span', { class: 'muted', style: 'margin-left:8px' }, `差 ${c.gap} 分`)
+                  h('div', { class: 'flex between wrap', style: 'gap:8px;align-items:center' }, [
+                    h('div', { class: 'flex wrap', style: 'gap:4px;align-items:center' }, [
+                      h('span', { class: 'mono muted', style: 'margin-right:2px' }, `#${c.submissionId}`),
+                      ...c.by.map((p2, i) => h('span', {}, [
+                        i ? h('span', { class: 'muted', style: 'margin:0 5px' }, 'vs') : null,
+                        h('b', {}, p2.name || '未知账号'),
+                        h('span', {}, ` ${p2.value} 分`)
+                      ])),
+                      h('span', { class: 'muted', style: 'margin-left:8px' }, `差 ${c.gap} 分`)
+                    ]),
+                    /*
+                     * 定案：这一格以后按谁的分算。
+                     *
+                     * 老做法是让第三个人再给一次分——那只是把两个人的分歧变成三个人的分歧，
+                     * 分歧数一个不会少。这里直接让分歧有结论：按某个人的分算，
+                     * 或者按判卷人自己定的分算（中间值往往才是真想要的）。
+                     */
+                    h('div', { class: 'flex', style: 'gap:4px;flex:none' }, [
+                      ...(c.stale
+                        ? [h('button', {
+                            class: 'btn sm primary', disabled: verdictBusy.value === `${c.submissionId}::${c.id}`,
+                            onClick: () => settle(calibration.value.formId, c.submissionId, c.id, c.verdict.value, q.label)
+                          }, `按 ${c.verdict.value} 分重定`)]
+                        : c.by.map(p2 => h('button', {
+                            class: 'btn sm', disabled: !!verdictBusy.value,
+                            title: `按${p2.name || '未知账号'}的 ${p2.value} 分定了，成绩单上这格不再带区间`,
+                            onClick: () => settle(calibration.value.formId, c.submissionId, c.id, p2.value, q.label)
+                          }, `按 ${p2.value} 分`))),
+                      c.verdict
+                        ? h('button', {
+                            class: 'btn sm ghost', disabled: !!verdictBusy.value,
+                            title: '撤回结案，这处分歧重新回到待处理',
+                            onClick: () => settle(calibration.value.formId, c.submissionId, c.id, null, q.label)
+                          }, '撤回')
+                        : null
+                    ])
+                  ]),
+                  c.stale
+                    ? h('div', { style: 'margin-top:2px' }, [
+                        h('span', { class: 'tag warn' }, '结论过期'),
+                        h('span', { style: 'margin-left:6px' }, verdictText(c))
+                      ])
+                    : null
                 ])),
                 q.cells.length > 4
                   ? h('div', { class: 'small muted', style: 'margin-top:4px' }, `另有 ${q.cells.length - 4} 处不一致未展开`)
@@ -1165,6 +1270,27 @@ export default {
                     h('div', { class: 'small muted' }, calibration.value.regrade.note)
                   ])
                 : null),
+            /*
+             * 已经拍过板的那批。它们不出现在上面的分歧清单里（不悬着了），
+             * 但也不能就这么消失——「我们定过哪几处、按谁的尺子定的」是这场考试的口径档案，
+             * 事后被问「为什么这份卷子是 71 分而不是 58」时要能翻出来。
+             */
+            calibration.value.resolved?.length ? h('details', { style: 'margin-top:14px' }, [
+              h('summary', { class: 'small', style: 'font-weight:600;cursor:pointer' },
+                `已拍板的分歧 ${calibration.value.resolved.length} 处`),
+              ...calibration.value.resolved.slice(0, 12).map(c => h('div', {
+                class: 'small', style: 'padding:6px 0;border-top:1px dashed var(--line);color:var(--text-2)'
+              }, [
+                h('span', { class: 'mono muted', style: 'margin-right:6px' }, `#${c.submissionId}`),
+                h('b', {}, c.label),
+                h('span', { style: 'margin-left:8px' }, c.by.map(p2 => `${p2.name || '未知账号'} ${p2.value} 分`).join(' vs ')),
+                h('span', { style: 'margin-left:8px;color:var(--text-3)' }, verdictText(c))
+              ])),
+              calibration.value.resolved.length > 12
+                ? h('div', { class: 'small muted', style: 'margin-top:4px' },
+                    `另有 ${calibration.value.resolved.length - 12} 处未展开`)
+                : null
+            ]) : null,
             calibration.value.teachers?.length > 1
               ? h('div', { class: 'small muted', style: 'margin-top:12px' },
                   '参与批阅的账号：' + calibration.value.teachers.map(t => `${t.name || '未知账号'}（${t.gradings} 次）`).join(' · '))
@@ -1243,9 +1369,21 @@ export default {
                * 老师要的是「这一份、这一题，之前有人给了几」——不然第三个口径又是随手定的。
                */
               it.others?.length ? h('div', { class: 'small', style: 'margin-top:4px' }, [
-                h('span', { class: 'tag warn' }, '尺子不一'),
+                // 结案过的格子换一个颜色：还悬着的是「等你定」，定过的是「有人定过了，你可以推翻但要知道自己在推翻什么」
+                h('span', { class: ['tag', it.settled ? 'ok' : 'warn'] }, it.settled ? '已定案' : '尺子不一'),
                 h('span', { style: 'margin-left:6px;color:var(--text-2)' },
-                  it.others.map(p2 => `${p2.name || '未知账号'} ${p2.value} 分`).join(' · '))
+                  it.others.map(p2 => `${p2.name || '未知账号'} ${p2.value} 分`).join(' · ')),
+                // 定了案的那句结论必须写出来：下一个批阅人要知道「现在这格按几分算」，
+                // 否则他会以为自己是第一个拍板的人，再给一个第三种分
+                it.settled && it.verdict
+                  ? h('span', { class: 'muted', style: 'margin-left:8px' },
+                      verdictText({ verdict: it.verdict, settled: true, stale: false }))
+                  : null,
+                // 结论被推翻的：@ 一下当前的分，读者才知道「定的是几分、现在又是几分」
+                it.verdict && !it.settled
+                  ? h('span', { class: 'muted', style: 'margin-left:8px' },
+                      `定过 ${it.verdict.value} 分，现在这格不是这个数——分歧又回到待处理`)
+                  : null
               ]) : null,
               h('div', {
                 style: 'white-space:pre-wrap;word-break:break-word;margin:6px 0 8px;font-size:13px;color:var(--text-2)'

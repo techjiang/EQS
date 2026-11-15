@@ -46,6 +46,38 @@ CREATE INDEX IF NOT EXISTS idx_review_logs_sub ON review_logs(submission_id, id)
 CREATE INDEX IF NOT EXISTS idx_review_logs_form ON review_logs(form_id, id);
 `
 
+/*
+ * 分歧结案。
+ *
+ * 留痕、区间、尺度对账、阅卷队列这几块都是「回头看」：谁偏松、差几分、哪一份浮动多大。
+ * 但系统里一直没有「这件事到此为止」这个动作——一份卷子只要被两位老师批过，
+ * 它成绩单上的区间就永久存在，因为回放里那两个人的分永远都在。
+ * 唯一能让它「有结论」的办法是第三个老师再给一次分，而那一来就多出第三个人，
+ * 分歧从 2 个人变成 3 个人，一点没变少。
+ *
+ * 所以这里单独记一条「结论」：这一格以后按哪个分算、谁定的、凭什么。
+ * 它不改分数（改分仍走 review_logs，谁动过谁负责），只回答「这处分歧已经有人拍板了」。
+ * 追加写、不覆盖：改口也是历史，取最后一条为准。
+ */
+const REVIEW_VERDICT_DDL = `
+CREATE TABLE IF NOT EXISTS review_verdicts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  form_id INTEGER NOT NULL,
+  submission_id INTEGER NOT NULL,
+  question_id TEXT NOT NULL,
+  -- 可空：value 为 NULL 的那一行是「撤回结案」。撤回本身也是一次改口，行不能删，
+  -- 否则事后说不清这格到底有没有人拍过板
+  value REAL,
+  source TEXT DEFAULT '',
+  note TEXT DEFAULT '',
+  user_id INTEGER NOT NULL DEFAULT 0,
+  username TEXT DEFAULT '',
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_review_verdicts_cell ON review_verdicts(submission_id, question_id, id);
+CREATE INDEX IF NOT EXISTS idx_review_verdicts_form ON review_verdicts(form_id, id);
+`
+
 const now = () => new Date().toISOString()
 
 db.exec(`
@@ -280,6 +312,7 @@ CREATE INDEX IF NOT EXISTS idx_sub_created ON submissions(created_at);
 /* 按表单 + 时间取数（时间范围筛选）走这条，省掉回表 */
 CREATE INDEX IF NOT EXISTS idx_sub_form_created ON submissions(form_id, created_at);
 ${REVIEW_LOG_DDL}
+${REVIEW_VERDICT_DDL}
 /*
  * 成绩排名按 (表单, 分数倒序) 取前 N 名。
  * 没有这条索引时，SQLite 要把这个表单的全部答卷读出来排一遍才能给出前 20 名——
@@ -363,6 +396,7 @@ PRAGMA busy_timeout = 5000;
 `)
   // 导入老备份时库文件是直接顶替的，新表要在这里补齐，否则第一条批阅就 no such table
   db.exec(REVIEW_LOG_DDL)
+  db.exec(REVIEW_VERDICT_DDL)
   resetStatementCache()
   return db
 }

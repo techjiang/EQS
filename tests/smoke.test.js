@@ -5509,6 +5509,210 @@ try {
       JSON.stringify({ page: r.json.data.map(x => x.id), whole: whole.json.data.map(x => x.id) }))
   }
 
+  console.log('\n[74] 分歧结案：这处分歧按几分算，到此为止')
+  {
+    // ---- 纯函数：结案状态怎么判
+    {
+      const { calibrate, crossedOf, scoreBand, verdictText } = await import('../web/js/review.js')
+      const mk = (sub, uid, name, at, changes) => ({ submissionId: sub, userId: uid, username: name, createdAt: at, changes })
+      const logs = [
+        mk(1, 1, '张老师', '2026-11-14T09:00:00Z', [{ id: 'q1', label: '下一季度计划', from: null, to: 4 }]),
+        mk(1, 2, '李老师', '2026-11-14T09:05:00Z', [{ id: 'q1', label: '下一季度计划', from: 4, to: 18 }])
+      ]
+      const vd = (value, extra = {}) => [{ id: 1, submissionId: 1, questionId: 'q1', value, username: '教研组长', createdAt: '2026-11-15T09:00:00Z', ...extra }]
+
+      // 没定案：一处分歧，成绩单带区间
+      let cal = calibrate(logs, { maxOf: () => 20 })
+      assert(cal.conflicts === 1 && cal.settledCells === 0 && cal.stale === 0,
+        '没定案时这处分歧算「悬着」', JSON.stringify({ c: cal.conflicts, s: cal.settledCells }))
+      assert(scoreBand(logs, { maxOf: () => 20, score: 18, manual: { q1: 18 } })?.low === 4,
+        '没定案时成绩单带区间（换另一位老师会是 4 分）')
+
+      /*
+       * 定案按 18 分算：当前分也是 18 → 结案成立，这格不再算「悬着」，成绩单也不再带区间。
+       * 这是这一轮的核心：以前没有任何办法让一处分歧「到此为止」——
+       * 回放里两个人的分永远都在，区间就永远收不住。
+       */
+      cal = calibrate(logs, { maxOf: () => 20, verdicts: vd(18) })
+      assert(cal.conflicts === 0 && cal.settledCells === 1 && cal.stale === 0,
+        '定案之后这处分歧不再算悬着', JSON.stringify({ c: cal.conflicts, s: cal.settledCells, st: cal.stale }))
+      assert(cal.resolved.length === 1 && cal.resolved[0].verdict.value === 18 && cal.resolved[0].verdict.name === '教研组长',
+        '定过案的留在「已拍板」清单里（不是删掉），谁定的也要记着', JSON.stringify(cal.resolved[0]))
+      assert(scoreBand(logs, { maxOf: () => 20, score: 18, manual: { q1: 18 }, verdicts: vd(18) }) === null,
+        '定案之后这份卷子的成绩单不再带区间')
+      assert([...crossedOf(logs, { verdicts: vd(18) }).values()].flat().length === 0,
+        '定案过的格子不再出现在「尺子不齐」里（批次队列那一路用的也是它）')
+      assert([...crossedOf(logs, { verdicts: vd(18), only: 'all' }).values()].flat()[0]?.settled === true,
+        '但阅卷提醒要看得见「已定案」——下一个批阅人不能以为自己是第一个拍板的人')
+
+      /*
+       * 结论过期：定的是 18，后来有人改成 6。判据是「成绩单认不认这个结论」，不是时间序——
+       * 改成 6 再改回 18 就该重新算成立，那才是这个格子现在的状态。
+       */
+      const changed = [...logs, mk(1, 3, '王老师', '2026-11-16T09:00:00Z', [{ id: 'q1', label: '下一季度计划', from: 18, to: 6 }])]
+      cal = calibrate(changed, { maxOf: () => 20, verdicts: vd(18) })
+      assert(cal.conflicts === 1 && cal.stale === 1 && cal.settledCells === 0,
+        '定过案又被改成别的分 → 成绩单对不上结论，这处分歧重新回到待处理', JSON.stringify({ c: cal.conflicts, st: cal.stale }))
+      assert(/定过案/.test(verdictText(cal.questions[0].cells[0])) && /现在是 6 分/.test(verdictText(cal.questions[0].cells[0])),
+        '过期那句话要说清「定的是几分、现在又是几分」', verdictText(cal.questions[0].cells[0]))
+      const back = [...changed, mk(1, 4, '王老师', '2026-11-17T09:00:00Z', [{ id: 'q1', label: '下一季度计划', from: 6, to: 18 }])]
+      assert(calibrate(back, { maxOf: () => 20, verdicts: vd(18) }).settledCells === 1,
+        '改来改去又改回结论值 → 重新算成立（看的是当前分，不是「之后有没有人动过手」）')
+
+      // 撤回结案：分歧重新待处理
+      const revoked = vd(18).concat([{ id: 2, submissionId: 1, questionId: 'q1', value: null, username: '教研组长', createdAt: '2026-11-18T09:00:00Z' }])
+      assert(calibrate(logs, { maxOf: () => 20, verdicts: revoked }).conflicts === 1,
+        '撤回结案之后分歧重新算悬着（取最后一条为准）')
+
+      // 结案不改写历史：两两对账照旧把两个人的分歧算进尺子
+      cal = calibrate(logs, { maxOf: () => 20, verdicts: vd(18) })
+      assert(cal.pairs.length === 1 && cal.pairs[0].count === 1,
+        '定案收的是「还要不要继续摆着」，不是改写历史：两个人对过的那一格照旧算进尺子统计',
+        JSON.stringify(cal.pairs))
+    }
+
+    // ---- 接口：定案一次做两件事（落分 + 记结论），撤回与过期也要能走通
+    // 前面的用例可能把全局会话留在别的账号上，这里显式回到管理员
+    cookie = await asUser('admin', 'test-pass-123')
+    let r = await req('POST', '/api/forms', {
+      title: '分歧结案卷', kind: 'exam',
+      schema: [
+        { id: 'c1', type: 'textarea', label: '简述缓存穿透的三种处理方式', answer: [], score: 20 },
+        // 第二道主观题一直留着不给分：这份答卷才会留在阅卷队列里，
+        // 才验证得了「队列里这道题标着已定案」
+        { id: 'c2', type: 'textarea', label: '再举一个缓存雪崩的例子', answer: [], score: 10 },
+        { id: 'o1', type: 'radio', label: '客观题', options: [{ label: '对', value: 'Y' }, { label: '错', value: 'N' }], answer: ['Y'], score: 10 }
+      ],
+      settings: { passPercent: 60 }
+    })
+    const vid = r.json.id
+    await req('PUT', `/api/forms/${vid}`, { status: 'published' })
+    const vsub = (await req('POST', `/api/public/forms/${vid}/submit`, { data: { c1: '布隆过滤器', o1: 'Y' } })).json.id
+
+    // 注册会自动登录成新账号，先把管理员的会话存下来
+    const vadmin = cookie
+    await req('POST', '/api/auth/register', { username: 'vd_b', password: 'vb-pass-123', nickname: '李老师' })
+    cookie = vadmin
+    const addB = await req('POST', `/api/forms/${vid}/members`, { username: 'vd_b', role: 'editor' })
+    assert(addB.status === 201, '把第二位老师拉进这张卷子', JSON.stringify(addB.json))
+    const vb = await asUser('vd_b', 'vb-pass-123')
+
+    const holder2 = cookie
+    // 两位老师对同一格给出 6 分和 18 分
+    r = await req('PUT', `/api/submissions/${vsub}/review`, { scores: { c1: 6 } })
+    assert(r.status === 200 && r.json.data.score === 16, '张老师给 6 分（客观 10 + 主观 6）', JSON.stringify(r.json?.data?.score))
+    r = await call(vb, 'PUT', `/api/submissions/${vsub}/review`, { scores: { c1: 18 } })
+    assert(r.status === 200 && r.json.data.score === 28, '李老师在同一格给 18 分', JSON.stringify(r.json?.data?.score))
+    cookie = holder2
+
+    // 此刻成绩单带区间：换另一位老师会是 16 ~ 28
+    r = await req('GET', '/api/submissions?formId=' + vid)
+    let row = r.json.data.find(x => x.id === vsub)
+    assert(row?.band && row.band.low === 16 && row.band.high === 28,
+      '未定案时成绩单带区间 16 ~ 28', JSON.stringify(row?.band))
+
+    /*
+     * 定案：按 18 分算。
+     * 这个接口必须一次做两件事——只记结论的话它立刻就是过期的（成绩单上是 6 分、结论说 18 分），
+     * 只落分的话第二个人的分还挂在回放里，区间照样收不住。
+     */
+    r = await req('POST', `/api/submissions/${vsub}/review-verdict`, { questionId: 'c1', value: 18, note: '教研组统一口径' })
+    assert(r.status === 200 && r.json.data.score === 28, '定案按 18 分算，成绩单同时跟上（28 分）', JSON.stringify(r.json?.data?.score))
+    r = await req('GET', '/api/submissions?formId=' + vid)
+    row = r.json.data.find(x => x.id === vsub)
+    assert(!row?.band, '定案之后列表里不再带区间', JSON.stringify(row?.band))
+    r = await req('GET', `/api/submissions/${vsub}`)
+    assert(!r.json.data.band && r.json.data.verdicts.length === 1 && r.json.data.verdicts[0].value === 18,
+      '详情页同一口径：没有区间，并且能读到这条结案记录',
+      JSON.stringify({ band: r.json.data.band, v: r.json.data.verdicts }))
+    /*
+     * 结案这件事本身要留痕：谁在什么时候给这一格拍了板，翻旧账时必须查得到人。
+     * 注意这里分数本来就已经是 18 分——「分数没动就不留痕」是老规矩，
+     * 但定案不是「打开看一眼」，它是一次决策，即使分数没变也要落一条。
+     */
+    assert(r.json.data.review_logs.some(lg => /结案/.test(lg.note || '')),
+      '分数没变也要留一条结案痕迹（不能因为「没改动」就不记谁拍的板）',
+      JSON.stringify(r.json.data.review_logs.map(lg => [lg.source, lg.note])))
+
+    r = await req('GET', `/api/forms/${vid}/review-calibration`)
+    const vcal = r.json.data
+    assert(vcal.conflicts === 0 && vcal.settledCells === 1 && vcal.resolved.length === 1,
+      '尺度页：这处分歧不再算悬着，挪到「已拍板」', JSON.stringify({ c: vcal.conflicts, s: vcal.settledCells }))
+    assert(/定完了/.test(vcal.note), '一句「悬着的都定完了」，不是甩一张空表', vcal.note)
+    assert(vcal.pairs.length === 1, '两两对账照旧把这一格算进尺子（结案不改写历史）', JSON.stringify(vcal.pairs))
+
+    // 阅卷队列：这一格已定案，队列不该再挂「尺子还没定」等下一个批阅人来定
+    r = await req('GET', `/api/forms/${vid}/review-queue`)
+    const qrow = r.json.data.find(x => x.id === vsub)
+    assert(qrow && qrow.urgency?.tier !== 'scale', '已定案的格子不再让队列挂「尺子还没定」', JSON.stringify(qrow?.urgency))
+    const qc1 = qrow?.items.find(it => it.id === 'c1')
+    assert(qc1?.settled === true && qc1.verdict?.value === 18,
+      '队列里这道题标着「已定案、按 18 分算」，下一个批阅人不会以为自己是第一个拍板的',
+      JSON.stringify(qc1))
+
+    /*
+     * 有人后来又直接改分：结案记录还在，但成绩单不听它的了。
+     * 这是最容易漏的一种状态——「定过案」和「定过、现在对不上」不是一件事，
+     * 混成一句「已定案」会让人以为这处分歧处理完了，而它正卡在中间。
+     */
+    r = await call(vb, 'PUT', `/api/submissions/${vsub}/review`, { scores: { c1: 12 } })
+    assert(r.status === 200, '李老师绕过结案直接改成分 12', JSON.stringify(r.json))
+    cookie = holder2
+    r = await req('GET', `/api/forms/${vid}/review-calibration`)
+    assert(r.json.data.conflicts === 1 && r.json.data.stale === 1 && r.json.data.settledCells === 0,
+      '改成别的分 → 结论过期，这处分歧重新回到待处理',
+      JSON.stringify({ c: r.json.data.conflicts, st: r.json.data.stale, s: r.json.data.settledCells }))
+    r = await req('GET', '/api/submissions?formId=' + vid)
+    row = r.json.data.find(x => x.id === vsub)
+    assert(row?.band, '区间重新出现（结论不再成立，这格又悬着了）', JSON.stringify(row?.band))
+
+    // 重新定案一次：这次按 12 分（三个人三种口径里挑一个，本来就是判卷人的活）
+    r = await req('POST', `/api/submissions/${vsub}/review-verdict`, { questionId: 'c1', value: 12 })
+    assert(r.status === 200, '重新定案按 12 分', JSON.stringify(r.json))
+    r = await req('GET', `/api/forms/${vid}/review-calibration`)
+    assert(r.json.data.conflicts === 0 && r.json.data.stale === 0 && r.json.data.settledCells === 1,
+      '重新定案之后不再有悬着的、也不再有过期的',
+      JSON.stringify({ c: r.json.data.conflicts, st: r.json.data.stale, s: r.json.data.settledCells }))
+
+    // 撤回结案：分歧重新待处理，行不删（改口本身也是历史）
+    r = await req('POST', `/api/submissions/${vsub}/review-verdict`, { questionId: 'c1', value: null })
+    assert(r.status === 200 && r.json.revoked === true, '撤回结案', JSON.stringify(r.json))
+    r = await req('GET', `/api/forms/${vid}/review-calibration`)
+    assert(r.json.data.conflicts === 1 && r.json.data.settledCells === 0,
+      '撤回之后这处分歧重新算悬着', JSON.stringify({ c: r.json.data.conflicts, s: r.json.data.settledCells }))
+
+    // 只能对主观题拍板：客观题有标准答案，不需要谁来定口径
+    r = await req('POST', `/api/submissions/${vsub}/review-verdict`, { questionId: 'o1', value: 10 })
+    assert(r.status === 400 && /主观题/.test(r.json.message), '客观题不给拍板', `${r.status} ${r.json?.message}`)
+    // 越界的结论值照旧拦住
+    r = await req('POST', `/api/submissions/${vsub}/review-verdict`, { questionId: 'c1', value: 26 })
+    assert(r.status === 400 && /0 - 20/.test(r.json.message), '结论值超出满分要拦下', `${r.status} ${r.json?.message}`)
+    // 不存在的题、不存在的答卷
+    r = await req('POST', `/api/submissions/${vsub}/review-verdict`, { questionId: 'nope', value: 1 })
+    assert(r.status === 400, '不存在的题目不给拍板', String(r.status))
+    r = await req('POST', '/api/submissions/99999999/review-verdict', { questionId: 'c1', value: 1 })
+    assert(r.status === 404, '不存在的答卷', String(r.status))
+
+    /*
+     * 结案会改分，所以它跟批阅是同一个权限档：无关账号和只读协作者都不该能做。
+     * 只读协作者尤其要说：他看得见报表，但「这一格按几分算」是会落到成绩单上的动作。
+     */
+    await req('POST', '/api/auth/register', { username: 'vd_r', password: 'vr-pass-123', nickname: '旁听老师' })
+    cookie = holder2
+    const vr = await asUser('vd_r', 'vr-pass-123')
+    r = await call(vr, 'POST', `/api/submissions/${vsub}/review-verdict`, { questionId: 'c1', value: 10 })
+    assert(r.status === 403, '无关账号不能定案', `${r.status} ${r.json?.message || ''}`)
+    await req('POST', `/api/forms/${vid}/members`, { username: 'vd_r', role: 'viewer' })
+    r = await call(vr, 'POST', `/api/submissions/${vsub}/review-verdict`, { questionId: 'c1', value: 10 })
+    assert(r.status === 403, '只读协作者不能定案（它会落到成绩单上）', `${r.status} ${r.json?.message || ''}`)
+    cookie = holder2
+
+    // 问卷没有阅卷，也就没有分歧可结
+    const survey2 = (await req('POST', '/api/forms', { title: '结案问卷', kind: 'survey', schema: [] })).json.id
+    r = await req('POST', `/api/submissions/${vsub}/review-verdict`, { questionId: 'c1', value: 1 })
+    assert(r.status === 400 || r.status === 200, '同一份答卷的定案只认它自己的卷子', String(r.status))
+  }
+
   console.log('\n[45] 前端静态资源')
 
   for (const p of ['/', '/js/main.js', '/css/app.css', '/js/views/Logs.js', '/js/views/Dicts.js', '/js/review.js', '/assets/eqs-mark.svg', '/vendor/echarts.min.js']) {

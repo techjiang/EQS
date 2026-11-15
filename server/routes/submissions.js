@@ -34,7 +34,7 @@ import { notifySubmission, dispatchWebhooks } from '../lib/notify.js'
 import { formRole, submissionVisibleScope, requireFormRole } from '../lib/formMembers.js'
 import { rateLimit, publicLimit } from '../lib/guard.js'
 import { rankingTop, rankOf, publicRanking, distributionOf } from '../lib/ranking.js'
-import { bandsOf, crossedBySubmission, crossedCountByForm, formBandReader } from '../lib/bands.js'
+import { bandsOf, crossedBySubmission, crossedCountByForm, formBandReader, verdictsOf } from '../lib/bands.js'
 import { submissionsXlsx, submissionsHead, submissionRow } from '../lib/sheet.js'
 import { writeXlsxStream } from '../lib/xlsx.js'
 import { signFileUrl, signFileUrls, signHtmlFiles, QUERY_FILE_TTL } from '../lib/fileAccess.js'
@@ -614,7 +614,12 @@ export default function register(r) {
     // 再单独发一次请求会让弹窗先空一下再补上，等于把两次渲染拼在人眼前
     // 分数区间同一口径算：详情页说「71 分」，弹窗里说「59 ~ 71」，两处数字对不上最伤信任
     const band = form ? bandsOf(form, [row]).get(Number(row.id)) || null : null
-    sendJson(res, 200, { ok: true, data: { ...withManual(row), reviewer, band, review_logs: reviewLogs(row.id, 20), form } })
+    // 结案记录跟着详情一起给：打开批阅弹窗就要看见「这题有人拍过板、按 18 分算」，
+    // 不然下一个人会以为自己是第一个定口径的人，又给一个第三种分
+    const verdicts = form
+      ? verdictsOf(form).filter(v => Number(v.submissionId) === Number(row.id) && v.value !== null && v.value !== undefined)
+      : []
+    sendJson(res, 200, { ok: true, data: { ...withManual(row), reviewer, band, verdicts, review_logs: reviewLogs(row.id, 20), form } })
   })
 
   /** 一份答卷的批阅历史（按次倒序）：谁、什么时候、动了哪几题、从几分改到几分 */
@@ -627,6 +632,69 @@ export default function register(r) {
     const url = new URL(req.url, 'http://x')
     const logs = reviewLogs(row.id, url.searchParams.get('limit') || 50)
     sendJson(res, 200, { ok: true, data: logs, total: logs.length })
+  })
+
+  /**
+   * 分歧结案：这一格以后按几分算。
+   *
+   * 留痕、区间、尺度对账、阅卷队列都是「回头看」。系统里一直没有「这件事到此为止」这个动作：
+   * 一份卷子只要被两位老师批过，它成绩单上的区间就永久存在——回放里那两个人的分永远都在。
+   * 唯一能让它「有结论」的办法是第三个人再给一次分，而那一来就多出第三个人，
+   * 分歧从 2 个人变成 3 个人，一点没变少。
+   *
+   * 所以这个接口一次做两件事，而且必须一起做：
+   *  ① 把分数落成结论值（走 applyReview，照旧留痕：谁改的、从几分改到几分）；
+   *  ② 记一条结案记录，说明「这处分歧已经有人拍过板」。
+   * 只做 ② 的话，结论立刻就是过期的（成绩单上是 6 分、结论说 18 分）；
+   * 只做 ① 的话，第二个人的分还挂在回放里，区间照样收不住。
+   *
+   * body: { questionId, value, note? }，`value: null` 表示撤回结案（分歧重新待处理）。
+   */
+  r.post('/api/submissions/:id/review-verdict', async (req, res, { params }) => {
+    const user = requirePerm(req, 'data:write')
+    const row = get('SELECT * FROM submissions WHERE id = ? AND deleted_at IS NULL', Number(params.id))
+    if (!row) fail(404, '答卷不存在')
+    const form = pickForm(row.form_id)
+    if (!form) fail(404, '表单不存在')
+    if (form.kind !== 'exam') fail(400, '只有考试答卷需要批阅')
+    requireFormRole(user, form, 'edit')
+    const body = await readJson(req)
+    const questionId = String(body.questionId || '')
+    const field = form.schema.find(f => f.id === questionId)
+    if (!field || !isSubjective(field)) fail(400, '只能对主观题拍板')
+    const note = String(body.note || '').slice(0, 200)
+    /*
+     * 撤回结案：不写 value，落一条 null 记录。
+     * 行不删是有原因的——「昨天定了 18 分、今天又推翻」这件事本身要留痕，
+     * 否则事后没人说得清这格到底有没有人拍过板。
+     */
+    if (body.value === null || body.value === undefined || body.value === '') {
+      run(`INSERT INTO review_verdicts(form_id, submission_id, question_id, value, source, note, user_id, username, created_at)
+        VALUES(?,?,?,?,?,?,?,?,?)`, form.id, row.id, questionId, null, 'revoke', note, user.id, user.nickname || user.username || '', now())
+      log(user, '撤回分歧结案', `#${row.id} / ${field.label}`)
+      return sendJson(res, 200, { ok: true, data: withManual(get('SELECT * FROM submissions WHERE id = ?', row.id)), revoked: true })
+    }
+    const value = Number(body.value)
+    if (!Number.isFinite(value)) fail(400, '结论值不是数字')
+    if (value < 0 || value > Number(field.score)) fail(400, `「${field.label}」应在 0 - ${field.score} 分之间`)
+    const settled = Math.round(value * 100) / 100
+    // 先落分：结案要能和成绩单对上，顺序反了就会出现一条立刻过期的结论
+    const data = applyReview(user, row, form, { [questionId]: settled }, body.note ?? undefined, { merge: true, source: 'verdict' })
+    /*
+     * 分数本来就已经是结论值时，applyReview 不会留痕（「打开看一眼就关掉不该长出空记录」）。
+     * 但定案不是看一眼，它是一次决策——即使分数没变，也必须留下「谁在什么时候拍了板」。
+     * 这条留痕的 changes 为空，所以回放时不会凭空多出一格，只是让旧账查得到人。
+     */
+    if (!data.changes?.length) {
+      run(`INSERT INTO review_logs(submission_id, form_id, user_id, username, source, seconds, score_before, score_after, changes, note, created_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?)`, row.id, form.id, user.id, user.nickname || user.username || '', 'verdict', 0,
+        row.score ?? null, data.score, '[]', `分歧结案：${field.label} 按 ${settled} 分算${note ? '（' + note + '）' : ''}`, now())
+    }
+    run(`INSERT INTO review_verdicts(form_id, submission_id, question_id, value, source, note, user_id, username, created_at)
+      VALUES(?,?,?,?,?,?,?,?,?)`, form.id, row.id, questionId, settled, 'verdict', note, user.id, user.nickname || user.username || '', now())
+    log(user, '分歧结案', `#${row.id} / ${field.label} → ${settled} 分`)
+    dispatchWebhooks('update', { formId: form.id, formTitle: form.title, submission: withManual(get('SELECT * FROM submissions WHERE id = ?', row.id)) }).catch(() => {})
+    sendJson(res, 200, { ok: true, data })
   })
 
   r.post('/api/submissions', async (req, res) => {
@@ -874,9 +942,15 @@ export default function register(r) {
           givenRaw: answers[f.id] === undefined ? null : answers[f.id],
           analysis: f.analysis || '',
           current: manual[f.id] === undefined ? null : manual[f.id],
-          // 这道题被两个人给出过不同的分：把两个人各自的分一并递出去
-          // （刚被撤分的题也一样给——总分里没有它了，但口径分歧还在）
-          others: cross.get(f.id)?.by || null
+          /*
+           * 这道题被两个人给出过不同的分：把两个人各自的分一并递出去
+           * （刚被撤分的题也一样给——总分里没有它了，但口径分歧还在）。
+           * 结案状态一起带上：下一个批阅人要知道「这格已经有人按 18 分拍过板」，
+           * 否则他会以为自己是第一个定口径的人，再给一个第三种分。
+           */
+          others: cross.get(f.id)?.by || null,
+          verdict: cross.get(f.id)?.verdict || null,
+          settled: !!cross.get(f.id)?.settled
         }))
       return {
         id: row.id, publicId: row.public_id, createdAt: row.created_at,
@@ -940,7 +1014,9 @@ export default function register(r) {
     }))
     // 满分从当前 schema 取：尺度说的「差了几分」必须跟题目现在的分值对得上
     const maxOf = id => Number(form.schema.find(f => f.id === id)?.score) || 0
-    const result = calibrate(entries, { maxOf })
+    // 结案过的分支不再算「悬着」：否则尺度页上永远挂着那几处已经拍过板的旧账
+    const verdicts = verdictsOf(form)
+    const result = calibrate(entries, { maxOf, verdicts })
     // 每道题再标一句人话，别让前端各算一遍口径
     for (const q of result.questions) q.level = gapLevel(q.worst?.gap, q.max)
     /*
@@ -1005,7 +1081,15 @@ export default function register(r) {
          */
         drift,
         regrade,
-        note: result.conflicts ? '' : '还没有同一道题被两位老师给出不同的分（同分不留痕，所以一致的那些看不见）'
+        /*
+         * 三种「没有悬着的分歧」要说成三句话，混成一句会把「都定完了」说成「一处都没有」：
+         * ① 压根没有过；② 有过，全定案了；③ 有，但定过的案又被打回去了（stale）。
+         */
+        note: result.conflicts
+          ? ''
+          : result.settledCells
+            ? `悬着的分歧都定完了：${result.settledCells} 处已拍板，成绩单上这几份不再带区间`
+            : '还没有同一道题被两位老师给出不同的分（同分不留痕，所以一致的那些看不见）'
       }
     })
   })

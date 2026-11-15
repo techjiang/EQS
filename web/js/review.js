@@ -418,8 +418,9 @@ export function driftText(t) {
  * 撤分（to === null）表示「这个人对这格没有分数」，不是 0 分——
  * 把撤分当 0 算，一次误操作就会让整张尺子歪掉。
  */
-export function calibrate(entries, { maxOf = () => 0 } = {}) {
+export function calibrate(entries, { maxOf = () => 0, verdicts = [] } = {}) {
   const { cells, teachers } = replayCells(entries)
+  const idx = verdictIndex(verdicts)
 
   const questions = new Map()
   const pairs = new Map()
@@ -430,6 +431,8 @@ export function calibrate(entries, { maxOf = () => 0 } = {}) {
    * 只会让人得出「我们分歧率 90%」这种结论。能数的只有「真被后一位老师改过的地方」。
    */
   let conflicts = 0
+  let stale = 0
+  const resolved = []
   for (const cell of cells.values()) {
     const given = [...cell.by.entries()].filter(([, v]) => v.value !== null && v.value !== undefined)
     if (given.length < 2) continue
@@ -438,13 +441,31 @@ export function calibrate(entries, { maxOf = () => 0 } = {}) {
     if (raw === 0) continue
     // 两位小数就够：差 5.3 分是个能读的数字，差 5.299999999999999 分是一行噪声
     const gap = round100(raw)
-    conflicts++
     const max = Number(maxOf(cell.id)) || 0
+    /*
+     * 两两对账跟结案无关：「这题按 18 分定了」不会让「当初有人给了 4 分」这件事消失，
+     * 它仍然是那位老师尺子偏松的证据。结案收的是「这条分歧还要不要继续摆着」，
+     * 不是改写历史。所以尺子统计照旧算全部有分歧的格子。
+     */
+    addPairs(pairs, teachers, given)
+    const state = verdictState(cell, idx.get(`${cell.submissionId}::${cell.id}`) || null)
+    const entry = {
+      // id/label 必须一起带出去：界面上「按 14 分定了」这个动作要指名是哪一道题，
+      // 少了它就是拿 undefined 去请求一个不存在的题目
+      id: cell.id, label: cell.label,
+      submissionId: cell.submissionId, gap, ratio: max > 0 ? gap / max : 0,
+      by: given.map(([, v]) => ({ name: v.name, value: Number(v.value) })),
+      ...state
+    }
+    // 已经拍过板、而且成绩单认这个结论：不再算「悬着的分歧」
+    if (state.settled) { resolved.push({ ...entry, max }); continue }
+    // 定过案但成绩单对不上（被改成别的分、被撤分）：它重新回到待处理，并单独报数
+    if (state.stale) stale++
+    conflicts++
     const q = questions.get(cell.id) || { id: cell.id, label: cell.label, max, cells: [] }
     q.max = q.max || max
-    q.cells.push({ submissionId: cell.submissionId, gap, ratio: max > 0 ? gap / max : 0, by: given.map(([, v]) => ({ name: v.name, value: Number(v.value) })) })
+    q.cells.push(entry)
     questions.set(cell.id, q)
-    addPairs(pairs, teachers, given)
   }
 
   const list = [...questions.values()]
@@ -468,8 +489,10 @@ export function calibrate(entries, { maxOf = () => 0 } = {}) {
   let maxSpread = 0
   const spreadOf = new Map()
   for (const cell of cells.values()) {
-    const c = crossInfo(cell)
+    const c = crossInfo(cell, idx.get(`${cell.submissionId}::${cell.id}`) || null)
     if (!c) continue
+    // 与 scoreBand 同一条判据：已经有结论的分歧不再撑开区间
+    if (c.settled) continue
     // 这题现在没有分（还没批 / 被撤分），总分里本来就不含它，不该算进浮动——
     // 与 scoreBand 同一条判据，否则这里报「3 份卷子带区间」、成绩单上却是 2 份
     if (cell.current?.value === null || cell.current?.value === undefined) continue
@@ -482,6 +505,13 @@ export function calibrate(entries, { maxOf = () => 0 } = {}) {
 
   return {
     conflicts,
+    // 已经拍过板、而且成绩单认这个结论的分歧。它们从「悬着」里消失，但不是被删掉——
+    // 界面要能说清「原来 8 处，定了 6 处，还剩 2 处」。
+    // 名字带 Cells 是为了跟 regrade.settled（那是「换他的尺子等于现状」的人）分开
+    settledCells: resolved.length,
+    // 定过案、但成绩单上的分已经跟结论对不上：这处分歧重新需要人拍一次
+    stale,
+    resolved: resolved.sort((a, b) => b.gap - a.gap),
     questions: list,
     pairs: [...pairs.values()]
       .map(p => ({ ...p, avgGap: p.count ? Math.round((Math.abs(p.sum) / p.count) * 100) / 100 : 0, bias: p.count ? Math.round((p.sum / p.count) * 100) / 100 : 0 }))
@@ -507,25 +537,76 @@ export function gapLevel(gap, max) {
 }
 
 /**
+ * 结案记录归一：一格最多一条有效结论。
+ *
+ * 传进来的顺序就是写入顺序（SQL 按 id 升序），后写的覆盖先写的——
+ * 「先定 18 分、后来改口按 12 算」这件事，读者要的是最后一次的口径。
+ *
+ * `value` 为 null 的那一行表示「撤回结案」：分歧重新变成待处理。
+ * 撤回本身也是一次改口，所以行不删，只是让索引里那格消失。
+ */
+function verdictIndex(verdicts = []) {
+  const out = new Map()   // `${submissionId}::${questionId}` → { value, name, at, note, id }
+  for (const v of verdicts || []) {
+    const key = `${Number(v.submissionId)}::${v.questionId}`
+    if (v.value === null || v.value === undefined || v.value === '') { out.delete(key); continue }
+    out.set(key, {
+      value: Number(v.value),
+      name: v.username || '未知账号',
+      at: v.createdAt || '',
+      note: v.note || '',
+      id: v.id ?? 0
+    })
+  }
+  return out
+}
+
+/**
+ * 一格的结案状态：这处分歧是不是已经有人拍过板了。
+ *
+ * **过期的判据是「当前分认不认这个结论」，不是「结论之后有没有人动过手」。**
+ * 时间顺序看着更严谨，实际会漏掉最要紧的一种：结案按 18 分算了，第二天有人改成 6 分，
+ * 第三天又改回 18 分——按时间序它「被改过」，按当前分它「还是 18」。要问的从来是后者：
+ * 这格现在记着的分，还算不算这个结论。
+ *
+ * 所以 `stale` 只有一句话：**结论和成绩单对不上了。**
+ * 这一格被第三个人改成别的分、被撤分、或者某人绕过结案直接改分，都会走到这里。
+ */
+function verdictState(cell, verdict) {
+  // current 一并带出去：界面上说「定过案按 18 分，但现在是 6 分」得能读到那个 6
+  const cur = cell.current?.value === undefined ? null : cell.current.value
+  if (!verdict) return { verdict: null, settled: false, stale: false, current: cur }
+  const stale = cur === null || Number(cur) !== Number(verdict.value)
+  return { verdict, settled: !stale, stale, current: cur }
+}
+
+/**
  * 哪些格子的尺子不齐：同一份卷子的同一道题，被两位以上老师给过不同的分。
  *
  * 这是「分数带区间」和「阅卷时提醒别人给过几分」共用的那一份判据。
  * 写两遍就会分叉：一处把撤分当 0 分、一处不当，界面上的提醒和成绩单上的区间对不上，
  * 而读者只会得出一个结论——这些数字都是猜的。
+ *
+ * `only: 'open'`（默认）只给还没结案的：成绩单上的区间要的是「还悬着的分歧」，
+ * 已经有人拍过板的格子不该再撑开一个永远收不住的范围。
+ * 阅卷队列与会话提醒用 `only: 'all'`——「这题有人拍过板、按几分算」本身
+ * 就是下一个批阅人需要的信息。
  */
-export function crossedOf(entries) {
-  const out = new Map()   // submissionId → [ { id, label, min, max, by } ]
+export function crossedOf(entries, { verdicts = [], only = 'open' } = {}) {
+  const out = new Map()   // submissionId → [ { id, label, min, max, by, verdict, settled, stale } ]
+  const idx = verdictIndex(verdicts)
   for (const cell of replayCells(entries).cells.values()) {
-    const c = crossInfo(cell)
+    const c = crossInfo(cell, idx.get(`${cell.submissionId}::${cell.id}`) || null)
     if (!c) continue
+    if (only === 'open' && c.settled) continue
     if (!out.has(cell.submissionId)) out.set(cell.submissionId, [])
     out.get(cell.submissionId).push(c)
   }
   return out
 }
 
-/** 这一格的尺子齐不齐。不齐就给出两端与每个人各自的分，齐（或只有一个人）就返回 null */
-function crossInfo(cell) {
+/** 这一格的尺子齐不齐。不齐就给出两端、每个人各自的分，以及这处分歧的结案状态 */
+function crossInfo(cell, verdict = null) {
   // 撤分（to: null）是「这个人对这格没有分数」，不是 0 分：
   // 一次误操作就能让成绩单上的区间凭空宽出一整题的分
   const by = [...cell.by.values()].filter(v => v.value !== null && v.value !== undefined)
@@ -536,7 +617,26 @@ function crossInfo(cell) {
   const max = Math.max(...values)
   // 两个人都给 8 分不是「尺子不齐」：这题换谁批都一样，不该在成绩单上留一个区间
   if (min === max) return null
-  return { id: cell.id, label: cell.label, min, max, by }
+  return { id: cell.id, label: cell.label, min, max, by, ...verdictState(cell, verdict) }
+}
+
+/**
+ * 一处分歧结案后的那句话：这一格按 18 分算，李老师定的。
+ *
+ * 过期的时候要说得更清楚：**结论还在，但成绩单已经不听它的了。**
+ * 「已定案」和「定过、但现在对不上」是两件事，混成一句会让人以为这处分歧已经处理完，
+ * 而实际上它正卡在「有人拍过板、后来又有人改了分」的中间状态——那恰恰是最该看一眼的。
+ */
+export function verdictText(v) {
+  if (!v?.verdict) return ''
+  const n = Math.round(Number(v.verdict.value) * 100) / 100
+  const who = v.verdict.name || '未知账号'
+  if (v.stale) {
+    const cur = v.current
+    const now = cur === null || cur === undefined ? '已经没有分' : `现在是 ${Math.round(Number(cur) * 100) / 100} 分`
+    return `定过案（按 ${n} 分，${who} 定），但${now}——这处分歧又回到了待处理`
+  }
+  return `按 ${n} 分算，${who} 定`
 }
 
 /**
@@ -555,14 +655,15 @@ function crossInfo(cell) {
  * 还没批（或被撤分）的格子不参与：总分里本来就没有它的分，
  * 拿区间去「预测」一个不存在的分，只会算出比满分还高的区间。
  */
-export function scoreBand(entries, { maxOf = () => 0, score = null, manual = {} } = {}) {
+export function scoreBand(entries, { maxOf = () => 0, score = null, manual = {}, verdicts = [] } = {}) {
   const base = Number(score)
   if (!Number.isFinite(base)) return null
   const items = []
   let low = base
   let high = base
   const round = v => Math.round(v * 100) / 100
-  for (const cell of [...crossedOf(entries).values()].flat()) {
+  // 只算还没结案的分歧：已经有人拍过板的格子，成绩单不该再带着一个收不住的范围
+  for (const cell of [...crossedOf(entries, { verdicts }).values()].flat()) {
     const raw = manual?.[cell.id]
     // 这题现在没有分（还没批 / 被撤分）：总分里本来就不含它，不该算进区间
     if (raw === undefined || raw === null || raw === '') continue
