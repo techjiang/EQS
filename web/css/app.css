@@ -119,6 +119,18 @@ p{margin:0}
 .tag.warn{background:rgba(245,158,11,.14);color:#b45309;border-color:transparent}
 .tag.danger{background:rgba(239,68,68,.12);color:#dc2626;border-color:transparent}
 .tag.brand{background:rgba(91,124,250,.12);color:var(--brand);border-color:transparent}
+/* 我自己这把尺子：批卷弹窗顶部那条横幅。
+   左边一道颜色条区分三种情况——偏高（暖色）、偏低（品牌色）、基本一致（绿色）。
+   不用红：偏松偏紧是尺子的形状，不是一次失误，红会让人以为自己做错了事。 */
+.self-bias{
+  display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;
+  padding:9px 12px;margin-bottom:10px;border-radius:9px;
+  background:var(--panel-2);border:1px solid var(--line);border-left:3px solid var(--brand);
+}
+.self-bias.high{border-left-color:var(--warn);background:rgba(245,158,11,.07)}
+.self-bias.low{border-left-color:var(--brand);background:rgba(91,124,250,.07)}
+.self-bias.flat{border-left-color:var(--ok);background:rgba(16,185,129,.07)}
+.self-bias b{font-weight:650}
 
 .stat{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:18px;position:relative;overflow:hidden}
 .stat .k{font-size:12.5px;color:var(--text-2);font-weight:560}

@@ -399,6 +399,98 @@ export function driftText(t) {
 }
 
 /**
+ * 我自己的尺子：同格对比下，我比同格其他人高几分。
+ *
+ * 尺度对账回答「谁偏松」，第三人称，摆在一张谁都看得见的页面上。但批到第 6 页的那个人
+ * 站在电脑前，需要的是一人称的一句话——「我这把尺子比同题其他人高 6 分」。这不是体贴：
+ * 一个人连着批 40 份，他这把尺子的偏移会摊在每一份卷子上，而成绩单上看不见。
+ * 知道自己在戴什么颜色的眼镜，才可能在给分的那一刻把手收回来。
+ *
+ * 口径与 `reviewDrift` 完全一致（同一个 `replayCells`，逐格减去同格其他人的均值），
+ * 所以「我的走向」与「我的整体偏移」不会互相打脸。四条边界：
+ *  - **撤分不算分**：那是我对这格没有分数，不是 0 分。
+ *  - **一定要有别人在同一格给过分**：绝对分不进这个数——我批的这批考生可能就是答得更好。
+ *  - **样本太少不下结论**：3 处以下只说「还没对上过几格」。一两格就判一个人偏松，
+ *    那是一句会跟着他很久的话，而它可能只是运气。
+ *  - **结案不改写历史**：定过案的格子照旧算进来，「当初有人给过 4 分」是事实。
+ */
+export function selfBias(entries = [], { userId = 0, minSamples = 3 } = {}) {
+  const me = Number(userId) > 0 ? `u${Number(userId)}` : ''
+  const empty = { samples: 0, bias: 0, confident: false, perQuestion: {}, text: '' }
+  if (!me) return empty
+  const { cells } = replayCells(entries)
+  let sum = 0
+  let samples = 0
+  const per = new Map()
+  for (const cell of cells.values()) {
+    // 与 crossInfo / reviewDrift 同一条判据：撤分不是 0 分
+    const given = [...cell.by.entries()].filter(([, v]) => v.value !== null && v.value !== undefined)
+    const mine = given.find(([k]) => k === me)
+    if (!mine) continue
+    const others = given.filter(([k]) => k !== me).map(([, v]) => Number(v.value))
+    if (!others.length) continue
+    // 正数 = 这一格我比同格其他人给得高。考生水平在减法里被抵消掉
+    const diff = Number(mine[1].value) - others.reduce((a, b) => a + b, 0) / others.length
+    sum += diff
+    samples++
+    const q = per.get(cell.id) || { sum: 0, samples: 0 }
+    q.sum += diff
+    q.samples++
+    per.set(cell.id, q)
+  }
+  const bias = samples ? round1(sum / samples) : 0
+  const perQuestion = {}
+  for (const [id, q] of per) {
+    const v = { bias: round1(q.sum / q.samples), samples: q.samples }
+    perQuestion[id] = { ...v, text: questionBiasText(v) }
+  }
+  return {
+    samples,
+    bias,
+    // 够不够格下结论：界面上靠它决定是写「你的尺子 +6 分」还是「样本太少」
+    confident: samples >= minSamples,
+    perQuestion,
+    text: selfBiasText(bias, samples, minSamples)
+  }
+}
+
+/**
+ * 一人称的那句话。措辞刻意避开「偏差」「不准确」这类词：
+ * 说的是「你比别人给得高」，是一把尺子的形状，不是一次失误。
+ */
+/**
+ * 单题的口径提示：够不够格摆到那一题上。
+ *
+ * 「整场偏高 2 分」是背景，「这题我平均高 6 分」才是能拦住一个数字的话。
+ * 但门槛不能松到 1 处：只跟别人对上过一次就贴一条「这题你偏高」，那是噪声，
+ * 而这类提示一旦被贴成噪声，人就会连真的那条一起无视。所以至少 2 处、至少 1 分。
+ */
+export function selfQuestion(perQuestion = {}, qid = '') {
+  const q = perQuestion?.[qid]
+  if (!q || Number(q.samples) < 2) return null
+  if (Math.abs(Number(q.bias) || 0) < 1) return null
+  return { bias: q.bias, samples: q.samples, text: q.text }
+}
+
+export function selfBiasText(bias, samples, minSamples = 3) {
+  const n = Math.max(Number(samples) || 0, 0)
+  if (!n) return '还没人和你批过同一道题，这把尺子暂时没得比——同一个格子被两个人给过分，才看得出松紧'
+  if (n < minSamples) return `只和别人的分对过 ${n} 处，样本太少，先不判你偏松还是偏紧`
+  const b = round1(bias)
+  if (Math.abs(b) < 1) return `你和同题其他人给得差不多（${n} 处对比，${biasText(b)} 分）`
+  return `你比同题其他人平均${b > 0 ? '高' : '低'} ${Math.abs(b)} 分（${n} 处对比）`
+}
+
+/** 单题口径的那句话：题目自己带处数，读的人才知道这句话有几分重量 */
+export function questionBiasText(p) {
+  const n = Math.max(Number(p?.samples) || 0, 0)
+  if (!n) return ''
+  const b = round1(p.bias)
+  if (Math.abs(b) < 1) return `这题你和别人给得差不多（${n} 处对比）`
+  return `这题你平均比同题其他人${b > 0 ? '高' : '低'} ${Math.abs(b)} 分（${n} 处对比）`
+}
+
+/**
  * 评分尺度：同一份卷子的同一道题，被两位老师分别给过分，差了多少。
  *
  * 留痕能追到「谁批的、改了什么」，但两个人对同一题给出 4 分和 18 分时，

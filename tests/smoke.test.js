@@ -5713,6 +5713,188 @@ try {
     assert(r.status === 400 || r.status === 200, '同一份答卷的定案只认它自己的卷子', String(r.status))
   }
 
+  console.log('\n[75] 我自己的尺子：批卷的人也要知道自己偏了几分')
+  {
+    // ---- 纯函数：同格对比下「我」比别人高几分
+    {
+      const { selfBias, selfBiasText, selfQuestion } = await import('../web/js/review.js')
+      const mk = (sub, uid, name, changes, at = '2026-11-14T09:00:00Z') => ({ submissionId: sub, userId: uid, username: name, createdAt: at, changes })
+
+      /*
+       * 一格、我对 18、别人 12：我比同格高 6 分。
+       * 但只对上过 1 处，不许下结论——这句话会跟着人很久，而它可能只是运气。
+       */
+      let one = selfBias([
+        mk(1, 1, '我', [{ id: 'q1', label: '简述', from: null, to: 18 }]),
+        mk(1, 2, '张老师', [{ id: 'q1', label: '简述', from: 18, to: 12 }])
+      ], { userId: 1 })
+      assert(one.samples === 1 && one.bias === 6 && one.confident === false,
+        '一处对比：偏移算出来了，但还不够下结论', JSON.stringify(one))
+      assert(/样本太少/.test(one.text) && /1 处/.test(one.text),
+        '样本不够时说的是「先不判」，不是硬给一个「你偏松」', one.text)
+
+      // 三格都高 6 分：够格下结论了
+      const three = selfBias([
+        mk(1, 1, '我', [{ id: 'q1', label: '简述', from: null, to: 18 }]),
+        mk(1, 2, '张老师', [{ id: 'q1', label: '简述', from: 18, to: 12 }]),
+        mk(2, 1, '我', [{ id: 'q1', label: '简述', from: null, to: 18 }]),
+        mk(2, 2, '张老师', [{ id: 'q1', label: '简述', from: 18, to: 12 }]),
+        mk(3, 1, '我', [{ id: 'q1', label: '简述', from: null, to: 18 }]),
+        mk(3, 2, '张老师', [{ id: 'q1', label: '简述', from: 18, to: 12 }])
+      ], { userId: 1 })
+      assert(three.samples === 3 && three.bias === 6 && three.confident === true,
+        '三处同向偏移 → 可以说「你比同题其他人平均高 6 分」', JSON.stringify(three))
+      assert(/高 6 分/.test(three.text) && /3 处/.test(three.text),
+        '那句话要带方向、数值和处数', three.text)
+      assert(three.perQuestion.q1.samples === 3 && three.perQuestion.q1.bias === 6,
+        '逐题也给一份：整场平均掩盖不了「这题我偏得最多」', JSON.stringify(three.perQuestion))
+
+      /*
+       * 别人的格子不算我的证据：只在「同一格上别人也给过分」时才产生一个数据点。
+       * 我一个人批的 10 份卷子，对这把尺子一点说明都没有。
+       */
+      const alone = selfBias([mk(1, 1, '我', [{ id: 'q1', label: '简述', from: null, to: 18 }])], { userId: 1 })
+      assert(alone.samples === 0 && alone.confident === false && /还没人/.test(alone.text),
+        '没人跟我批过同一道题时不硬算偏移', JSON.stringify(alone))
+      assert(selfBias([mk(1, 2, '别人', [{ id: 'q1', from: null, to: 9 }])], { userId: 1 }).samples === 0,
+        '别人的批阅记录不是我的数据点')
+
+      /*
+       * 撤分不是 0 分：我撤了这格，就表示「我对这格没有分数」，不参与任何偏移。
+       * 与 crossInfo / reviewDrift 同一条判据——三处口径必须一致，否则我的走向和我的偏移会互相打脸。
+       */
+      const revoked = selfBias([
+        mk(1, 2, '张老师', [{ id: 'q1', label: '简述', from: null, to: 12 }]),
+        mk(1, 1, '我', [{ id: 'q1', label: '简述', from: null, to: 18 }]),
+        mk(1, 1, '我', [{ id: 'q1', label: '简述', from: 18, to: null }], '2026-11-14T10:00:00Z')
+      ], { userId: 1 })
+      assert(revoked.samples === 0, '撤分之后这格不再算我的偏移（不是「我给了 0 分」）', JSON.stringify(revoked))
+
+      /*
+       * 给得一样：样本够了就说「差不多」。这不是一句废话——
+       * 一把没偏的尺子如果被说成「偏高」或「有待改进」，这个人下次就不看这条提示了。
+       */
+      const sameLogs = []
+      for (let i = 1; i <= 3; i++) {
+        sameLogs.push(mk(i, 1, '我', [{ id: 'q1', label: '简述', from: null, to: 12 }]))
+        sameLogs.push(mk(i, 2, '张老师', [{ id: 'q1', label: '简述', from: 12, to: 12 }]))
+      }
+      const same = selfBias(sameLogs, { userId: 1 })
+      assert(same.samples === 3 && same.bias === 0 && same.confident === true && /差不多/.test(same.text),
+        '三处同分：算「给得差不多」，不说成偏松也不说成「有待改进」', same.text)
+      assert(selfBiasText(0, 5) && /差不多/.test(selfBiasText(0, 5)), '样本够但没偏移时说「差不多」', selfBiasText(0, 5))
+
+      /*
+       * 单题提示的门槛：2 处、1 分。
+       * 只对上过一次就贴一条「这题你偏高」，提示会变成噪声；而这类提示一旦成了噪声，
+       * 人就会连真的那条一起无视。
+       */
+      assert(selfQuestion({ q1: { bias: 5, samples: 1, text: 'x' } }, 'q1') === null, '1 处对比不贴单题提示')
+      assert(selfQuestion({ q1: { bias: 0.4, samples: 5, text: 'x' } }, 'q1') === null, '不到 1 分不贴单题提示（0.4 分是运气）')
+      const hint = selfQuestion({ q1: { bias: 6, samples: 3, text: '这题你平均高 6 分' } }, 'q1')
+      assert(hint && hint.bias === 6 && hint.samples === 3, '够格的那题要能拿到提示', JSON.stringify(hint))
+      assert(selfQuestion({}, 'nope') === null, '没有对比的题不给提示')
+    }
+
+    // ---- 接口：批卷的人打开弹窗前就该看见自己那把尺子
+    cookie = await asUser('admin', 'test-pass-123')
+    let r = await req('POST', '/api/forms', {
+      title: '我的尺子卷', kind: 'exam',
+      schema: [
+        { id: 'w1', type: 'textarea', label: '分析一次分布式锁失效', answer: [], score: 20 },
+        // 第二道主观题一直不批：答卷才会留在阅卷队列里，才验证得了「批阅界面上看得见我的口径」
+        { id: 'w2', type: 'textarea', label: '举一个幂等设计的例子', answer: [], score: 10 }
+      ],
+      settings: { passPercent: 60 }
+    })
+    const wid = r.json.id
+    await req('PUT', `/api/forms/${wid}`, { status: 'published' })
+    const subs = []
+    for (let i = 0; i < 3; i++) {
+      subs.push((await req('POST', `/api/public/forms/${wid}/submit`, { data: { w1: `第 ${i + 1} 份答案` } })).json.id)
+    }
+
+    // 两位老师：管理员（我）与 w_b，把同一格批成 16 和 10
+    const wadmin = cookie
+    await req('POST', '/api/auth/register', { username: 'w_b', password: 'wb-pass-123', nickname: '李老师' })
+    cookie = wadmin
+    await req('POST', `/api/forms/${wid}/members`, { username: 'w_b', role: 'editor' })
+    const wb = await asUser('w_b', 'wb-pass-123')
+
+    for (const id of subs) {
+      r = await req('PUT', `/api/submissions/${id}/review`, { scores: { w1: 16 } })
+      assert(r.status === 200, '我（管理员）给 16 分', JSON.stringify(r.json?.message))
+      r = await call(wb, 'PUT', `/api/submissions/${id}/review`, { scores: { w1: 10 } })
+      assert(r.status === 200, '李老师在同一格给 10 分', JSON.stringify(r.json?.message))
+    }
+    cookie = wadmin
+
+    /*
+     * 队列里必须带着「我自己的尺子」：三格都高 6 分，够格下结论。
+     * 这条提示的意义不是体贴，而是让正在给分的人知道自己戴着什么颜色的眼镜——
+     * 它摊在每一份卷子上，而成绩单上看不见。
+     */
+    r = await req('GET', `/api/forms/${wid}/review-queue`)
+    const mine = r.json.self
+    assert(r.status === 200 && r.json.data.length === 3, '三份卷子的第二道题还没批，都在队列里', String(r.json.data?.length))
+    assert(mine && mine.samples === 3 && mine.bias === 6 && mine.confident === true,
+      '队列带着我的口径：三格对比、平均高 6 分', JSON.stringify(mine))
+    assert(/高 6 分/.test(mine.text), '那句话是给「正在批卷的人」看的，方向与数值都要有', mine.text)
+    assert(mine.perQuestion?.w1?.samples === 3 && mine.perQuestion.w1.bias === 6,
+      '逐题口径一起给', JSON.stringify(mine.perQuestion))
+    /*
+     * 只下发自己的。这条提示是让人看清自己的口径，不是给同事之间互相点评提供素材——
+     * 那是尺度页的事，它有权限门槛（只读协作者看不到逐份答卷）。
+     */
+    assert(!JSON.stringify(r.json.self).includes('李老师'), '不下发别人的名字（这条提示只关于我自己）', JSON.stringify(r.json.self))
+
+    /*
+     * 逐题提示只贴在该贴的那一题上：w1 我给过 16、李老师给过 10，这题我也偏了，
+     * 就该在我重新打开它时提醒一句；w2 两个人都还没碰过，一个字都不该有。
+     * 一律贴上去的话，提示会变成装饰，而装饰是没人读的。
+     */
+    const first = r.json.data[0]
+    const it1 = first.items.find(it => it.id === 'w1')
+    const it2 = first.items.find(it => it.id === 'w2')
+    assert(it1?.self && it1.self.bias === 6 && it1.self.samples === 3,
+      '我批过、别人也给过的那道题带着单题提示（这题我也高了 6 分）', JSON.stringify(it1?.self))
+    assert(it2?.self === null,
+      '还没被两个人批过的题不给单题提示', JSON.stringify(it2?.self))
+
+    // 换成李老师：同一批数据，他看到的是「低 6 分」——同一份事实的两个方向
+    r = await call(wb, 'GET', `/api/forms/${wid}/review-queue`)
+    assert(r.json.self?.bias === -6 && /低 6 分/.test(r.json.self.text),
+      '换成李老师问，同一批数据得出的是「你比同题其他人低 6 分」', JSON.stringify(r.json.self))
+    assert(r.json.self?.samples === 3, '处数是同一批格子', JSON.stringify(r.json.self?.samples))
+
+    // 第三位老师：一格都没和人对上过，不许给他一个数字
+    await req('POST', '/api/auth/register', { username: 'w_c', password: 'wc-pass-123', nickname: '王老师' })
+    cookie = wadmin
+    await req('POST', `/api/forms/${wid}/members`, { username: 'w_c', role: 'editor' })
+    const wc = await asUser('w_c', 'wc-pass-123')
+    r = await call(wc, 'GET', `/api/forms/${wid}/review-queue`)
+    assert(r.json.self?.samples === 0 && r.json.self?.confident === false && /还没人/.test(r.json.self?.text),
+      '没有可比处的老师说「暂时没得比」，不硬凑一个 0 分', JSON.stringify(r.json.self))
+
+    /*
+     * 单份批阅也带同一份口径：批量阅卷和单份批阅是两个入口，
+     * 只在批量那边显示，用单份批的人就成了唯一不知道自己在戴什么眼镜的人。
+     */
+    r = await req('GET', `/api/submissions/${subs[0]}`)
+    assert(r.json.data.self?.samples === 3 && r.json.data.self.bias === 6,
+      '单份批阅的详情里也带着我自己的尺子', JSON.stringify(r.json.data.self))
+
+    /*
+     * 「我的口径」不能变成「我的免罪符」：结案不改写历史，我批过的分照旧算进我的偏移。
+     * 这一格已经被人拍过板（按 12 分算），但「当初我给 16」仍是事实，幅度不该被抹掉。
+     */
+    r = await req('POST', `/api/submissions/${subs[0]}/review-verdict`, { questionId: 'w1', value: 12, note: '教研组统一口径' })
+    assert(r.status === 200, '这一格按 12 分结案', JSON.stringify(r.json?.message))
+    r = await req('GET', `/api/forms/${wid}/review-queue`)
+    assert(r.json.self?.samples === 3,
+      '结案不改写历史：我在这格给过的分照旧算进我的偏移', JSON.stringify(r.json.self))
+  }
+
   console.log('\n[45] 前端静态资源')
 
   for (const p of ['/', '/js/main.js', '/css/app.css', '/js/views/Logs.js', '/js/views/Dicts.js', '/js/review.js', '/assets/eqs-mark.svg', '/vendor/echarts.min.js']) {

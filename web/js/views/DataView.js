@@ -5,7 +5,7 @@ import { ok, err, confirmBox, fmtDate, Empty, Modal, Pagination, escapeHtml } fr
 import { Icon } from '../icons.js'
 import { renderControl, answerDisplay } from '../renderer.js'
 import { buildFlow } from '../flow.js'
-import { batchPayload, nextIndex, reviewProgress, afterSave, elapsedSeconds, changeText, changeLine, humanSeconds, gapLevel, bandText, biasText, regradeText, standingText, URGENCY_LABEL, verdictText } from '../review.js'
+import { selfQuestion, batchPayload, nextIndex, reviewProgress, afterSave, elapsedSeconds, changeText, changeLine, humanSeconds, gapLevel, bandText, biasText, regradeText, standingText, URGENCY_LABEL, verdictText } from '../review.js'
 
 export default {
   setup() {
@@ -264,10 +264,15 @@ export default {
           // 这一格定过案没有：弹窗打开就要说清「按 18 分算，李老师定的」，
           // 不然下一个人会给一个第三种口径，而这件事在尺度页上要等到下次开会才被看见
           verdicts: sub.verdicts || [],
+          // 我自己的尺子：单份批阅也要知道自己在戴什么颜色的眼镜，
+          // 不然只有走批量阅卷的人才看得见这条提示
+          self: sub.self || null,
           items: subjective.map(q => ({
             id: q.id, label: q.label, score: Number(q.score) || 0,
             given: data[q.id], analysis: q.analysis || '',
-            verdict: (sub.verdicts || []).find(v => v.questionId === q.id) || null
+            verdict: (sub.verdicts || []).find(v => v.questionId === q.id) || null,
+            // 这道题上我自己的口径：同一道题我给的和别人差几分
+            self: selfQuestion(sub.self?.perQuestion, q.id)
           }))
         }
       } catch (e) { err(e.message) }
@@ -510,7 +515,9 @@ export default {
         need: r.need, done: r.done, scanned: r.scanned,
         total: r.total, offset: offset || 0, limit: BATCH_LIMIT, items,
         // 整队里几份批完会改结论：按整队算，不按这一页——否则每翻一页这句话都变一次
-        summary: r.summary || null, order: r.order || batchOrder.value
+        summary: r.summary || null, order: r.order || batchOrder.value,
+        // 我自己的尺子：批之前先看清自己的口径
+        self: r.self || null
       }
       // 保存之后队列清空是正常结果，不该再弹一句「没有待批阅」——那句提示是说给「点进来才发现空」的人
       /*
@@ -638,6 +645,36 @@ export default {
               '按交卷顺序'
             ])
           ])
+        : null
+    ])
+  }
+
+  /**
+   * 我自己的尺子。
+   *
+   * 尺度页上那句话是第三人称的：「李老师平均偏高 4.61 分」。摆在那儿是为了让教研组回头对账，
+   * 而真正在给分的那一刻，人需要的是第一人称的一句——「你比同题其他人平均高 6 分」。
+   *
+   * 只在够格下结论时才说得这么硬。3 处以下的样本说成「你偏松」，这句话会跟着一个人很久，
+   * 而它可能只是运气。所以不够就老实写「样本太少，先不判」，不硬凑一个数字。
+   */
+  const selfBanner = (self) => {
+    if (!self) return null
+    const n = Number(self.samples) || 0
+    const b = Number(self.bias) || 0
+    /*
+     * 颜色只在「够格下结论」时才表态。样本不足却已经染上「偏高」的暖色，
+     * 等于用颜色把一句「先不判」说成了「你偏松」——那两句的分量差得很远。
+     */
+    const flat = self.confident && Math.abs(b) < 1
+    const tone = !self.confident ? '' : flat ? 'flat' : (b > 0 ? 'high' : 'low')
+    return h('div', { class: ['self-bias', tone] }, [
+      h('span', { class: 'small', style: 'font-weight:600' }, '我的尺子'),
+      h('span', { class: 'small' }, self.text),
+      n
+        ? h('span', { class: 'small muted' }, n < 3
+            ? '· 意思是「同一格上别人也给过分」的处数还不够'
+            : '· 口径与评分尺度页同一条：逐格比同题其他人的均值，撤分不算分')
         : null
     ])
   }
@@ -881,6 +918,7 @@ export default {
             h('span', {}, [h('kbd', {}, 'Esc'), ' 退出']),
             h('button', { class: 'btn sm', style: 'margin-left:auto', onClick: () => { reviewInputs()[0]?.focus(); reviewInputs()[0]?.select?.() } }, '从第一题开始')
           ]),
+          selfBanner(review.value.self),
           review.value.items.length > 1 ? h('div', { class: 'flex between mb' }, [
             h('span', { class: 'small muted' }, `共 ${review.value.items.length} 道主观题，未填的按 0 分算`),
             h('button', { class: 'btn sm', onClick: fillZero }, '未填的按 0 分')
@@ -905,6 +943,15 @@ export default {
                   `，换成另一位老师是 ${row.low} ~ ${row.high} 分`)
               ])
             })(),
+            /*
+             * 这道题上我自己的口径。整场那句话说的是平均，而这一题可能正是把我拉偏的那道：
+             * 「这题你平均比同题其他人高 6 分」比「你整体高 2 分」更能让人在敲数字前停一下。
+             * 它跟上面的「尺子不一」不是重复：那句说别人之间有分歧，这句说我站在哪一边。
+             */
+            it.self ? h('div', { class: 'small', style: 'margin-top:6px' }, [
+              h('span', { class: 'tag brand' }, '我的口径'),
+              h('span', { style: 'margin-left:6px;color:var(--text-2)' }, it.self.text)
+            ]) : null,
             /*
              * 这格有人拍过板：结论摆在给分框上面，不是埋在尺度页里。
              * 批阅人此刻要决定的是「改成几分」，而「之前定过 15 分、现在被改成 6 分」
@@ -1319,6 +1366,7 @@ export default {
               onClick: () => focusScore(0)
             }, '从第一题开始')
           ]) : null,
+          selfBanner(batch.value.self),
           ...batch.value.items.map((x, xi) => h('div', {
             style: 'padding:14px;border:1px solid var(--line);border-radius:10px;margin-bottom:12px'
           }, [
@@ -1368,6 +1416,14 @@ export default {
                * 尺度页上说「李老师偏松 4.61 分」是回头看的结论；批到第 6 页时，
                * 老师要的是「这一份、这一题，之前有人给了几」——不然第三个口径又是随手定的。
                */
+              /*
+               * 我自己的口径：整场那句在弹窗顶部，这一句贴在这一题上。
+               * 同一道题我给的和别人差几分，比「整体偏高 2 分」更能拦住第三个数。
+               */
+              it.self ? h('div', { class: 'small', style: 'margin-top:4px' }, [
+                h('span', { class: 'tag brand' }, '我的口径'),
+                h('span', { style: 'margin-left:6px;color:var(--text-2)' }, it.self.text)
+              ]) : null,
               it.others?.length ? h('div', { class: 'small', style: 'margin-top:4px' }, [
                 // 结案过的格子换一个颜色：还悬着的是「等你定」，定过的是「有人定过了，你可以推翻但要知道自己在推翻什么」
                 h('span', { class: ['tag', it.settled ? 'ok' : 'warn'] }, it.settled ? '已定案' : '尺子不一'),

@@ -34,12 +34,12 @@ import { notifySubmission, dispatchWebhooks } from '../lib/notify.js'
 import { formRole, submissionVisibleScope, requireFormRole } from '../lib/formMembers.js'
 import { rateLimit, publicLimit } from '../lib/guard.js'
 import { rankingTop, rankOf, publicRanking, distributionOf } from '../lib/ranking.js'
-import { bandsOf, crossedBySubmission, crossedCountByForm, formBandReader, verdictsOf } from '../lib/bands.js'
+import { bandsOf, crossedBySubmission, crossedCountByForm, formBandReader, formReviewEntries, verdictsOf } from '../lib/bands.js'
 import { submissionsXlsx, submissionsHead, submissionRow } from '../lib/sheet.js'
 import { writeXlsxStream } from '../lib/xlsx.js'
 import { signFileUrl, signFileUrls, signHtmlFiles, QUERY_FILE_TTL } from '../lib/fileAccess.js'
 // 份数/分数的留痕口径只有一份：前端也是这套（web/js/review.js），两边说的必须是同一件事
-import { scoreChanges, changeText, calibrate, gapLevel, reviewDrift, driftText, regradeRuler, regradeText, standingText, queueUrgency, orderQueue, queueSummary } from '../../web/js/review.js'
+import { scoreChanges, changeText, calibrate, gapLevel, reviewDrift, driftText, regradeRuler, regradeText, standingText, queueUrgency, orderQueue, queueSummary, selfBias, selfQuestion } from '../../web/js/review.js'
 
 function fingerprint(req, extra = {}) {
   return {
@@ -619,7 +619,13 @@ export default function register(r) {
     const verdicts = form
       ? verdictsOf(form).filter(v => Number(v.submissionId) === Number(row.id) && v.value !== null && v.value !== undefined)
       : []
-    sendJson(res, 200, { ok: true, data: { ...withManual(row), reviewer, band, verdicts, review_logs: reviewLogs(row.id, 20), form } })
+    /*
+     * 我自己这把尺子，跟着详情一起给：单份批阅和批量阅卷是两个入口，
+     * 而「你比同题其他人高 6 分」这件事在哪个入口给分都该看得见——
+     * 只在批量那边显示，用单份批的人就成了唯一不知道自己在戴什么眼镜的人。
+     */
+    const self = form && form.kind === 'exam' ? selfBias(formReviewEntries(form), { userId: user.id }) : null
+    sendJson(res, 200, { ok: true, data: { ...withManual(row), reviewer, band, verdicts, self, review_logs: reviewLogs(row.id, 20), form } })
   })
 
   /** 一份答卷的批阅历史（按次倒序）：谁、什么时候、动了哪几题、从几分改到几分 */
@@ -875,8 +881,15 @@ export default function register(r) {
     // 顺手统计整场考试的批阅进度——一页存完就清空，批到第 6 页时已经不知道
     // 自己在整场里的位置，也不知道还剩几个人的卷子没看。分母只算「有主观题的卷子」，
     // 否则纯客观题的答卷会让进度永远到不了头。
+    /*
+     * 整张卷子的批阅留痕，一次读完，两处用：
+     * ① 每份有几处「尺子不齐」（队列排序要）；
+     * ② 我自己这把尺子偏松还是偏紧（批的人要知道自己戴着什么颜色的眼镜）。
+     * 两条 SQL 各读一遍的话，一处改了过滤条件另一处不知道，排序和提示就会各说一套。
+     */
+    const entries = formReviewEntries(form)
     // 整张卷子的口径分歧按份数一次算完：一页一页算的话，第二页的排序看不见第一页的分歧
-    const crossedCount = crossedCountByForm(form)
+    const crossedCount = crossedCountByForm(form, entries)
     const queue = []
     let scanned = 0
     let need = 0
@@ -915,6 +928,13 @@ export default function register(r) {
       )
       delete row.tally
     }
+    /*
+     * 我自己的尺子。第三人称的「谁偏松 4.61 分」摆在尺度页上，批到第 6 页的人不在那个页面上——
+     * 他在批卷弹窗里，需要的是一人称的一句话。所以这里按当前登录账号现算一份。
+     * 只看自己的，不下发别人的：这条提示的目的是让正在给分的人知道自己的口径，
+     * 不是给同事之间互相点评提供素材（那是尺度页做的事，它有权限门槛）。
+     */
+    const self = selfBias(entries, { userId: user.id })
     // 按 id 排的那一档保留成可选：老师想按交卷顺序从头扫一遍时还在
     const order = url.searchParams.get('order') === 'id' ? 'id' : 'priority'
     const ordered = orderQueue(queue, { mode: order })
@@ -950,7 +970,15 @@ export default function register(r) {
            */
           others: cross.get(f.id)?.by || null,
           verdict: cross.get(f.id)?.verdict || null,
-          settled: !!cross.get(f.id)?.settled
+          settled: !!cross.get(f.id)?.settled,
+          /*
+           * 这道题上，我自己的尺子偏了几分。
+           *
+           * 整场的偏移摆在弹窗顶部，但真正在敲键盘的是这一题：昨天这题我给 12、
+           * 李老师给 18，我现在要给的第三个数，落在哪儿才不算又开一个口径。
+           * 处数一起给：一句「这题你平均高 6 分」背后是 2 处还是 20 处，重量完全不同。
+           */
+          self: selfQuestion(self.perQuestion, f.id)
         }))
       return {
         id: row.id, publicId: row.public_id, createdAt: row.created_at,
@@ -975,7 +1003,9 @@ export default function register(r) {
     const summary = queueSummary(ordered)
     sendJson(res, 200, {
       ok: true, data, total: queue.length, need, done: Math.max(need - queue.length, 0), scanned,
-      offset, limit, order, summary
+      offset, limit, order, summary,
+      // 我自己的尺子：批的人先看清自己戴着什么颜色的眼镜，再下手给分
+      self
     })
   })
 

@@ -108,6 +108,22 @@ export function crossedBySubmission(form, rows) {
 }
 
 /**
+ * 整张卷子的批阅留痕，一次读完。
+ *
+ * 三个出口共用这一份：队列排序要数「每一份有几处尺子不齐」、本人尺子要算
+ * 「我比同格其他人高几分」、导出要按份取区间。它们读的是同一批行——
+ * 各写一条 SQL 的话，字段顺序或过滤条件稍一错位，三处结论就会互相打脸。
+ */
+export function formReviewEntries(form) {
+  if (!form) return []
+  return all('SELECT submission_id, user_id, username, changes, created_at FROM review_logs WHERE form_id = ? ORDER BY id ASC', form.id)
+    .map(r => ({
+      submissionId: r.submission_id, userId: r.user_id, username: r.username || '',
+      createdAt: r.created_at, changes: safeJson(r.changes, [])
+    }))
+}
+
+/**
  * 整张卷子里，每一份「有几处尺子不齐」。
  *
  * 阅卷队列要按「批完会不会改结论」排序，而这需要知道整队每一份的口径分歧数——
@@ -117,20 +133,30 @@ export function crossedBySubmission(form, rows) {
  * 全部批阅次数」，而不是「一页 20 行」；一场千人的考试也就是几千条。
  * 真要撑不住，这里换成 SQL 聚合而不是把明细读进内存——但那是另一个数量级才会发生的事。
  */
-export function crossedCountByForm(form) {
+export function crossedCountByForm(form, entries = null) {
   const out = new Map()
   if (!form || form.kind !== 'exam') return out
   const verdicts = verdictsOf(form)
-  const grouped = groupLogs(all(
-    'SELECT submission_id, user_id, username, changes, created_at FROM review_logs WHERE form_id = ? ORDER BY id ASC', form.id))
-  for (const [sid, entries] of grouped) {
+  const grouped = groupLogs2(entries || formReviewEntries(form))
+  for (const [sid, list] of grouped) {
     // 只数还悬着的：已经定案的口径不需要「等下一个批的人定」，
     // 把它算进去，队列会一直挂着一个永远消不掉的标签
     const mine = verdicts.filter(v => Number(v.submissionId) === Number(sid))
-    const n = [...crossedOf(entries, { verdicts: mine }).values()].flat().length
+    const n = [...crossedOf(list, { verdicts: mine }).values()].flat().length
     if (n) out.set(sid, n)
   }
   return out
+}
+
+/** 已解析的留痕按答卷分组（与 groupLogs 同一形状，只是不过 SQL 行） */
+function groupLogs2(entries) {
+  const map = new Map()
+  for (const e of entries) {
+    const key = Number(e.submissionId)
+    if (!map.has(key)) map.set(key, [])
+    map.get(key).push(e)
+  }
+  return map
 }
 
 /**
@@ -150,8 +176,7 @@ export function formBandReader(form) {
     if (!bySubmission.has(k)) bySubmission.set(k, [])
     bySubmission.get(k).push(v)
   }
-  const grouped = groupLogs(all(
-    'SELECT submission_id, user_id, username, changes, created_at FROM review_logs WHERE form_id = ? ORDER BY id ASC', form.id))
+  const grouped = groupLogs2(formReviewEntries(form))
   // 导出与列表、榜单同一口径：带区间的结论必须处处一致，否则 Excel 里是 71≈59~71、
   // 页面上是 71，对着同一份数据给人看，两边都不可信
   return (row) => scoreBand(grouped.get(Number(row.id)) || [], {
