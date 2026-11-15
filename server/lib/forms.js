@@ -23,7 +23,15 @@ export const DISPLAY_TYPES = new Set(['divider', 'richtext', 'html', 'image', 'c
 const CHOICE = new Set(['select', 'radio', 'checkbox', 'sort', 'cascader', 'carousel', 'matrix'])
 
 export function normalizeField(f, i = 0) {
-  const type = FIELD_TYPES.includes(f.type) ? f.type : 'text'
+  /*
+   * 「判断题」在 schema 里没有自己的类型：它存成 radio + 正确/错误两个选项，
+   * 这样判分、统计、Excel 进出都只有一条路。但接口与 Excel 导入都会直接写 type='judge'，
+   * 而 FIELD_TYPES 里没有它 —— 以前这不报错，quietly 落成 text：
+   * 判断题变成单行文本，答案「正确」还是那个字符串，页面上却成了一个填空框。
+   * 于是谁从接口建判断题，谁就得到一道填不出正确答案的题。
+   */
+  const declaredJudge = f.type === 'judge'
+  const type = FIELD_TYPES.includes(f.type) ? f.type : (declaredJudge ? 'radio' : 'text')
   const out = {
     id: f.id || 'f_' + crypto.randomBytes(5).toString('hex'),
     type,
@@ -91,6 +99,22 @@ export function normalizeField(f, i = 0) {
         type: FIELD_TYPES.includes(sf?.type) ? sf.type : 'text',
         label: String(sf?.label ?? `子项 ${i + 1}`)
       }))
+  }
+  /*
+   * 判断题的选项由题型决定，不由调用方决定：传了「正确/错误」以外的选项一律换掉。
+   * 只补默认值没有意义 —— 库里存着 radio + A/B 的「判断题」，跟普通单选长得一模一样，
+   * 判分时答案「正确」对不上任何选项，这题谁答都错。
+   */
+  if (declaredJudge || (type === 'radio' && /^(判断|判断题|是非题|对错题)$/.test(String(f.declType || '')))) {
+    out.options = judgeOptions()
+    // 判断的标准答案常被写成「对 / 错 / T / F / A / B」。不折算的话，normalizeSchema 里
+    // 「答案必须是真有的选项」那道闸会把它整条滤掉，这题从此谁答都错，页面上还看不出来
+    out.answer = out.answer.map(a => {
+      const t = String(a ?? '').trim()
+      if (/^(A|T|true|对|正确|是)$/i.test(t)) return '正确'
+      if (/^(B|F|false|错|错误|否)$/i.test(t)) return '错误'
+      return t
+    })
   }
   if (type === 'rate') out.props.max = Number(out.props.max) || 5
   if (type === 'slider') { out.props.min ??= 0; out.props.max ??= 100; out.props.step ??= 1 }

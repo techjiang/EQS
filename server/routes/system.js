@@ -13,12 +13,13 @@ import {
 import { openZipFile as openZipPath, extractZipEntryToFile } from '../lib/zip.js'
 import { smtpSend, wxAccessToken } from '../lib/notify.js'
 import { generateForm } from '../lib/ai.js'
+import { APP_VERSION } from '../lib/version.js'
 
 export default function register(r) {
   /** 健康检查（容器 / 负载均衡探活用） */
   r.get('/api/health', async (req, res) => {
     const ok = !!get('SELECT 1 AS x')
-    sendJson(res, ok ? 200 : 503, { ok, uptime: Math.floor(process.uptime()), version: '1.0.0' })
+    sendJson(res, ok ? 200 : 503, { ok, uptime: Math.floor(process.uptime()), version: APP_VERSION })
   })
 
   /**
@@ -197,7 +198,7 @@ export default function register(r) {
     sendJson(res, 200, {
       ok: true,
       data: {
-        version: '1.0.0', node: process.version, uptime: Math.floor(process.uptime()),
+        version: APP_VERSION, node: process.version, uptime: Math.floor(process.uptime()),
         platform: `${process.platform} ${process.arch}`,
         dataDir: DATA_DIR, dbSize, walSize,
         fileCount: counts.files, counts

@@ -6088,6 +6088,49 @@ try {
     assert(r.json.fatigue.bias === null, '他没有可比的分，就不给一个数字', JSON.stringify(r.json.fatigue?.bias))
   }
 
+  console.log('\n[77] 判断题：接口建出来的必须是一道能答对的题')
+  {
+    /*
+     * schema 里没有 judge 这个类型：判断题存成 radio + 正确/错误两个选项，
+     * 判分、统计、Excel 进出才只有一条路。但文档和题库都把「判断题」当题型，
+     * 于是接口会收到 type: 'judge'。FIELD_TYPES 里没有它，normalizeField 就一路
+     * 落成 text —— 判断题变成填空框，标准答案「正确」还是那个字符串，
+     * 页面上却是个输入框，学生填什么都不对。这里守的就是这条降级。
+     */
+    let r = await req('POST', '/api/forms', {
+      title: '判断题探针', kind: 'exam',
+      schema: [
+        { type: 'judge', label: '地球是圆的', options: ['正确', '错误'], answer: ['正确'], score: 5 },
+        { type: 'judge', label: '答案写成「对」', answer: ['对'], score: 5 },
+        { type: 'judge', label: '调用方乱传选项', options: ['A', 'B'], answer: ['正确'], score: 5 }
+      ]
+    })
+    const js1 = r.json.data.schema
+    assert(js1[0].type === 'radio', '判断题落成单选（不是被降级成文本题）', js1[0].type)
+    assert(js1[0].options.map(o => o.value).join('/') === '正确/错误', '判断题的选项就是正确/错误', JSON.stringify(js1[0].options))
+    assert(JSON.stringify(js1[1].answer) === JSON.stringify(['正确']), '答案写「对」也折算到「正确」', JSON.stringify(js1[1].answer))
+    assert(js1[2].options.map(o => o.value).join('/') === '正确/错误', '传进来的 A/B 选项被换回正确/错误', JSON.stringify(js1[2].options))
+
+    // 答卷侧：选「正确」就该得分
+    const fid = r.json.id
+    await req('PUT', `/api/forms/${fid}`, { status: 'published' })
+    const ids = js1.map(f => f.id)
+    r = await req('POST', `/api/public/forms/${fid}/submit`, { data: { [ids[0]]: '正确', [ids[1]]: '正确', [ids[2]]: '错误' } })
+    assert(r.json.score === 10 && r.json.total === 15, '作答「正确」两题得分，答「错误」那题不进分', `${r.json.score}/${r.json.total}`)
+
+    // 题库侧走同一条：不带选项、答案写「错」
+    r = await req('POST', '/api/banks', { name: '判断题题库' })
+    const bid = r.json.id
+    r = await req('POST', `/api/banks/${bid}/questions`, { items: [{ type: 'judge', title: '判断题也能进题库', answer: ['错'], score: 5 }] })
+    assert(r.status === 201, '题库建判断题成功', String(r.status))
+    r = await req('GET', `/api/banks/${bid}/questions`)
+    const q = r.json.data[0]
+    const vals = (q.options || []).map(o => String(o.value ?? o.label))
+    // 前端用同一个判据把它标成「判断题」（Banks.js 的 isJudgeQ），接口给的是原始形状
+    assert(q.type === 'radio' && vals.join('/') === '正确/错误', '题库里存成单选 + 正确/错误（前端据此标判断题）', `${q.type}/${vals.join('/')}`)
+    assert(JSON.stringify(q.answer) === JSON.stringify(['错误']), '答案写「错」在题库里也折算到「错误」', JSON.stringify(q.answer))
+  }
+
   console.log('\n[45] 前端静态资源')
 
   for (const p of ['/', '/js/main.js', '/css/app.css', '/js/views/Logs.js', '/js/views/Dicts.js', '/js/review.js', '/assets/eqs-mark.svg', '/vendor/echarts.min.js']) {

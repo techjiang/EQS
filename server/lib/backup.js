@@ -4,6 +4,7 @@ import path from 'node:path'
 import crypto from 'node:crypto'
 import { db, dbFile, DATA_DIR, switchDb } from './db.js'
 import { writeZipStream, openZipFile, extractZipEntryToFile } from './zip.js'
+import { APP_VERSION } from './version.js'
 
 /*
  * 备份与迁移。
@@ -25,7 +26,6 @@ import { writeZipStream, openZipFile, extractZipEntryToFile } from './zip.js'
 
 export const BACKUP_DIR = path.join(DATA_DIR, '.backups')
 const SNAPSHOT_KEEP = 5
-const APP_VERSION = '1.0.0'
 
 /** 备份包里的数据库路径约定，导入端也按这个找 */
 const DB_ENTRY = 'eqs-data/eqs.db'

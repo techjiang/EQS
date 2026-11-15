@@ -48,7 +48,7 @@ export default {
       return need === 'admin' ? false : perms.includes(need)
     }
     const quicks = () => [
-      ['创建问卷', '拖拽 27+ 组件，或让 AI 帮你写', '/forms?new=1', 'form', 'form:create'],
+      ['创建问卷', '拖拽 30 种组件，或让 AI 帮你写', '/forms?new=1', 'form', 'form:create'],
       ['发起考试', '题库组卷、自动评分、成绩排名', '/exams', 'exam', 'form:create'],
       ['模板中心', '6 套精选模板，一键套用', '/templates', 'template', 'form:create'],
       ['统计分析', '实时图表，支持导出 PNG', '/report', 'chart', 'report:read'],

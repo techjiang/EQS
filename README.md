@@ -11,6 +11,9 @@
 [![Node](https://img.shields.io/badge/Node.js-%E2%89%A522-339933?logo=node.js&logoColor=white)](https://nodejs.org)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Docker](https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white)](#-docker-部署)
+[![GitHub](https://img.shields.io/badge/GitHub-techjiang%2FEQS-181717?logo=github&logoColor=white)](https://github.com/techjiang/EQS)
+
+**[github.com/techjiang/EQS](https://github.com/techjiang/EQS)** · 欢迎 Star / Issue / PR
 
 </div>
 
@@ -23,14 +26,14 @@
 | **真正一体化** | 问卷、考试、刷题不是三个割裂的产品，题库、用户、权限、数据统一管理 |
 | **零依赖部署** | 只用 Node.js 22+ 内建能力，`npm install` 都不需要，复制解压即启动 |
 | **数据自己掌控** | 单文件内嵌数据库 + 本地文件存储，一个目录就是全部数据，备份=压缩一个文件夹 |
-| **28+ 组件** | 拖拽即用，覆盖文本、选择、量表、矩阵、子表单、签名、定位等全部常见场景 |
+| **30 种组件** | 拖拽即用，覆盖文本、选择、量表、矩阵、子表单、签名、定位等全部常见场景 |
 | **AI 加持** | 兼容 OpenAI 接口，支持 SiliconFlow / DeepSeek / Qwen / Llama；流式生成边吐边画（题目一道一道长出来），模型可从真实列表里切换，可按语言生成；刷题页逐题给 AI 解析 |
 | **完整闭环** | 从创建、发布、作答，到评分、练习、报表、导出，全部在同一平台完成 |
 
 ## 功能特点
 
 **问卷与表单**
-- 28+ 自定义组件，拖拽式可视化设计，支持文本 / Excel 批量导入题目
+- 30 种自定义组件，拖拽式可视化设计，支持文本 / Excel 批量导入题目
 - 单行/多行文本、日期、下拉、单选、多选、文件上传、排序、级联（多级联动）、轮播、一键定位、手机号校验、矩阵量表、子表单、手写签名、评分、NPS、滑动条、分割线、富文本等
 - 级联两种作答方式：层级下拉，或**搜索式选择**（输入关键字直接落到某一级，`行业分类`那种
   四级以上、几百个节点的选项树不用一层层翻；选题多时自动切换）。选项来源可以是字典、**部门树**，也可以手填
@@ -166,9 +169,16 @@
 ### 方式一：直接运行（推荐）
 
 ```bash
-git clone https://cnb.cool/sleepyheade/EQS.git
+git clone https://github.com/techjiang/EQS.git
 cd EQS
 bash scripts/start.sh
+```
+
+也可以直接下 Release 包，解压就能跑，不需要 `npm install`：
+
+```bash
+curl -LO https://github.com/techjiang/EQS/releases/latest/download/eqs-1.0.0.tar.gz
+tar -xzf eqs-1.0.0.tar.gz && cd eqs-1.0.0 && bash scripts/start.sh
 ```
 
 Windows 用户双击 `scripts\start.bat` 即可，脚本会自动打开浏览器。
@@ -372,7 +382,7 @@ node scripts/sanitize-html.mjs --apply   # 确认后写回（幂等，可重复�
 
 ```bash
 node --watch server/index.js   # 热重启
-node tests/smoke.test.js       # 冒烟测试（590 项）
+node tests/smoke.test.js       # 冒烟测试（1323 项，通过即代表可以上线）
 ```
 
 ## 项目结构
@@ -398,6 +408,21 @@ EQS/
 ## 贡献
 
 欢迎提交 Issue 与 PR。提交前请确保 `node tests/smoke.test.js` 全部通过。
+
+## 谁在做
+
+**科技酱**
+
+| | |
+| --- | --- |
+| 主站 | <https://www.asoe.cn> |
+| 技术文档 | <https://docs.asoe.cn> |
+| GitHub | <https://github.com/techjiang/> |
+| 哔哩哔哩 | <https://space.bilibili.com/1768832152> |
+| 邮箱 | <official@tech.asoe.cn> |
+| 玲珑社区 | <https://forums.asoe.cn/> |
+
+交流群：QQ `291974598` · `474819022` · `631167288`
 
 ## 许可证
 
