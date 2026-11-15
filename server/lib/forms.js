@@ -746,7 +746,7 @@ export function pendingLeft(form, row) {
  * 混进去的话进度条永远到不了头（82 份里 40 份是纯客观题，批完 42 份显示 51%）。
  */
 export function reviewTally(form, row) {
-  if (!form || form.kind !== 'exam') return { subjective: 0, pending: 0 }
+  if (!form || form.kind !== 'exam') return { subjective: 0, pending: 0, room: 0, nowTotal: 0 }
   const data = safeJson(row.data, {})
   const manual = manualScoresOf(row)
   // 直接查库拿到的是未解析的行，schema 还是 JSON 字符串
@@ -754,12 +754,24 @@ export function reviewTally(form, row) {
   const flow = buildFlow(schema, data)
   let subjective = 0
   let pending = 0
+  // 还有多少分可给、以及「现在这条线画在哪儿」的分母。
+  // 这两个数只服务阅卷队列的排序：批完能加几分、加完之后及格线会抬到哪。
+  // 口径照抄 gradeSubmission，不另写一套——否则队列按 A 算、批完按 B 算，排序就是错的。
+  let room = 0
+  let nowTotal = 0
+  for (const f of schema) {
+    if (!f.score || !flow.active.has(f.id)) continue
+    if (f.answer?.length) { nowTotal += f.score; continue }
+    const m = manual[f.id]
+    if (m === undefined || m === null || m === '') continue
+    nowTotal += f.score
+  }
   for (const f of schema) {
     if (!isSubjective(f) || !flow.active.has(f.id)) continue
     subjective++
-    if (!Object.prototype.hasOwnProperty.call(manual, f.id)) pending++
+    if (!Object.prototype.hasOwnProperty.call(manual, f.id)) { pending++; room += f.score }
   }
-  return { subjective, pending }
+  return { subjective, pending, room, nowTotal }
 }
 
 /** 从答卷记录里取人工批阅分：{ [fieldId]: number } */

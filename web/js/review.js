@@ -987,3 +987,138 @@ export function regradeText(t) {
   if (!parts.length) return t.changed ? `${t.changed} 份分数会变，但没人换边` : '这份卷子的分一个都不会变'
   return parts.join('，')
 }
+
+/* ============ 阅卷队列的顺序：先批那些批完会改变结论的 ============ */
+
+/**
+ * 这一份卷子批完之后，会不会改变结论。
+ *
+ * 阅卷队列一直是按交卷时间排的：一个班 40 人，就从第一份扫到最后一份。
+ * 可批阅时间是有限的，而队列里大多数卷子批了也不改变任何结论——
+ * 离及格线还差 5 分、剩余主观题只有 10 分可给，批完仍然是过不了线；
+ * 反过来已经稳稳过线的，批完只会更高。把时间花在这两类卷子上，等于按 id 顺序写作业。
+ *
+ * 真正值得先批的是「批完就会换一句话」的几种：
+ *
+ *  1. `drop`  **现在列表上写着及格，批完却可能掉线。** 这一档最该先看。
+ *  2. `pass`  现在过不了线，但剩余主观题的分够把它推过去。
+ *  3. `top`   现在追不上第 1 名，但剩余的分够追上。
+ *  4. `fresh` 一道题都还没判过，及格线本身还没定下来。
+ *  5. `scale` 这份卷子某道题已经被两位老师给出过不同的分，下一个批的人会把第三种口径定下来。
+ *
+ * 为什么会有 `drop`：及格线不是固定的，它按「可判分题目总分」的百分比算。
+ * 还有 40 分主观题没批时，分母只是客观题那 60 分，线画在 36；批完分母变成 100，线抬到 60。
+ * 于是一个 40 分的考生此刻显示「及格」，把两道主观题各给 5 分之后就是 50 分、线下。
+ * **分数只会往上走，线也会往上走，所以「掉线」不是分数被扣，是分数线跑到了他前面。**
+ * 这一档如果不说，老师按列表上的「及格」把剩下的卷子扫一遍，扫完发现半数人不及格，
+ * 却不知道是哪几份在什么时候翻过去的。
+ *
+ * 其余几条口径：
+ *  - 批分本身只会加分（主观题给分落在 [0, 满分]），所以上界就是 `score + room`。
+ *  - 两端各取一次线：现在的线用 `nowTotal`（已判分题目总分）算，批完的线用 `nowTotal + room` 算。
+ *    只比一边，`drop` 这一档根本不会出现，`pass` 也会把「给满也够不着」的卷子误判进来。
+ */
+export function queueUrgency(row = {}, { passLineOf = () => 0, top = null } = {}) {
+  const low = Number(row.score) || 0
+  const room = Math.max(Number(row.room) || 0, 0)
+  const nowTotal = Number(row.nowTotal) || 0
+  const crossed = Math.max(Number(row.crossed) || 0, 0)
+  // 没有剩余可给的分，它本来也不该在队列里
+  if (!(room > 0)) return { tier: '', gap: 0, room: 0, text: '' }
+  /*
+   * 一道题都还没判过的时候，及格线本身还没定下来：它是按「可判分题目总分」的百分比算的，
+   * 分母此刻是 0。拿 0 去和 0 比，会得出「他已经过线了」这种既不真也不假的话。
+   * 这一档单独说：还没判过分，批完才知道——它既不该说成「会改结论」，也不该说成「不会改」。
+   */
+  if (!(nowTotal > 0)) return { tier: 'fresh', gap: 0, room, text: '还没判过分，批完才知道过不过线' }
+  const high = low + room
+  const passNow = Number(passLineOf(nowTotal)) || 0
+  const passFull = Number(passLineOf(nowTotal + room)) || 0
+  if (low >= passNow && low < passFull) {
+    // 线跑到了他前面：这几题给不满 need 分，他就从「及格」变成「不及格」
+    const need = round100(passFull - low)
+    return { tier: 'drop', gap: need, room, text: `现在算过线，但这几题给不满 ${need} 分就会掉到线下` }
+  }
+  if (low < passNow && high >= passFull) {
+    const gap = round100(passNow - low)
+    return { tier: 'pass', gap, room, text: `还差 ${gap} 分过线，剩 ${room} 分可给` }
+  }
+  // 榜首只跟「已经批完的答卷」比：还在涨分的卷子当榜首，会变成谁都没批完却已经有个第 1 名
+  if (top !== null && top !== undefined && low < Number(top) && high >= Number(top)) {
+    const gap = round100(Number(top) - low)
+    return { tier: 'top', gap, room, text: `距第 1 名 ${gap} 分，剩 ${room} 分可给` }
+  }
+  if (crossed > 0) {
+    return { tier: 'scale', gap: 0, room, text: `${crossed} 处口径不一致，等下一个批的人定` }
+  }
+  return { tier: '', gap: 0, room, text: '' }
+}
+
+/** 三档优先级的人话说法。文案放在这里，服务端与页面用的是同一句 */
+export const URGENCY_LABEL = {
+  drop: '批完可能掉线', pass: '批完可能上岸', top: '批完可能换第 1 名',
+  fresh: '还没判过分', scale: '尺子还没定'
+}
+
+/*
+ * 档位权重。
+ *
+ * `drop` 排最前是有意的：列表上已经写着「及格」，老师扫一眼就会认；批完掉下去之后，
+ * 谁也不会回头想「他是什么时候从及格变成不及格的」。这一档不先说不先批，就是等着挨骂。
+ * 然后是 `pass`（上岸，行政后果）；榜首其次；再往下是「一点都还没判」与「尺子没定」——
+ * 后者不是不着急，而是它已经有人在管了，只差最后一个人定口径。
+ */
+const TIER_WEIGHT = { drop: 5, pass: 4, top: 3, fresh: 2, scale: 1, '': 0 }
+
+/** 差距占剩余分值的比例：越小越贴边，越该先批。没有档位的排最后 */
+function tightness(row) {
+  const u = row?.urgency || {}
+  const room = Number(u.room) || 0
+  if (!u.tier || !(room > 0)) return 1e9
+  return (Number(u.gap) || 0) / room
+}
+
+/**
+ * 排队的顺序。
+ *
+ * `priority` 下同档位里按「差距 / 剩余可给分」升序：还差 2 分、手里有 20 分的那份，
+ * 比还差 19 分、手里只有 20 分的那份更贴边——前者怎么批都大概率换边，后者得给满才勉强。
+ * 平手时按 id：顺序必须是确定的，否则翻页会漏人、也会重批同一份。
+ */
+export function orderQueue(rows = [], { mode = 'priority' } = {}) {
+  const list = [...rows]
+  if (mode !== 'priority') return list.sort((a, b) => Number(a.id) - Number(b.id))
+  return list.sort((a, b) => (TIER_WEIGHT[b?.urgency?.tier || ''] || 0) - (TIER_WEIGHT[a?.urgency?.tier || ''] || 0)
+    || tightness(a) - tightness(b)
+    || Number(a.id) - Number(b.id))
+}
+
+/**
+ * 队列的一句话摘要：这一整队里，几份批完会改变结论。
+ *
+ * 「还剩 45 份」只说工作量，不说这 45 份里哪几份值得现在就批。
+ * 一份都不换边时也要说——那正是「这些卷子批了也不改变任何结论」这个结论本身。
+ */
+export function queueSummary(rows = []) {
+  const count = t => rows.filter(r => (r?.urgency?.tier || '') === t).length
+  const drop = count('drop')
+  const pass = count('pass')
+  const top = count('top')
+  const scale = count('scale')
+  const fresh = count('fresh')
+  const parts = []
+  if (drop) parts.push(`${drop} 份现在显示及格、批完可能掉线`)
+  if (pass) parts.push(`${pass} 份批完可能上岸`)
+  if (top) parts.push(`${top} 份可能换第 1 名`)
+  if (fresh) parts.push(`${fresh} 份还没判过分`)
+  if (scale) parts.push(`${scale} 份的尺子还没定`)
+  return {
+    drop, pass, top, scale, fresh, total: rows.length,
+    // 队列空了不谈优先级：那不是「都不用批」，是没有可批的
+    text: !rows.length
+      ? ''
+      : parts.length
+        ? `其中 ${parts.join('，')}`
+        : '剩下这些卷子批完都不会改结论，可以慢慢来'
+  }
+}

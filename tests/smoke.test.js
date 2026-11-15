@@ -5304,6 +5304,211 @@ try {
     cookie = holdS
   }
 
+  console.log('\n[73] 阅卷队列的顺序：先批那些批完会改变结论的')
+  {
+    // ---- 纯函数：优先级口径
+    {
+      const { queueUrgency, orderQueue, queueSummary } = await import('../web/js/review.js')
+      // 及格线按可判分总分 60% 算，与 passLineOf 同一个口径
+      const line = t => Math.round(t * 0.6 * 100) / 100
+
+      // 还差 6 分过线，手里还有 40 分可给 → 批完大概率换边
+      let u = queueUrgency({ score: 30, room: 40, nowTotal: 60 }, { passLineOf: line })
+      assert(u.tier === 'pass' && u.gap === 6, '离及格线还差 6 分、剩 40 分可给 → 批完可能换及格线', JSON.stringify(u))
+
+      /*
+       * 及格线会跟着动：它按「可判分题目总分」的百分比算，还有 40 分主观题没批时
+       * 分母只是客观题那 60 分。所以只跟「现在的线」比会得出相反的结论——
+       * 这一份给满了也只有 40 分，而批完之后线会抬到 60 分，怎么批都过不了。
+       */
+      u = queueUrgency({ score: 0, room: 40, nowTotal: 60 }, { passLineOf: line })
+      assert(u.tier === '', '给满也不够及格线抬高的那一截 → 不排进「会换结论」', JSON.stringify(u))
+
+      /*
+       * 列表上已经写着「及格」，批完却可能掉线——这一档最该先看。
+       *
+       * 及格线不是固定的：它按「可判分题目总分」的百分比算。还有 40 分主观题没批时，
+       * 分母只是客观题那 60 分，线画在 36；批完分母变成 100，线抬到 60。
+       * 40 分的考生此刻显示及格，两道主观题各给 5 分之后是 50 分、线下。
+       * 分数只会往上走，线也会往上走——「掉线」不是分数被扣，是分数线跑到了他前面。
+       */
+      u = queueUrgency({ score: 40, room: 40, nowTotal: 60 }, { passLineOf: line })
+      assert(u.tier === 'drop' && u.gap === 20,
+        '现在显示及格、但给不满 20 分就会掉线 → 单独一档，排最前', JSON.stringify(u))
+
+      // 分数已经过了「批完之后的线」，怎么给都不会掉
+      u = queueUrgency({ score: 60, room: 40, nowTotal: 60 }, { passLineOf: line })
+      assert(u.tier === '', '分数已过批完之后的线，给满分也不会掉，不算「会改结论」', JSON.stringify(u))
+
+      // 一道题都还没判过：及格线的分母是 0，此时「他已经过线了」既不真也不假
+      u = queueUrgency({ score: 0, room: 40, nowTotal: 0 }, { passLineOf: line })
+      assert(u.tier === 'fresh', '还没判过任何题的卷子单独说，不硬判过没过线', JSON.stringify(u))
+
+      // 差榜首 20 分、剩 20 分可给：及格线那一档不算（给满也够不着批完之后的线）
+      u = queueUrgency({ score: 10, room: 20, nowTotal: 60 }, { passLineOf: line, top: 30 })
+      assert(u.tier === 'top' && u.gap === 20, '距第 1 名 20 分、剩 20 分可给 → 批完可能换榜首', JSON.stringify(u))
+      u = queueUrgency({ score: 10, room: 10, nowTotal: 60 }, { passLineOf: line, top: 30 })
+      assert(u.tier === '', '差榜首的分超过剩余可给分 → 追不上，不排前面', JSON.stringify(u))
+
+      // 尺子还没定：这一份某道题已经被两个人给出过不同的分
+      u = queueUrgency({ score: 60, room: 10, nowTotal: 80, crossed: 2 }, { passLineOf: line })
+      assert(u.tier === 'scale' && /2 处口径不一致/.test(u.text), '尺子不齐也算一档，但排在及格线后面', JSON.stringify(u))
+
+      // 剩余可给分为 0 的不该在队列里，也不该编出一档
+      assert(queueUrgency({ score: 50, room: 0, nowTotal: 50 }, { passLineOf: line }).tier === '',
+        '没有剩余可给分就不谈优先级')
+
+      // 排序：档位高的在前，同档按「差距 / 剩余可给分」升序（越贴边越先批）
+      const rows = [
+        { id: 9, urgency: { tier: '', gap: 0, room: 0 } },
+        { id: 8, urgency: { tier: 'scale', gap: 0, room: 10 } },
+        { id: 7, urgency: { tier: 'pass', gap: 18, room: 20 } },
+        { id: 6, urgency: { tier: 'pass', gap: 2, room: 20 } },
+        { id: 5, urgency: { tier: 'top', gap: 5, room: 40 } },
+        { id: 4, urgency: { tier: 'drop', gap: 20, room: 40 } }
+      ]
+      assert(orderQueue(rows).map(r => r.id).join(',') === '4,6,7,5,8,9',
+        '先按档位（掉线 > 上岸 > 榜首 > 尺子）、再按贴边程度、最后按 id（顺序必须确定，否则翻页会漏人）',
+        orderQueue(rows).map(r => r.id).join(','))
+      assert(orderQueue(rows, { mode: 'id' }).map(r => r.id).join(',') === '4,5,6,7,8,9',
+        '改成按交卷顺序时，就是按 id')
+
+      // 摘要：只说工作量不说哪几份值得先批，「还剩 45 份」等于没说
+      const sum = queueSummary([
+        { urgency: { tier: 'pass' } }, { urgency: { tier: 'pass' } },
+        { urgency: { tier: 'drop' } },
+        { urgency: { tier: 'top' } }, { urgency: { tier: '' } }
+      ])
+      assert(sum.pass === 2 && sum.drop === 1 && sum.top === 1 && /1 份现在显示及格、批完可能掉线/.test(sum.text),
+        '摘要按档位分句，不是给一个总数（掉线那句排在最前）', JSON.stringify(sum))
+      assert(/都不会改结论/.test(queueSummary([{ urgency: { tier: '' } }]).text),
+        '一份都不换边时也要说——那正是「这些卷子批了也不改变结论」这个结论')
+      assert(queueSummary([]).text === '', '队列空了不谈优先级')
+    }
+
+    // ---- 接口：队列按「批完会改结论」排，顺序与标注都要对得上
+    let r = await req('POST', '/api/forms', {
+      title: '队列优先级卷', kind: 'exam',
+      schema: [
+        { id: 'q1', type: 'radio', label: '客观一', options: [{ label: '对', value: 'Y' }, { label: '错', value: 'N' }], answer: ['Y'], score: 30 },
+        { id: 'q2', type: 'radio', label: '客观二', options: [{ label: '对', value: 'Y' }, { label: '错', value: 'N' }], answer: ['Y'], score: 30 },
+        { id: 's1', type: 'textarea', label: '主观一', answer: [], score: 20 },
+        { id: 's2', type: 'textarea', label: '主观二', answer: [], score: 20 }
+      ],
+      settings: { passPercent: 60 }
+    })
+    const pfid = r.json.id
+    await req('PUT', `/api/forms/${pfid}`, { status: 'published' })
+    const sub = async (data) => (await req('POST', `/api/public/forms/${pfid}/submit`, { data })).json.id
+    // 客观 30 分、还剩 40 分主观题：现在的线是 60 × 0.6 = 36，批完的线会抬到 100 × 0.6 = 60
+    const near1 = await sub({ q1: 'Y', q2: 'N', s1: '甲', s2: '乙' })   // 30 分，差 6 分过线
+    const far = await sub({ q1: 'N', q2: 'N', s1: '丙', s2: '丁' })     // 0 分，给满 40 也够不着 60
+    const passed = await sub({ q1: 'Y', q2: 'Y', s1: '戊', s2: '己' })  // 60 分，已过线
+    const chief = await sub({ q1: 'Y', q2: 'N', s1: '庚', s2: '辛' })   // 30 分
+    const near2 = await sub({ q1: 'Y', q2: 'N', s1: '壬', s2: '癸' })   // 30 分，同 near1
+
+    r = await req('GET', `/api/forms/${pfid}/review-queue?limit=10`)
+    assert(r.status === 200 && r.json.total === 5, '五份都进队列', `${r.status} ${r.json?.total}`)
+    assert(r.json.order === 'priority', '默认按优先级排', String(r.json.order))
+    const orderIds = r.json.data.map(x => x.id)
+    // near1 / chief / near2 三份完全同档（都差 6 分、都有 40 分可给），同档之内按 id —— 顺序必须确定
+    assert(orderIds.slice(0, 3).sort((a, b) => a - b).join(',') === [near1, chief, near2].sort((a, b) => a - b).join(','),
+      '「差 6 分就过线」的三份排最前（不是按交卷先后排到最末）', JSON.stringify(orderIds))
+    assert(orderIds[0] === near1 && orderIds.indexOf(passed) > orderIds.indexOf(near2),
+      '客观题就过线的排后面：批完只会更高，不会换结论', JSON.stringify(orderIds))
+    const u = r.json.data[0].urgency
+    assert(u.tier === 'pass' && /还差 6 分过线，剩 40 分可给/.test(u.text),
+      '每份自己说明凭什么排在前面（差几分、手里几分）', JSON.stringify(u))
+    assert(r.json.data.find(x => x.id === far).urgency.tier === '',
+      '给满也不够的卷子不挂档位——及格线会跟着分母一起抬，这条得算准',
+      JSON.stringify(r.json.data.find(x => x.id === far)?.urgency))
+    assert(r.json.summary?.pass === 3, '摘要说清整队里有几份会改结论', JSON.stringify(r.json.summary))
+    assert(/3 份批完可能上岸/.test(r.json.summary.text), '摘要是一句人话', r.json.summary.text)
+
+    /*
+     * 「现在算过线、批完会掉线」这一档：最该先看，因为列表上已经写着及格了。
+     *
+     * near1 客观 30 分。给 s1 打 18 分之后 = 48 分，此刻显示及格
+     * （分母是已判分的 60 + 20 = 80，线画在 48）；但还剩 20 分主观题没批，
+     * 批完分母变 100、线抬到 60——那 20 分里给不满 12 分，他就掉到线下。
+     */
+    r = await req('PUT', '/api/submissions/review-batch', { items: [{ id: near1, scores: { s1: 18 } }] })
+    assert(r.json.saved === 1, '把一份批到「刚好算过线」', JSON.stringify(r.json))
+    r = await req('GET', `/api/forms/${pfid}/review-queue?limit=10`)
+    const dropRow = r.json.data.find(x => x.id === near1)
+    assert(dropRow?.urgency?.tier === 'drop' && /给不满 12 分就会掉到线下/.test(dropRow.urgency.text),
+      '现在显示及格、批完可能掉线 → 单独一档并排在最前', JSON.stringify(dropRow?.urgency))
+    assert(r.json.data[0].id === near1, '这一档排在所有「上岸」前面：列表上写着及格的人掉线，没人会回头追',
+      JSON.stringify(r.json.data.map(x => [x.id, x.urgency.tier])))
+    assert(/1 份现在显示及格、批完可能掉线/.test(r.json.summary.text), '摘要先说掉线那档', r.json.summary.text)
+
+    // 想按交卷顺序扫一遍时还在
+    r = await req('GET', `/api/forms/${pfid}/review-queue?limit=10&order=id`)
+    assert(r.json.data.map(x => x.id).join(',') === [near1, far, passed, chief, near2].join(','),
+      'order=id 回到交卷顺序', JSON.stringify(r.json.data.map(x => x.id)))
+
+    /*
+     * 榜首那一档：只跟「已经批完的答卷」比。
+     * 还在涨分的卷子当榜首，等于「谁都没批完却已经有个第一名」，按它算的位移全是假的。
+     */
+    r = await req('PUT', '/api/submissions/review-batch', { items: [{ id: chief, scores: { s1: 0, s2: 0 } }] })
+    assert(r.json.saved === 1, '先批完一份（30 分），让它成为榜首', JSON.stringify(r.json))
+    r = await req('GET', `/api/forms/${pfid}/review-queue?limit=10`)
+    const farRow = r.json.data.find(x => x.id === far)
+    assert(farRow?.urgency?.tier === 'top' && farRow.urgency.gap === 30,
+      '0 分、剩 40 分可给的那份：够得上第 1 名（30 分），排进「可能换榜首」', JSON.stringify(farRow?.urgency))
+    /*
+     * 同是 near1：它此刻 48 分、剩余 20 分，既够得上榜首（30 分），也贴着自己会掉的那条线。
+     * 两档都成立时报「掉线」——及格线是行政后果，榜首只是名次。
+     */
+    const n1 = r.json.data.find(x => x.id === near1)
+    assert(n1?.urgency?.tier === 'drop', '既可能掉线又可能换榜首时，报掉线（行政后果优先）', JSON.stringify(n1?.urgency))
+    assert(r.json.data.indexOf(n1) < r.json.data.indexOf(farRow), '掉线那一档排在榜首那一档前面',
+      JSON.stringify(r.json.data.map(x => [x.id, x.urgency.tier])))
+
+    /*
+     * 一份只带主观题的卷子：可判分总分此刻是 0，及格线的分母是 0，
+     * 这时候「他已经过线了」既不真也不假——得单独说「还没判过分」。
+     */
+    r = await req('POST', '/api/forms', {
+      title: '纯主观题卷', kind: 'exam',
+      schema: [
+        { id: 's1', type: 'textarea', label: '问答一', answer: [], score: 20 },
+        { id: 's2', type: 'textarea', label: '问答二', answer: [], score: 10 }
+      ],
+      settings: { passPercent: 60 }
+    })
+    const sfid = r.json.id
+    await req('PUT', `/api/forms/${sfid}`, { status: 'published' })
+    await req('POST', `/api/public/forms/${sfid}/submit`, { data: { s1: '答一', s2: '答二' } })
+    r = await req('GET', `/api/forms/${sfid}/review-queue?limit=10`)
+    assert(r.json.data[0]?.urgency?.tier === 'fresh', '还一道题都没判过时单独一档，不硬判过没过线',
+      JSON.stringify(r.json.data[0]?.urgency))
+    assert(r.json.data[0]?.urgency?.room === 30, '顺带说出还剩几分可给（20 + 10）', String(r.json.data[0]?.urgency?.room))
+
+    // 空队列不吭声：那不是「都不用批」，是没有可批的
+    const emptyForm = (await req('POST', '/api/forms', {
+      title: '没人交的卷', kind: 'exam',
+      schema: [{ id: 's1', type: 'textarea', label: '问答', answer: [], score: 10 }]
+    })).json.id
+    r = await req('GET', `/api/forms/${emptyForm}/review-queue`)
+    assert(r.json.total === 0 && r.json.summary?.text === '', '空队列不给优先级摘要', JSON.stringify(r.json.summary))
+
+    /*
+     * 分页按「整队」算：摘要和排序都在切片之前完成。
+     * 按页算的话，说「其中 3 份批完可能换及格线」时那 3 份可能在第一页，
+     * 而老师正站在第三页——这句话每翻一页变一次，变得比工作量本身还快。
+     */
+    const whole = await req('GET', `/api/forms/${pfid}/review-queue?limit=50`)
+    r = await req('GET', `/api/forms/${pfid}/review-queue?limit=2&offset=2`)
+    assert(r.json.data.length === 2 && JSON.stringify(r.json.summary) === JSON.stringify(whole.json.summary),
+      '第二页的摘要与整队一致（不是按这一页现算）',
+      JSON.stringify({ page: r.json.summary, whole: whole.json.summary }))
+    assert(r.json.data.map(x => x.id).join(',') === whole.json.data.slice(2, 4).map(x => x.id).join(','),
+      '第二页就是整队排序后的第 3、4 份——先切再排的话顺序会自相矛盾',
+      JSON.stringify({ page: r.json.data.map(x => x.id), whole: whole.json.data.map(x => x.id) }))
+  }
+
   console.log('\n[45] 前端静态资源')
 
   for (const p of ['/', '/js/main.js', '/css/app.css', '/js/views/Logs.js', '/js/views/Dicts.js', '/js/review.js', '/assets/eqs-mark.svg', '/vendor/echarts.min.js']) {

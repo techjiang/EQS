@@ -5,7 +5,7 @@ import { ok, err, confirmBox, fmtDate, Empty, Modal, Pagination, escapeHtml } fr
 import { Icon } from '../icons.js'
 import { renderControl, answerDisplay } from '../renderer.js'
 import { buildFlow } from '../flow.js'
-import { batchPayload, nextIndex, reviewProgress, afterSave, elapsedSeconds, changeText, changeLine, humanSeconds, gapLevel, bandText, biasText, regradeText, standingText } from '../review.js'
+import { batchPayload, nextIndex, reviewProgress, afterSave, elapsedSeconds, changeText, changeLine, humanSeconds, gapLevel, bandText, biasText, regradeText, standingText, URGENCY_LABEL } from '../review.js'
 
 export default {
   setup() {
@@ -442,13 +442,20 @@ export default {
       } catch (e) { err(e.message) }
     }
 
+    /*
+     * 队列的排序口径。默认按「批完会不会改结论」，可切回按交卷顺序——
+     * 有些场合（比如对着一份打印名单念名字）就是要按交卷先后走。
+     */
+    const batchOrder = ref('priority')
+
     const loadBatch = async (offset, { silent = false } = {}) => {
-      let r = await api.get(`/api/forms/${formId.value}/review-queue?limit=${BATCH_LIMIT}&offset=${offset || 0}`)
+      const q = `limit=${BATCH_LIMIT}&offset=${offset || 0}&order=${batchOrder.value}`
+      let r = await api.get(`/api/forms/${formId.value}/review-queue?${q}`)
       // 批完最后一页的几份之后，队列变短了，原来的 offset 可能已经越过队尾。
       // 这时回落到队尾那一页，而不是给一张空页让人以为「批完了」（其实前面还有没批的）
       if (!r.data?.length && r.total > 0 && offset > 0) {
         offset = Math.max(Math.floor((r.total - 1) / BATCH_LIMIT) * BATCH_LIMIT, 0)
-        r = await api.get(`/api/forms/${formId.value}/review-queue?limit=${BATCH_LIMIT}&offset=${offset}`)
+        r = await api.get(`/api/forms/${formId.value}/review-queue?limit=${BATCH_LIMIT}&offset=${offset}&order=${batchOrder.value}`)
       }
       const items = (r.data || []).map(x => ({
         ...x,
@@ -466,7 +473,9 @@ export default {
         // need/done 是整场考试的进度锚：total 只是「这一页还剩几份待批」，
         // 拿它当分子分母都会说错话（批到第 6 页时它一直是 10）
         need: r.need, done: r.done, scanned: r.scanned,
-        total: r.total, offset: offset || 0, limit: BATCH_LIMIT, items
+        total: r.total, offset: offset || 0, limit: BATCH_LIMIT, items,
+        // 整队里几份批完会改结论：按整队算，不按这一页——否则每翻一页这句话都变一次
+        summary: r.summary || null, order: r.order || batchOrder.value
       }
       // 保存之后队列清空是正常结果，不该再弹一句「没有待批阅」——那句提示是说给「点进来才发现空」的人
       /*
@@ -562,6 +571,7 @@ export default {
    */
   const progressBar = (b) => {
     const p = reviewProgress(b.need, b.done)
+    const summary = b.summary
     return h('div', { class: 'review-progress' }, [
       h('div', { class: 'flex between wrap', style: 'gap:8px;align-items:baseline' }, [
         h('span', { class: 'small', style: 'font-weight:600' },
@@ -576,8 +586,36 @@ export default {
       ]),
       h('div', { class: 'bar-line', style: 'margin-top:6px' }, [
         h('i', { style: `width:${p.percent}%` })
-      ])
+      ]),
+      /*
+       * 「还剩 45 份」只说工作量，不说这 45 份里哪几份值得现在就批。
+       * 这一行是队列自己的判断：按交卷顺序从头扫，等于把时间平摊在那些
+       * 「怎么批都不改结论」的卷子上。
+       */
+      summary?.text
+        ? h('div', { class: 'flex between wrap', style: 'gap:8px;align-items:center;margin-top:8px' }, [
+            h('span', { class: 'small', style: 'color:var(--text-2)' }, summary.text),
+            h('label', { class: 'flex small muted', style: 'gap:6px;align-items:center;cursor:pointer' }, [
+              h('input', {
+                type: 'checkbox', checked: b.order === 'id', style: 'accent-color:var(--brand)',
+                onChange: e => switchBatchOrder(e.target.checked ? 'id' : 'priority')
+              }),
+              '按交卷顺序'
+            ])
+          ])
+        : null
     ])
+  }
+
+  /**
+   * 换排序：从第一页重新开始，别停在第 6 页。
+   * 排序换了之后「第 31 – 40 份」指的是另一批卷子，接着原来的 offset 往下看，
+   * 前面那 30 份就再也见不到了——而它们很可能正是最急的那几份。
+   */
+  const switchBatchOrder = async (mode) => {
+    if (!batch.value || batch.value.order === mode) return
+    batchOrder.value = mode
+    try { await loadBatch(0) } catch (e) { err(e.message) }
   }
 
   return () => h('div', {}, [
@@ -1166,6 +1204,20 @@ export default {
                 x.publicId ? h('span', { class: 'mono small muted' }, x.publicId) : null,
                 h('span', { class: 'small muted' }, fmtDate(x.createdAt)),
                 h('span', { class: 'tag' }, `客观题 ${x.score ?? '-'} 分`),
+                /*
+                 * 这一份凭什么排在前面。只写「待批阅」等于什么都没说：
+                 * 还差 2 分过线和还差 19 分过线，在队列里长得一模一样，
+                 * 而前者批完大概率换人，后者得给满才勉强。
+                 */
+                x.urgency?.tier
+                  ? h('span', {
+                      class: ['tag', x.urgency.tier === 'pass' ? 'danger' : (x.urgency.tier === 'top' ? 'warn' : 'brand')]
+                    }, URGENCY_LABEL[x.urgency.tier] || x.urgency.tier)
+                  : null,
+                // 具体的分数摆在这句灰字里：标签只说「哪一档」，这一行说「差几分、手里几分」
+                x.urgency?.text
+                  ? h('span', { class: 'small muted' }, x.urgency.text)
+                  : null,
                 // 这一份别人已经批过一部分：两口子/两位老师同时批同一场时，
                 // 谁给了多少分必须一眼看得见，否则两份分差得离谱也没人知道是两个人干的
                 x.reviewedAt

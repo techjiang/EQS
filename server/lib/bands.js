@@ -81,6 +81,28 @@ export function crossedBySubmission(form, rows) {
 }
 
 /**
+ * 整张卷子里，每一份「有几处尺子不齐」。
+ *
+ * 阅卷队列要按「批完会不会改结论」排序，而这需要知道整队每一份的口径分歧数——
+ * 不是只这一页。按页算的话，第二页的排序就看不见第一页的分歧，翻页顺序自相矛盾。
+ *
+ * 代价是这一次要读整张卷子的留痕。与 `bandsOf` 按页算不同，这里的量级是「这场考试的
+ * 全部批阅次数」，而不是「一页 20 行」；一场千人的考试也就是几千条。
+ * 真要撑不住，这里换成 SQL 聚合而不是把明细读进内存——但那是另一个数量级才会发生的事。
+ */
+export function crossedCountByForm(form) {
+  const out = new Map()
+  if (!form || form.kind !== 'exam') return out
+  const grouped = groupLogs(all(
+    'SELECT submission_id, user_id, username, changes, created_at FROM review_logs WHERE form_id = ? ORDER BY id ASC', form.id))
+  for (const [sid, entries] of grouped) {
+    const n = [...crossedOf(entries).values()].flat().length
+    if (n) out.set(sid, n)
+  }
+  return out
+}
+
+/**
  * 导出一整张卷子：留痕读一次就够。
  *
  * 导出是流式的（93 万份答卷也不进内存），但留痕不能跟着每行查一次——

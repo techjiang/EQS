@@ -34,12 +34,12 @@ import { notifySubmission, dispatchWebhooks } from '../lib/notify.js'
 import { formRole, submissionVisibleScope, requireFormRole } from '../lib/formMembers.js'
 import { rateLimit, publicLimit } from '../lib/guard.js'
 import { rankingTop, rankOf, publicRanking, distributionOf } from '../lib/ranking.js'
-import { bandsOf, crossedBySubmission, formBandReader } from '../lib/bands.js'
+import { bandsOf, crossedBySubmission, crossedCountByForm, formBandReader } from '../lib/bands.js'
 import { submissionsXlsx, submissionsHead, submissionRow } from '../lib/sheet.js'
 import { writeXlsxStream } from '../lib/xlsx.js'
 import { signFileUrl, signFileUrls, signHtmlFiles, QUERY_FILE_TTL } from '../lib/fileAccess.js'
 // 份数/分数的留痕口径只有一份：前端也是这套（web/js/review.js），两边说的必须是同一件事
-import { scoreChanges, changeText, calibrate, gapLevel, reviewDrift, driftText, regradeRuler, regradeText, standingText } from '../../web/js/review.js'
+import { scoreChanges, changeText, calibrate, gapLevel, reviewDrift, driftText, regradeRuler, regradeText, standingText, queueUrgency, orderQueue, queueSummary } from '../../web/js/review.js'
 
 function fingerprint(req, extra = {}) {
   return {
@@ -807,18 +807,50 @@ export default function register(r) {
     // 顺手统计整场考试的批阅进度——一页存完就清空，批到第 6 页时已经不知道
     // 自己在整场里的位置，也不知道还剩几个人的卷子没看。分母只算「有主观题的卷子」，
     // 否则纯客观题的答卷会让进度永远到不了头。
+    // 整张卷子的口径分歧按份数一次算完：一页一页算的话，第二页的排序看不见第一页的分歧
+    const crossedCount = crossedCountByForm(form)
     const queue = []
     let scanned = 0
     let need = 0
+    // 第 1 名是谁：只跟「已经批完的答卷」比。还在涨分的卷子当榜首，
+    // 等于「谁都没批完，却已经有个第一名」，按它算的「会不会换榜首」全是假的
+    let topScore = null
     for (const row of each('SELECT id, public_id, data, manual_scores, score, passed, created_at, review_note, reviewed_at, reviewed_by FROM submissions WHERE form_id = ? AND deleted_at IS NULL ORDER BY id ASC', form.id)) {
       scanned++
       const tally = reviewTally(form, row)
       if (!tally.subjective) continue
       need++
-      if (tally.pending === 0) continue
+      if (tally.pending === 0) {
+        if (row.score !== null && row.score !== undefined && Number.isFinite(Number(row.score))) {
+          topScore = topScore === null ? Number(row.score) : Math.max(topScore, Number(row.score))
+        }
+        continue
+      }
+      row.tally = tally
       queue.push(row)
     }
-    const page = queue.slice(offset, offset + limit)
+    /*
+     * 队列的顺序：不再只按交卷时间。
+     *
+     * 批阅时间是有限的，而队列里大多数卷子批了也不改变任何结论——离及格线还差 5 分、
+     * 剩 10 分可给，批完仍然过不了线。按 id 从头扫，等于把有限的时间平摊在
+     * 那些「怎么批都一样」的卷子上。这里给每一份算一个「批完会不会换一句话」，
+     * 排序时把会换的排前面，交卷时间退化成平手时的次序。
+     *
+     * 算优先级要等在整场扫完之后：榜首是谁得先知道（后面的卷子分可能更高），
+     * 而「会不会换第 1 名」正是其中一档。所以这里分两趟。
+     */
+    for (const row of queue) {
+      row.urgency = queueUrgency(
+        { score: row.score, room: row.tally.room, nowTotal: row.tally.nowTotal, crossed: crossedCount.get(Number(row.id)) || 0 },
+        { passLineOf: t => passLineOf(form.settings || {}, t), top: topScore }
+      )
+      delete row.tally
+    }
+    // 按 id 排的那一档保留成可选：老师想按交卷顺序从头扫一遍时还在
+    const order = url.searchParams.get('order') === 'id' ? 'id' : 'priority'
+    const ordered = orderQueue(queue, { mode: order })
+    const page = ordered.slice(offset, offset + limit)
     const nameOfReviewer = reviewerNames(page)
     /*
      * 别人对这题给过多少分。
@@ -849,6 +881,9 @@ export default function register(r) {
       return {
         id: row.id, publicId: row.public_id, createdAt: row.created_at,
         score: row.score, passed: row.passed, note: row.review_note || '',
+        // 这份卷子凭什么排在现在这个位置：页面要把这句话直接摆在那份卷子上，
+        // 而不是让人自己去列表里算「他还差几分」
+        urgency: row.urgency || { tier: '', gap: 0, room: 0, text: '' },
         // 这一份之前有没有人动过：批量阅卷里最怕「两个人各批了一半，谁也不知道对方给了多少」
         reviewedAt: row.reviewed_at || '', reviewedBy: row.reviewed_by || 0,
         reviewer: nameOfReviewer(row.reviewed_by),
@@ -858,7 +893,16 @@ export default function register(r) {
     })
     // done 只报「已批完」的份数，不报「扫过多少」：后者包含没有主观题的卷子，
     // 拿它做进度分子的话，刚打开阅卷界面就显示「已批 40 份」，一份都还没批。
-    sendJson(res, 200, { ok: true, data, total: queue.length, need, done: Math.max(need - queue.length, 0), scanned, offset, limit })
+    /*
+     * 队列摘要按整队算，不是按这一页：说「其中 3 份批完可能换及格线」时，
+     * 那 3 份可能在第一页，而老师正站在第三页。按页算的话这句话每翻一页变一次，
+     * 变得比工作量本身还快。
+     */
+    const summary = queueSummary(ordered)
+    sendJson(res, 200, {
+      ok: true, data, total: queue.length, need, done: Math.max(need - queue.length, 0), scanned,
+      offset, limit, order, summary
+    })
   })
 
   /**
